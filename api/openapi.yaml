@@ -1,0 +1,288 @@
+openapi: 3.0.3
+info:
+  title: NodeWall API
+  version: 0.1.0
+paths:
+  /ssh-protection/activity:
+    get:
+      summary: Recent SSH connection, Bash command and per-file transfer audit records
+      parameters:
+        - name: session
+          in: query
+          schema:
+            type: string
+        - name: event
+          in: query
+          schema:
+            type: string
+            enum: [session_open, session_close, command, transfer, upload_scan, audit_status]
+        - name: source
+          in: query
+          schema:
+            type: string
+        - name: user
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+      responses:
+        '200':
+          description: Newest records first, including session_id, exit_code when available and bounded command/path fields
+  /nodes/{node}/ssh-protection/activity:
+    get:
+      summary: Authenticated console proxy for the selected node's SSH audit records
+      parameters:
+        - name: node
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: session
+          in: query
+          schema:
+            type: string
+        - name: event
+          in: query
+          schema:
+            type: string
+        - name: source
+          in: query
+          schema:
+            type: string
+        - name: user
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            maximum: 500
+      responses:
+        '200':
+          description: SSH audit records; requires console authentication
+  /nodes/{node}/interfaces/{iface}/protection-baseline:
+    post:
+      summary: Enable the recovery-safe protection baseline or start a timed trial
+      parameters:
+        - name: node
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: iface
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                trial_seconds:
+                  type: integer
+                  minimum: 0
+                  maximum: 120
+                  description: Keep enforcement provisional for this many seconds; zero confirms immediately.
+      responses:
+        '200':
+          description: Baseline enabled or trial started
+  /nodes/{node}/interfaces/{iface}/protection-baseline/confirm:
+    post:
+      summary: Confirm an active protection trial
+      parameters: &protectionBaselinePath
+        - name: node
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: iface
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Trial confirmed and retained
+  /nodes/{node}/interfaces/{iface}/protection-baseline/rollback:
+    post:
+      summary: Roll back an active protection trial immediately
+      parameters: *protectionBaselinePath
+      responses:
+        '200':
+          description: Trial rolled back
+  /interfaces/{iface}/attach:
+    post:
+      summary: Attach XDP to an interface
+  /interfaces/{iface}/detach:
+    post:
+      summary: Detach XDP from an interface
+  /interfaces/{iface}/allowlist:
+    get:
+      summary: List allowlist CIDRs
+    post:
+      summary: Add an allowlist CIDR
+  /interfaces/{iface}/allowlist/{cidr}:
+    delete:
+      summary: Delete an allowlist CIDR
+  /interfaces/{iface}/stats:
+    get:
+      summary: Get pass/drop counters
+  /interfaces/{iface}/publish:
+    post:
+      summary: Apply a staged policy with rollback protection
+  /interfaces/{iface}/confirm:
+    post:
+      summary: Confirm a pending publish
+  /interfaces/{iface}/rollback:
+    post:
+      summary: Roll back a pending publish
+  /health:
+    get:
+      summary: Agent health status
+  /system/metrics:
+    get:
+      summary: Host resource metrics from Linux proc/sys filesystems
+  /monitoring/history:
+    get:
+      summary: Persistent host time-series for the cluster or one node (up to seven days)
+      parameters:
+        - name: range
+          in: query
+          schema:
+            type: integer
+            enum: [300, 900, 1800, 3600, 10800, 21600, 43200, 86400, 259200, 604800]
+        - name: node
+          in: query
+          schema:
+            type: string
+        - name: from
+          in: query
+          description: Custom range start; requires to
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          description: Custom range end; requires from
+          schema:
+            type: string
+            format: date-time
+  /security/summary:
+    get:
+      summary: Built-in host security checks
+  /security/scan:
+    get:
+      summary: Get the current built-in file scan
+    post:
+      summary: Start a read-only built-in file scan
+      description: A global scan may set auto_terminate_processes to immediately contain confirmed hidden or miner processes and isolate a verified executable after termination.
+  /security/scan/{finding}/quarantine:
+    post:
+      summary: Manually isolate a finding after confirmation
+  /security/scan/{finding}/terminate:
+    post:
+      summary: Terminate a process finding through the kernel after confirmation
+      parameters:
+        - name: finding
+          in: path
+          required: true
+          schema:
+            type: string
+  /security/quarantine:
+    get:
+      summary: List files in the NodeWall quarantine directory
+  /security/quarantine/{entry}:
+    delete:
+      summary: Permanently delete a quarantined file after confirmation
+      parameters:
+        - name: entry
+          in: path
+          required: true
+          schema:
+            type: string
+  /security/quarantine/{entry}/restore:
+    post:
+      summary: Restore a quarantined file to its recorded original path
+      parameters:
+        - name: entry
+          in: path
+          required: true
+          schema:
+            type: string
+  /security/scan/report:
+    get:
+      summary: Download the current completed or failed scan report
+      parameters:
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [html, json]
+  /security/scan/reports:
+    get:
+      summary: List up to 500 durable scan reports, newest first
+  /security/scan/reports/{scan}:
+    get:
+      summary: Download an individual durable scan report
+      parameters:
+        - name: scan
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [html, json]
+  /nodes/{node}/security/scan/reports:
+    get:
+      summary: Proxy the selected agent's durable report list (requires console login)
+      parameters:
+        - name: node
+          in: path
+          required: true
+          schema:
+            type: string
+  /nodes/{node}/security/scan/{finding}/terminate:
+    post:
+      summary: Proxy process termination to the selected node (requires console login)
+      parameters:
+        - name: node
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: finding
+          in: path
+          required: true
+          schema:
+            type: string
+  /nodes/{node}/security/scan/reports/{scan}:
+    get:
+      summary: Download a selected node's report (requires console login)
+      parameters:
+        - name: node
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: scan
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [html, json]

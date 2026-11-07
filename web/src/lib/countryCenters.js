@@ -1,0 +1,78 @@
+export const COUNTRY_CENTERS = {
+  AE: { lat: 24.3, lon: 54.4 },
+  AR: { lat: -38.4, lon: -63.6 },
+  AT: { lat: 47.6, lon: 14.1 },
+  AU: { lat: -25.3, lon: 133.8 },
+  BE: { lat: 50.5, lon: 4.5 },
+  BG: { lat: 42.7, lon: 25.5 },
+  BR: { lat: -14.2, lon: -51.9 },
+  BY: { lat: 53.7, lon: 27.9 },
+  CA: { lat: 56.1, lon: -106.3 },
+  CH: { lat: 46.8, lon: 8.2 },
+  CL: { lat: -35.7, lon: -71.5 },
+  CN: { lat: 35.9, lon: 104.2 },
+  CO: { lat: 4.6, lon: -74.1 },
+  CZ: { lat: 49.8, lon: 15.5 },
+  DE: { lat: 51.2, lon: 10.4 },
+  DK: { lat: 56.0, lon: 9.5 },
+  EG: { lat: 26.8, lon: 30.8 },
+  ES: { lat: 40.5, lon: -3.7 },
+  FI: { lat: 61.9, lon: 25.7 },
+  FR: { lat: 46.2, lon: 2.2 },
+  GB: { lat: 55.4, lon: -3.4 },
+  GR: { lat: 39.1, lon: 21.8 },
+  HK: { lat: 22.3, lon: 114.2 },
+  HR: { lat: 45.1, lon: 15.2 },
+  HU: { lat: 47.2, lon: 19.5 },
+  ID: { lat: -2.5, lon: 118.0 },
+  IE: { lat: 53.1, lon: -8.2 },
+  IL: { lat: 31.0, lon: 34.8 },
+  IN: { lat: 20.6, lon: 78.9 },
+  IR: { lat: 32.4, lon: 53.7 },
+  IT: { lat: 41.9, lon: 12.6 },
+  JP: { lat: 36.2, lon: 138.3 },
+  KR: { lat: 35.9, lon: 127.8 },
+  KZ: { lat: 48.0, lon: 66.9 },
+  LT: { lat: 55.2, lon: 23.9 },
+  LU: { lat: 49.8, lon: 6.1 },
+  LV: { lat: 56.9, lon: 24.6 },
+  MD: { lat: 47.4, lon: 28.4 },
+  MX: { lat: 23.6, lon: -102.6 },
+  MY: { lat: 4.2, lon: 102.0 },
+  NG: { lat: 9.1, lon: 8.7 },
+  NL: { lat: 52.1, lon: 5.3 },
+  NO: { lat: 60.5, lon: 8.5 },
+  NZ: { lat: -40.9, lon: 174.9 },
+  PH: { lat: 12.9, lon: 121.8 },
+  PK: { lat: 30.4, lon: 69.3 },
+  PL: { lat: 51.9, lon: 19.1 },
+  PT: { lat: 39.4, lon: -8.2 },
+  RO: { lat: 45.9, lon: 24.9 },
+  RS: { lat: 44.0, lon: 20.8 },
+  RU: { lat: 61.5, lon: 105.3 },
+  SA: { lat: 23.9, lon: 45.1 },
+  SE: { lat: 60.1, lon: 18.6 },
+  SG: { lat: 1.35, lon: 103.8 },
+  SI: { lat: 46.2, lon: 14.9 },
+  SK: { lat: 48.7, lon: 19.7 },
+  TH: { lat: 15.8, lon: 100.9 },
+  TR: { lat: 38.9, lon: 35.2 },
+  TW: { lat: 23.7, lon: 121.0 },
+  UA: { lat: 48.4, lon: 31.2 },
+  US: { lat: 39.8, lon: -98.6 },
+  VN: { lat: 14.1, lon: 108.3 },
+  ZA: { lat: -30.6, lon: 22.9 },
+  ZZ: { lat: 0, lon: 0 },
+};
+
+export function getCountryCenter(countryCode) {
+  return COUNTRY_CENTERS[countryCode] || null;
+}
+
+export function projectCountryCenter(countryCode, width = 640, height = 320) {
+  const point = getCountryCenter(countryCode);
+  if (!point) return null;
+  const x = ((point.lon + 180) / 360) * width;
+  const y = ((90 - point.lat) / 180) * height;
+  return { x, y };
+}

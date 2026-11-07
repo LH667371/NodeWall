@@ -1,0 +1,12 @@
+bin/
+dist/
+node_modules/
+.gocache/
+.gocache*/
+.gopath/
+tmp/
+.DS_Store
+bpf/gen/*.o
+bpf/gen/*_bpf*.go
+third_party/geoip/*.csv
+third_party/geoip/*.csv.gz

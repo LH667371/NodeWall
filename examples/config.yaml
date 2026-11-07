@@ -1,0 +1,8 @@
+agent:
+  listen_addr: 127.0.0.1:9080
+  bpf_object: bpf/gen/xdpacl_bpfel.o
+  confirm_timeout: 180s
+
+server:
+  listen_addr: 127.0.0.1:8080
+  agent_url: http://127.0.0.1:9080

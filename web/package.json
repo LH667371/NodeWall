@@ -1,0 +1,21 @@
+{
+  "name": "nodewall-web",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "note": "echo 'Use npm --prefix web run build before make dev if you change frontend code.'"
+  },
+  "dependencies": {
+    "@lucide/vue": "1.47.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "vue": "^3.5.30"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^4.6.2",
+    "vite": "^4.5.5"
+  }
+}

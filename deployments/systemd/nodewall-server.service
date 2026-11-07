@@ -1,0 +1,14 @@
+[Unit]
+Description=NodeWall server
+After=network-online.target nodewall-agent.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/nodewall
+EnvironmentFile=-/etc/nodewall/nodewall.env
+ExecStart=/opt/nodewall/bin/nodewall server
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

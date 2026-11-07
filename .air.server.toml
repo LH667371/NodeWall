@@ -1,0 +1,13 @@
+root = "."
+tmp_dir = "tmp/air-server"
+
+[build]
+cmd = "env GOCACHE=$PWD/.gocache GOPATH=$PWD/.gopath GOENV=off go build -o ./tmp/air-server/nodewall-server ./cmd/server"
+bin = "./tmp/air-server/nodewall-server"
+delay = 300
+exclude_dir = ["bin", ".git", ".gocache", ".gopath", "tmp/air-server", "tmp/air-agent", "bpf/gen"]
+include_ext = ["go", "tpl", "tmpl", "html", "css", "js"]
+stop_on_error = true
+
+[log]
+time = true

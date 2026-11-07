@@ -1,0 +1,16 @@
+[Unit]
+Description=NodeWall agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/nodewall
+EnvironmentFile=-/etc/nodewall/nodewall.env
+ExecStart=/opt/nodewall/bin/nodewall agent
+Restart=on-failure
+LimitMEMLOCK=infinity
+Environment=NODEWALL_BPF_OBJECT=/opt/nodewall/bpf/gen/xdpacl_bpfel.o
+
+[Install]
+WantedBy=multi-user.target

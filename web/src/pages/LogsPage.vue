@@ -1,8 +1,11 @@
 <script setup>
-import { computed } from "vue";
+import { computed, ref, watch } from "vue";
 import { Ban, Clock3, Gauge, ShieldCheck, Trash2 } from "@lucide/vue";
 import InfoTip from "@/components/InfoTip.vue";
 import { useI18n } from "@/lib/i18n";
+import TablePagination from "@/components/TablePagination.vue";
+import { formatDateTime } from "@/lib/time";
+import { canActOnFirewallSource, firewallSourceLabel } from "@/lib/firewallLogs";
 
 const props = defineProps({
   store: { type: Object, required: true },
@@ -10,10 +13,15 @@ const props = defineProps({
 const { t } = useI18n();
 
 const locale = computed(() => props.store?.state?.locale || "zh-CN");
-const visibleLogs = computed(() => props.store.filteredLogs);
-const selectedVisibleCount = computed(() => visibleLogs.value.filter((item) => isSelected(item)).length);
-const allVisibleSelected = computed(() => visibleLogs.value.length > 0 && selectedVisibleCount.value === visibleLogs.value.length);
+const logPage = ref(0);
+const logPageSize = ref(20);
+const filteredLogs = computed(() => props.store.filteredLogs || []);
+const visibleLogs = computed(() => filteredLogs.value.slice(logPage.value * logPageSize.value, (logPage.value + 1) * logPageSize.value));
+const selectedVisibleCount = computed(() => visibleLogs.value.filter((item) => canActOnFirewallSource(item) && isSelected(item)).length);
+const selectableLogs = computed(() => visibleLogs.value.filter(canActOnFirewallSource));
+const allVisibleSelected = computed(() => selectableLogs.value.length > 0 && selectedVisibleCount.value === selectableLogs.value.length);
 const someVisibleSelected = computed(() => selectedVisibleCount.value > 0 && !allVisibleSelected.value);
+watch(() => filteredLogs.value.length, () => { logPage.value = 0; });
 
 function normalizeIPv4(value) {
   const raw = String(value || "").trim();
@@ -27,11 +35,16 @@ function normalizeIPv4(value) {
 }
 
 function displaySourceIP(item) {
+  if (item?.source_cidr || item?.reason === "dhcp_broadcast") return firewallSourceLabel(item, t);
   return normalizeIPv4(item?.source_ip) || String(item?.source_ip || "-");
 }
 
+function displaySourceDomain(item) {
+  return String(item?.source_domain || "").trim();
+}
+
 function itemKey(item) {
-  return [item.interface || "-", item.direction || "ingress", displaySourceIP(item), item.port || 0, item.timestamp || "-"].join("|");
+  return [item.interface || "-", item.direction || "ingress", item.source_ip || item.source_cidr || "-", item.port || 0, item.timestamp || "-"].join("|");
 }
 
 function isSelected(item) {
@@ -40,10 +53,10 @@ function isSelected(item) {
 
 function toggleAllLogs() {
   if (allVisibleSelected.value) {
-    visibleLogs.value.forEach((item) => props.store.state.selection.delete(itemKey(item)));
+    selectableLogs.value.forEach((item) => props.store.state.selection.delete(itemKey(item)));
     return;
   }
-  visibleLogs.value.forEach((item) => {
+  selectableLogs.value.forEach((item) => {
     if (!isSelected(item)) props.store.toggleLogSelection(item);
   });
 }
@@ -82,6 +95,7 @@ function actionCopy(item, baseCopy, action) {
 }
 
 function actionTooltip(item, action) {
+  if (!canActOnFirewallSource(item)) return t("firewallSourceActionUnavailable");
   const copy = {
     allow: t("logActionAllowTooltip"),
     "rate-limit": t("logActionRateTooltip"),
@@ -98,9 +112,7 @@ function hitCount(item) {
 
 function formatTime(value) {
   if (!value) return "-";
-  const ts = new Date(value);
-  if (Number.isNaN(ts.getTime())) return "-";
-  return ts.toLocaleString(locale.value === "en-US" ? "en-US" : "zh-CN");
+  return formatDateTime(value, locale.value === "en-US" ? "en-US" : "zh-CN");
 }
 
 function openAllow(item) {
@@ -139,7 +151,7 @@ function openBlock(item) {
 
 function openRateLimit(item) {
   const source = displaySourceIP(item);
-  const endpoint = item.port ? `${source}:${item.port}` : source;
+  const endpoint = item.port ? `${source} · ${t("targetPort")} ${item.port}` : source;
   props.store.openModal({
     title: t("logActionRateTitle"),
     copy: actionCopy(item, t("logActionRateCopy", { endpoint }), "rate-limit"),
@@ -193,7 +205,7 @@ function openTempBlock(item) {
 }
 
 async function bulkTempBlock() {
-  const rows = props.store.filteredLogs.filter((item) => isSelected(item));
+  const rows = filteredLogs.value.filter((item) => canActOnFirewallSource(item) && isSelected(item));
   for (const item of rows) {
     await props.store.runLogAction("temp-block", item, { duration_minutes: 60 });
   }
@@ -201,7 +213,7 @@ async function bulkTempBlock() {
 }
 
 async function bulkRateLimit() {
-  const rows = props.store.filteredLogs.filter((item) => isSelected(item));
+  const rows = filteredLogs.value.filter((item) => canActOnFirewallSource(item) && isSelected(item));
   for (const item of rows) {
     await props.store.runLogAction("rate-limit", item, { requests_per_minute: 120, burst: 20 });
   }
@@ -211,6 +223,13 @@ async function bulkRateLimit() {
 
 <template>
   <section class="page-grid">
+    <div class="reports-page-intro">
+      <div>
+        <p class="eyebrow">{{ t("reportsEyebrow") }}</p>
+        <h1>{{ t("reportsTitle") }}</h1>
+        <p>{{ t("reportsSubtitle") }}</p>
+      </div>
+    </div>
     <div class="logs-layout">
       <article class="panel logs-table-panel">
         <div class="panel-head">
@@ -275,15 +294,15 @@ async function bulkRateLimit() {
                       type="checkbox"
                       :checked="allVisibleSelected"
                       :indeterminate="someVisibleSelected"
-                      :disabled="!visibleLogs.length"
+                      :disabled="!selectableLogs.length"
                       :aria-label="allVisibleSelected ? t('deselectAll') : t('selectAll')"
                       @change="toggleAllLogs"
                     />
                     <span>{{ allVisibleSelected ? t("deselectAll") : t("selectAll") }}</span>
                   </label>
                 </th>
-                <th>{{ t("sourceIp") }}</th>
-                <th>{{ t("port") }}</th>
+                <th>{{ t("sourceEndpoint") }}</th>
+                <th>{{ t("targetPort") }}</th>
                 <th>{{ t("toolbarDirection") }}</th>
                 <th>{{ t("reason") }}</th>
                 <th>{{ t("hitCount") }}</th>
@@ -298,48 +317,51 @@ async function bulkRateLimit() {
               </tr>
             </thead>
             <tbody>
-              <tr v-for="item in props.store.filteredLogs" :key="itemKey(item)">
-                <td><input type="checkbox" :checked="isSelected(item)" @change="props.store.toggleLogSelection(item)" /></td>
-                <td class="log-source">
-                  <strong>{{ displaySourceIP(item) }}</strong>
+              <tr v-for="item in visibleLogs" :key="itemKey(item)">
+                <td><input type="checkbox" :checked="isSelected(item)" :disabled="!canActOnFirewallSource(item)" @change="props.store.toggleLogSelection(item)" /></td>
+                <td class="log-source" :title="[displaySourceDomain(item), displaySourceIP(item), item.interface].filter(Boolean).join(' · ')">
+                  <strong v-if="displaySourceDomain(item)">{{ displaySourceDomain(item) }}</strong>
+                  <span>{{ displaySourceIP(item) }}</span>
                   <small>{{ item.interface }}</small>
                 </td>
-                <td>{{ item.port || "-" }}</td>
+                <td :title="item.direction === 'egress' ? t('targetPortEgressHint') : t('targetPortIngressHint')">{{ item.port || "-" }}</td>
                 <td>{{ item.direction === "egress" ? t("toolbarEgress") : t("toolbarIngress") }}</td>
-                <td>{{ props.store.formatLogReason(item.reason) }}</td>
+                <td :title="props.store.formatLogReason(item.reason)">{{ props.store.formatLogReason(item.reason) }}</td>
                 <td>{{ hitCount(item) }}</td>
                 <td>{{ formatTime(item.timestamp) }}</td>
                 <td>
                   <span v-if="isHandled(item)" class="status-pill">{{ t("handled") }}</span>
                   <span v-else-if="isIntercepted(item)" class="status-pill danger">{{ t("intercepted") }}</span>
+                  <span v-else class="status-pill">{{ t("firewallObservedOnly") }}</span>
                 </td>
                 <td>
                   <div class="inline-actions">
-                    <button class="icon-button table-action-button log-action-button allow" :title="actionTooltip(item, 'allow')" :aria-label="actionTooltip(item, 'allow')" :disabled="isCurrentAction(item, 'allow')" @click="openAllow(item)">
+                    <button class="icon-button table-action-button log-action-button allow" :title="actionTooltip(item, 'allow')" :aria-label="actionTooltip(item, 'allow')" :disabled="!canActOnFirewallSource(item) || isCurrentAction(item, 'allow')" @click="openAllow(item)">
                       <ShieldCheck :size="18" stroke-width="1.9" aria-hidden="true" />
                       <span class="log-action-tooltip" role="tooltip"><strong>{{ t("actionAllow") }}</strong><small>{{ t("logActionAllowTooltip") }}</small></span>
                     </button>
-                    <button class="icon-button table-action-button log-action-button rate" :title="actionTooltip(item, 'rate-limit')" :aria-label="actionTooltip(item, 'rate-limit')" :disabled="isCurrentAction(item, 'rate-limit')" @click="openRateLimit(item)">
+                    <button class="icon-button table-action-button log-action-button rate" :title="actionTooltip(item, 'rate-limit')" :aria-label="actionTooltip(item, 'rate-limit')" :disabled="!canActOnFirewallSource(item) || isCurrentAction(item, 'rate-limit')" @click="openRateLimit(item)">
                       <Gauge :size="18" stroke-width="1.9" aria-hidden="true" />
                       <span class="log-action-tooltip" role="tooltip"><strong>{{ t("actionRateLimit") }}</strong><small>{{ t("logActionRateTooltip") }}</small></span>
                     </button>
-                    <button class="icon-button table-action-button log-action-button warning" :title="actionTooltip(item, 'temp-block')" :aria-label="actionTooltip(item, 'temp-block')" :disabled="isCurrentAction(item, 'temp-block')" @click="openTempBlock(item)">
+                    <button class="icon-button table-action-button log-action-button warning" :title="actionTooltip(item, 'temp-block')" :aria-label="actionTooltip(item, 'temp-block')" :disabled="!canActOnFirewallSource(item) || isCurrentAction(item, 'temp-block')" @click="openTempBlock(item)">
                       <Clock3 :size="18" stroke-width="1.9" aria-hidden="true" />
                       <span class="log-action-tooltip" role="tooltip"><strong>{{ t("actionTempBlock") }}</strong><small>{{ t("logActionTempTooltip") }}</small></span>
                     </button>
-                    <button class="icon-button table-action-button log-action-button danger" :title="actionTooltip(item, 'block')" :aria-label="actionTooltip(item, 'block')" :disabled="isCurrentAction(item, 'block')" @click="openBlock(item)">
+                    <button class="icon-button table-action-button log-action-button danger" :title="actionTooltip(item, 'block')" :aria-label="actionTooltip(item, 'block')" :disabled="!canActOnFirewallSource(item) || isCurrentAction(item, 'block')" @click="openBlock(item)">
                       <Ban :size="18" stroke-width="1.9" aria-hidden="true" />
                       <span class="log-action-tooltip" role="tooltip"><strong>{{ t("actionBlock") }}</strong><small>{{ t("logActionBlockTooltip") }}</small></span>
                     </button>
                   </div>
                 </td>
               </tr>
-              <tr v-if="!props.store.filteredLogs.length">
+              <tr v-if="!filteredLogs.length">
                 <td colspan="9" class="table-empty">{{ t("noLogs") }}</td>
               </tr>
             </tbody>
           </table>
         </div>
+        <TablePagination v-model:page="logPage" v-model:page-size="logPageSize" :total="filteredLogs.length" :page-sizes="[20, 50, 100]" />
       </article>
 
       <article class="panel logs-queue-panel">
@@ -352,7 +374,7 @@ async function bulkRateLimit() {
         <div v-if="props.store.state.temporaryBlocks.length" class="stack-list">
           <div v-for="item in props.store.state.temporaryBlocks" :key="item.id" class="queue-card">
             <strong>{{ displaySourceIP(item) }}</strong>
-            <span>{{ item.port ? `:${item.port}` : t("allPorts") }}</span>
+            <span>{{ item.port ? `${t("targetPort")} ${item.port}` : t("allPorts") }}</span>
             <small>{{ formatTime(item.expires_at) }}</small>
           </div>
         </div>
@@ -369,7 +391,7 @@ async function bulkRateLimit() {
         <div v-if="props.store.state.rateLimits.length" class="stack-list">
           <div v-for="item in props.store.state.rateLimits" :key="item.id" class="queue-card">
             <strong>{{ displaySourceIP(item) }}</strong>
-            <span>{{ item.port ? `:${item.port}` : t("allPorts") }}</span>
+            <span>{{ item.port ? `${t("targetPort")} ${item.port}` : t("allPorts") }}</span>
             <small>{{ item.requests_per_minute }}/min · burst {{ item.burst }}</small>
           </div>
         </div>
@@ -387,7 +409,7 @@ async function bulkRateLimit() {
           <div v-for="item in props.store.state.interfaceLogs.slice(0, 8)" :key="itemKey(item)" class="feed-item">
             <div>
               <strong>{{ displaySourceIP(item) }}</strong>
-              <p>{{ props.store.formatLogReason(item.reason) }} · {{ item.port || "-" }} · {{ item.direction || "ingress" }}</p>
+              <p>{{ props.store.formatLogReason(item.reason) }} · {{ item.port ? `${t("targetPort")} ${item.port}` : t("allPorts") }} · {{ item.direction || "ingress" }}</p>
             </div>
             <small>{{ formatTime(item.timestamp) }}</small>
           </div>

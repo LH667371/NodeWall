@@ -5,11 +5,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	assets "nodewall"
 )
 
+// These variables allow release automation to label a specific binary at link time.
 var (
-	AppVersion     = "dev"
-	PackageVersion = "dev"
+	AppVersion     string
+	PackageVersion string
 )
 
 type Info struct {
@@ -19,21 +22,14 @@ type Info struct {
 
 func Current() Info {
 	app := strings.TrimSpace(AppVersion)
-	pkg := strings.TrimSpace(PackageVersion)
 	if app == "" || app == "dev" {
-		if v, ok := readVersionFile("VERSION"); ok {
-			app = v
-		}
-	}
-	if pkg == "" || pkg == "dev" {
-		if v, ok := readVersionFile("PACKAGE_VERSION"); ok {
-			pkg = v
-		}
+		app = strings.TrimSpace(assets.ReleaseVersion)
 	}
 	if app == "" {
 		app = "dev"
 	}
-	if pkg == "" {
+	pkg := strings.TrimSpace(PackageVersion)
+	if pkg == "" || pkg == "dev" {
 		pkg = app
 	}
 	return Info{AppVersion: app, PackageVersion: pkg}
@@ -53,33 +49,6 @@ func WriteInstallFiles(installDir string) error {
 func String() string {
 	info := Current()
 	return fmt.Sprintf("app=%s package=%s", info.AppVersion, info.PackageVersion)
-}
-
-func readVersionFile(name string) (string, bool) {
-	candidates := []string{
-		filepath.Join("/opt/nodewall", name),
-		filepath.Join(exeDir(), "..", name),
-		name,
-	}
-	for _, candidate := range candidates {
-		data, err := os.ReadFile(candidate)
-		if err != nil {
-			continue
-		}
-		value := strings.TrimSpace(string(data))
-		if value != "" {
-			return value, true
-		}
-	}
-	return "", false
-}
-
-func exeDir() string {
-	exe, err := os.Executable()
-	if err != nil {
-		return ""
-	}
-	return filepath.Dir(exe)
 }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {

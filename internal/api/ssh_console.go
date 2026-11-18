@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strconv"
@@ -34,16 +35,16 @@ var sshTerminalUpgrader = websocket.Upgrader{
 		if origin == "" {
 			return true
 		}
-		return strings.EqualFold(origin, requestOrigin(r))
+		parsed, err := url.Parse(origin)
+		if err != nil || parsed.Host == "" || parsed.User != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return false
+		}
+		// Compare the host only. TLS may terminate at an Ingress, so the
+		// backend request can be HTTP while the browser Origin is HTTPS. The
+		// host check still rejects a cross-site WebSocket and does not trust a
+		// forwarded scheme from an arbitrary client.
+		return strings.EqualFold(parsed.Host, r.Host)
 	},
-}
-
-func requestOrigin(r *http.Request) string {
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	return scheme + "://" + r.Host
 }
 
 type sshSessionRequest struct {

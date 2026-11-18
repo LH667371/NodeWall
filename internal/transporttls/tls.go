@@ -3,6 +3,7 @@
 package transporttls
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -25,6 +26,18 @@ import (
 // The private key stays on the host; only the certificate may be shared with
 // operators who want strict client-side verification of the self-signed peer.
 func EnsureCertificate(certFile, keyFile, listenAddr string) error {
+	return ensureCertificate(certFile, keyFile, listenAddr, false)
+}
+
+// EnsureCertificateForAddress preserves an existing certificate when it still
+// covers the advertised address. If a node has moved to a different IP, it
+// creates a replacement certificate before re-enrollment so the manager can
+// safely update both its endpoint and its pinned certificate in one operation.
+func EnsureCertificateForAddress(certFile, keyFile, listenAddr string) error {
+	return ensureCertificate(certFile, keyFile, listenAddr, true)
+}
+
+func ensureCertificate(certFile, keyFile, listenAddr string, requireAddress bool) error {
 	certFile = strings.TrimSpace(certFile)
 	keyFile = strings.TrimSpace(keyFile)
 	if certFile == "" || keyFile == "" {
@@ -44,7 +57,16 @@ func EnsureCertificate(certFile, keyFile, listenAddr string) error {
 	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
 	if _, certErr := os.Stat(certFile); certErr == nil {
 		if _, keyErr := os.Stat(keyFile); keyErr == nil {
-			return nil
+			if !requireAddress {
+				return nil
+			}
+			covered, err := certificateCoversAddress(certFile, keyFile, listenAddr)
+			if err != nil {
+				return err
+			}
+			if covered {
+				return nil
+			}
 		}
 	} else if !errors.Is(certErr, os.ErrNotExist) {
 		return certErr
@@ -58,6 +80,10 @@ func EnsureCertificate(certFile, keyFile, listenAddr string) error {
 		return fmt.Errorf("create TLS key directory: %w", err)
 	}
 
+	return createCertificate(certFile, keyFile, listenAddr)
+}
+
+func createCertificate(certFile, keyFile, listenAddr string) error {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 3072)
 	if err != nil {
 		return fmt.Errorf("generate TLS key: %w", err)
@@ -74,9 +100,13 @@ func EnsureCertificate(certFile, keyFile, listenAddr string) error {
 			CommonName:   "NodeWall self-signed",
 			Organization: []string{"NodeWall"},
 		},
-		NotBefore:             now.Add(-5 * time.Minute),
-		NotAfter:              now.Add(10 * 365 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		NotBefore: now.Add(-5 * time.Minute),
+		NotAfter:  now.Add(10 * 365 * 24 * time.Hour),
+		// NodeWall's self-signed certificate is also distributed as the
+		// single-node trust anchor. Mark it as a CA so Go and OpenSSL accept it
+		// when it is loaded into RootCAs on CentOS and other older hosts.
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment | x509.KeyUsageCertSign,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
 		DNSNames:              hosts.dns,
@@ -97,6 +127,40 @@ func EnsureCertificate(certFile, keyFile, listenAddr string) error {
 	return nil
 }
 
+func certificateCoversAddress(certFile, keyFile, listenAddr string) (bool, error) {
+	host := ""
+	if parsedHost, _, err := net.SplitHostPort(strings.TrimSpace(listenAddr)); err == nil {
+		host = strings.Trim(parsedHost, "[]")
+	} else {
+		host = strings.TrimSpace(listenAddr)
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return false, nil
+	}
+	data, err := os.ReadFile(certFile)
+	if err != nil {
+		return false, err
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return false, nil
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return false, nil
+	}
+	if time.Now().Before(certificate.NotBefore) || time.Now().After(certificate.NotAfter) {
+		return false, nil
+	}
+	if certificate.VerifyHostname(host) != nil {
+		return false, nil
+	}
+	if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
+		return false, nil
+	}
+	return true, nil
+}
+
 func ServerConfig(certFile, keyFile, listenAddr string) (*tls.Config, error) {
 	// TCP HTTPS and gRPC keep TLS 1.2 available for legacy curl/NSS clients.
 	// QUIC callers use QUICServerConfig, which enforces TLS 1.3 below.
@@ -115,20 +179,30 @@ func serverConfig(certFile, keyFile, listenAddr string, minVersion uint16) (*tls
 	if err := EnsureCertificate(certFile, keyFile, listenAddr); err != nil {
 		return nil, err
 	}
-	certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
+	if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
 		return nil, fmt.Errorf("load TLS certificate: %w", err)
 	}
-	return &tls.Config{
-		MinVersion:   minVersion,
-		Certificates: []tls.Certificate{certificate},
+	config := &tls.Config{
+		MinVersion: minVersion,
+		// Load the certificate for every new TLS handshake. This allows an
+		// administrator to import a replacement certificate without restarting
+		// the HTTP, gRPC, or QUIC listener; existing connections continue with
+		// the certificate negotiated when they were opened.
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
+			if err != nil {
+				return nil, fmt.Errorf("load TLS certificate: %w", err)
+			}
+			return &certificate, nil
+		},
 		// Keep all protocols used by NodeWall on the same certificate. HTTP/3
 		// uses h3, the browser fallback uses HTTP/1.1, and the cluster
 		// heartbeat/control channel uses gRPC over HTTP/2. Omitting h2 makes
 		// the TLS handshake succeed only far enough to be closed by grpc-go,
 		// leaving joined agents stuck in the offline state.
 		NextProtos: []string{"h3", "h2", "http/1.1"},
-	}, nil
+	}
+	return config, nil
 }
 
 // ClientConfig trusts a configured CA/certificate when supplied. During the
@@ -152,12 +226,66 @@ func ClientConfig(caFile, serverName string, insecureSkipVerify bool) (*tls.Conf
 	if err != nil {
 		return nil, fmt.Errorf("read TLS CA file: %w", err)
 	}
+	return ClientConfigFromPEM(data, serverName, insecureSkipVerify)
+}
+
+// ClientConfigFromPEM builds a client trust config from a supplied PEM. Older
+// NodeWall releases created self-signed server certificates without CA=true.
+// Such a certificate is still safe to trust when its exact leaf is pinned, but
+// Go rejects it as a RootCAs parent. Detect that legacy shape and verify the
+// peer's exact certificate instead of disabling verification wholesale.
+func ClientConfigFromPEM(data []byte, serverName string, insecureSkipVerify bool) (*tls.Config, error) {
+	config := &tls.Config{
+		MinVersion:         tls.VersionTLS13,
+		ServerName:         strings.TrimSpace(serverName),
+		InsecureSkipVerify: insecureSkipVerify,
+		NextProtos:         []string{"h3", "h2", "http/1.1"},
+	}
 	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(data) {
+	var pinned [][]byte
+	legacyLeaf := false
+	rest := data
+	for {
+		block, remaining := pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		rest = remaining
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		certificate, parseErr := x509.ParseCertificate(block.Bytes)
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse TLS CA certificate: %w", parseErr)
+		}
+		pool.AddCert(certificate)
+		pinned = append(pinned, append([]byte(nil), certificate.Raw...))
+		if !certificate.IsCA {
+			legacyLeaf = true
+		}
+	}
+	if len(pinned) == 0 {
 		return nil, errors.New("TLS CA file contains no certificates")
 	}
 	config.RootCAs = pool
-	config.InsecureSkipVerify = false
+	if !insecureSkipVerify && legacyLeaf {
+		config.InsecureSkipVerify = true
+		config.VerifyConnection = func(state tls.ConnectionState) error {
+			if len(state.PeerCertificates) == 0 {
+				return errors.New("TLS peer did not provide a certificate")
+			}
+			peer := state.PeerCertificates[0]
+			if config.ServerName != "" && peer.VerifyHostname(config.ServerName) != nil {
+				return fmt.Errorf("TLS certificate does not cover %s", config.ServerName)
+			}
+			for _, raw := range pinned {
+				if bytes.Equal(raw, peer.Raw) {
+					return nil
+				}
+			}
+			return errors.New("TLS peer certificate is not pinned")
+		}
+	}
 	return config, nil
 }
 

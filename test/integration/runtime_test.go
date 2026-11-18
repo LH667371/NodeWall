@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"image/png"
 	"io"
 	"net"
 	"net/http"
@@ -17,7 +18,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -47,8 +47,8 @@ func TestRuntimeProcess(t *testing.T) {
 	os.Exit(0)
 }
 
-// Exercise the production authentication wiring with real server/agent
-// processes, independent self-signed certificates, and a mock dataplane.
+// Exercise browser access protection and node enrollment with real processes,
+// independent self-signed certificates, and a mock dataplane.
 // No test process attaches a NIC or modifies sshd/netfilter configuration.
 func TestSecureMultiNodeRuntime(t *testing.T) {
 	managerDir, remoteDir := t.TempDir(), t.TempDir()
@@ -105,7 +105,8 @@ func TestSecureMultiNodeRuntime(t *testing.T) {
 		return result
 	}
 	startRuntime(t, "agent", baseEnv(managerDir, "manager", agentAddr, managerCert, managerKey), managerDir)
-	startRuntime(t, "server", baseEnv(managerDir, "manager", agentAddr, managerCert, managerKey), managerDir)
+	serverEnv := baseEnv(managerDir, "manager", agentAddr, managerCert, managerKey)
+	stopServer := startRuntime(t, "server", serverEnv, managerDir)
 	roots := x509.NewCertPool()
 	managerPEM, _ := os.ReadFile(managerCert)
 	roots.AppendCertsFromPEM(managerPEM)
@@ -121,19 +122,24 @@ func TestSecureMultiNodeRuntime(t *testing.T) {
 	if resp.StatusCode != 401 {
 		t.Fatal("anonymous browser read node list")
 	}
-	captchaID, captchaAnswer := solveLoginCaptcha(t, client, "https://"+managerAddr)
+	captchaID := assertLoginCaptchaPNG(t, client, "https://"+managerAddr)
 	resp, err = client.PostForm("https://"+managerAddr+"/login", url.Values{
 		"username":       {"admin"},
 		"password":       {"integration-test-password"},
 		"captcha_id":     {captchaID},
-		"captcha_answer": {captchaAnswer},
+		"captcha_answer": {"invalid"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != 303 {
-		t.Fatalf("login returned %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login with an invalid challenge returned %d", resp.StatusCode)
+	}
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == "nodewall_session" && cookie.Value != "" {
+			t.Fatal("invalid challenge issued a browser session")
+		}
 	}
 	req, _ := http.NewRequest(http.MethodGet, "https://"+agentAddr+"/health", nil)
 	req.Header.Set("Authorization", "Bearer "+managerToken)
@@ -145,7 +151,15 @@ func TestSecureMultiNodeRuntime(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatal("local node token was rejected")
 	}
-	resp, err = client.Post("https://"+managerAddr+"/nodes/enrollment", "application/json", bytes.NewBufferString(`{}`))
+	// The API package covers successful sign-in and CSRF with server-owned
+	// fixtures. Use a loopback server here for the node-to-node TLS checks,
+	// keeping them independent of the human challenge.
+	stopServer()
+	startRuntime(t, "server", append(serverEnv, "NODEWALL_AUTH_ENABLED=false"), managerDir)
+	waitEndpoint(t, client, "https://"+managerAddr+"/nodes", http.StatusOK)
+	enrollmentRequest, _ := http.NewRequest(http.MethodPost, "https://"+managerAddr+"/nodes/enrollment", bytes.NewBufferString(`{}`))
+	enrollmentRequest.Header.Set("Content-Type", "application/json")
+	resp, err = client.Do(enrollmentRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +231,9 @@ func TestSecureMultiNodeRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ = json.Marshal(map[string]string{"path": scanPath})
-	resp, err = client.Post("https://"+managerAddr+"/nodes/remote-node/security/scan", "application/json", bytes.NewReader(body))
+	scanRequest, _ := http.NewRequest(http.MethodPost, "https://"+managerAddr+"/nodes/remote-node/security/scan", bytes.NewReader(body))
+	scanRequest.Header.Set("Content-Type", "application/json")
+	resp, err = client.Do(scanRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +281,7 @@ func TestSecureMultiNodeRuntime(t *testing.T) {
 	}
 }
 
-func solveLoginCaptcha(t *testing.T, client *http.Client, baseURL string) (string, string) {
+func assertLoginCaptchaPNG(t *testing.T, client *http.Client, baseURL string) string {
 	t.Helper()
 	resp, err := client.Get(baseURL + "/login")
 	if err != nil {
@@ -276,94 +292,26 @@ func solveLoginCaptcha(t *testing.T, client *http.Client, baseURL string) (strin
 	if err != nil {
 		t.Fatalf("read login challenge: %v", err)
 	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get login challenge returned %d", resp.StatusCode)
+	}
 	page := string(body)
 	idMatch := regexp.MustCompile(`id="login-captcha-id" value="([a-f0-9]+)"`).FindStringSubmatch(page)
 	if len(idMatch) != 2 {
-		t.Fatalf("login page did not contain a captcha id: %s", page)
+		t.Fatal("login page did not contain a captcha id")
 	}
-
-	var answer string
-	switch {
-	case strings.Contains(page, `id="trace-image"`):
-		prompt := regexp.MustCompile(`class="trace-prompt">([^<]+)</p>`).FindStringSubmatch(page)
-		if len(prompt) != 2 {
-			t.Fatalf("trace challenge did not contain its coordinate prompt")
-		}
-		sequence := regexp.MustCompile(`[1-5]`).FindAllString(prompt[1], -1)
-		if len(sequence) != 5 {
-			t.Fatalf("trace challenge has an invalid route: %q", prompt[1])
-		}
-		imageMatch := regexp.MustCompile(`id="trace-image" src="([^"]+)"`).FindStringSubmatch(page)
-		if len(imageMatch) != 2 {
-			t.Fatal("trace challenge did not contain its image")
-		}
-		imageURL := html.UnescapeString(imageMatch[1])
-		const imagePrefix = "data:image/svg+xml;base64,"
-		if !strings.HasPrefix(imageURL, imagePrefix) {
-			t.Fatalf("unexpected trace image URI: %q", imageURL)
-		}
-		svg, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(imageURL, imagePrefix))
-		if err != nil {
-			t.Fatalf("decode trace image: %v", err)
-		}
-		if strings.Count(string(svg), `class="decoy"`) != 3 {
-			t.Fatal("trace image should include three unnumbered decoy points")
-		}
-		matches := regexp.MustCompile(`<text x="([0-9.]+)" y="([0-9.]+)"[^>]*>([1-5])</text>`).FindAllStringSubmatch(string(svg), -1)
-		if len(matches) != 5 {
-			t.Fatalf("trace image should contain five numbered targets, got %d", len(matches))
-		}
-		coordinates := make([]string, len(matches))
-		for i, match := range matches {
-			if match[3] != sequence[i] {
-				t.Fatalf("image target order %q does not match prompt %q", match[3], sequence[i])
-			}
-			x, _ := strconv.ParseFloat(match[1], 64)
-			y, _ := strconv.ParseFloat(match[2], 64)
-			coordinates[i] = fmt.Sprintf("%.2f,%.2f", x/3.2, y/1.5)
-		}
-		answer = strings.Join(coordinates, ";")
-	case strings.Contains(page, `class="captcha-image"`):
-		imageMatch := regexp.MustCompile(`class="captcha-image" data-kind="(math|letters)" src="([^"]+)"`).FindStringSubmatch(page)
-		if len(imageMatch) != 3 {
-			t.Fatalf("letter challenge did not contain an inline image")
-		}
-		imageURL := html.UnescapeString(imageMatch[2])
-		const imagePrefix = "data:image/svg+xml;base64,"
-		if !strings.HasPrefix(imageURL, imagePrefix) {
-			t.Fatalf("unexpected inline challenge image URI: %q", imageURL)
-		}
-		svg, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(imageURL, imagePrefix))
-		if err != nil {
-			t.Fatalf("decode challenge image: %v", err)
-		}
-		glyphs := regexp.MustCompile(`<text[^>]*>([^<])</text>`).FindAllSubmatch(svg, -1)
-		if len(glyphs) == 0 {
-			t.Fatal("challenge image has no glyphs")
-		}
-		var display strings.Builder
-		for _, glyph := range glyphs {
-			display.Write(glyph[1])
-		}
-		if imageMatch[1] == "letters" {
-			answer = display.String()
-		} else {
-			math := regexp.MustCompile(`^([0-9]+)([+−])([0-9]+)=\?$`).FindStringSubmatch(display.String())
-			if len(math) != 4 {
-				t.Fatalf("unexpected equation rendered in captcha image: %q", display.String())
-			}
-			left, _ := strconv.Atoi(math[1])
-			right, _ := strconv.Atoi(math[3])
-			if math[2] == "+" {
-				answer = strconv.Itoa(left + right)
-			} else {
-				answer = strconv.Itoa(left - right)
-			}
-		}
-	default:
-		t.Fatal("login page has no recognized captcha challenge")
+	imageMatch := regexp.MustCompile(`src="data:image/png;base64,([^"]+)"`).FindStringSubmatch(page)
+	if len(imageMatch) != 2 {
+		t.Fatal("login page did not contain an inline PNG captcha")
 	}
-	return idMatch[1], answer
+	data, err := base64.StdEncoding.DecodeString(html.UnescapeString(imageMatch[1]))
+	if err != nil {
+		t.Fatalf("decode captcha payload: %v", err)
+	}
+	if _, err := png.Decode(bytes.NewReader(data)); err != nil {
+		t.Fatalf("decode captcha image: %v", err)
+	}
+	return idMatch[1]
 }
 
 func unusedAddress(t *testing.T) string {

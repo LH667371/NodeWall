@@ -8,11 +8,54 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"nodewall/internal/store"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/peer"
 )
+
+func TestHeartbeatRPCIsBoundedEvenWhenManagerAcceptsButStopsReplying(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadlineSeen := make(chan time.Time, 1)
+	server := grpc.NewServer(grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		deadline, _ := ctx.Deadline()
+		deadlineSeen <- deadline
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}))
+	NewServer(store.New(), "", "").Register(server)
+	go server.Serve(listener)
+	defer server.Stop()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- ReportLoop(ctx, listener.Addr().String(), ReportRequest{NodeID: "node-a"}, time.Millisecond)
+	}()
+	select {
+	case deadline := <-deadlineSeen:
+		remaining := time.Until(deadline)
+		if deadline.IsZero() || remaining <= 0 || remaining > 6*time.Second {
+			t.Fatalf("heartbeat has no bounded RPC timeout: %s", deadline)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("heartbeat did not reach manager")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled heartbeat did not reconnect/exit")
+	}
+}
 
 func TestReportDoesNotSynchronizePolicyToNodes(t *testing.T) {
 	t.Parallel()
@@ -43,6 +86,24 @@ func TestReportDoesNotSynchronizePolicyToNodes(t *testing.T) {
 	}
 	if len(st.ListNodes(context.Background())) != 1 {
 		t.Fatalf("expected heartbeat to record exactly one node")
+	}
+}
+
+func TestReportPersistsSelectedStandbyWebPort(t *testing.T) {
+	state := store.New()
+	srv := NewServer(state, "http://127.0.0.1:9080", "")
+	ctx := peer.NewContext(context.Background(), &peer.Peer{Addr: &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 50000}})
+	if _, err := srv.Report(ctx, &ReportRequest{
+		NodeID:         "node-a",
+		AgentHTTPAddr:  "192.0.2.10:9080",
+		AgentURL:       "https://192.0.2.10:9080",
+		ServerHTTPAddr: "0.0.0.0:8082",
+	}); err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	nodes := state.ListNodes(ctx)
+	if len(nodes) != 1 || nodes[0].ServerHTTPAddr != "192.0.2.10:8082" {
+		t.Fatalf("selected web port was not persisted as a reachable address: %#v", nodes)
 	}
 }
 
@@ -85,6 +146,22 @@ func TestPackageUpdateAvailable(t *testing.T) {
 				t.Fatalf("packageUpdateAvailable(%q, %q) = %t, want %t", test.local, test.remote, got, test.wantUpdate)
 			}
 		})
+	}
+}
+
+func TestReportIncludesCurrentManagerURL(t *testing.T) {
+	server := NewServer(store.New(), "https://127.0.0.1:9080", "")
+	server.SetManagerURL("https://192.168.201.17:8086/")
+	response, err := server.Report(context.Background(), &ReportRequest{
+		NodeID:        "node-a",
+		AgentHTTPAddr: "192.168.201.20:9080",
+		AgentURL:      "https://192.168.201.20:9080",
+	})
+	if err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	if response.ManagerURL != "https://192.168.201.17:8086" {
+		t.Fatalf("manager URL = %q", response.ManagerURL)
 	}
 }
 

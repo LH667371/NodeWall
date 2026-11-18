@@ -14,12 +14,33 @@ import (
 	"testing"
 	"time"
 
+	"nodewall/internal/models"
 	"nodewall/internal/nodeauth"
 	"nodewall/internal/service"
 	"nodewall/internal/sshconsole"
 	"nodewall/internal/store"
 	"nodewall/internal/transporttls"
 )
+
+func TestSuggestEnrollmentNodeIDUsesAgentEndpointAndAvoidsManagerID(t *testing.T) {
+	state := store.New()
+	if err := state.UpsertNodeChecked(t.Context(), models.Node{ID: "192-168-201-18"}); err != nil {
+		t.Fatal(err)
+	}
+	handler := &ServerHandler{nodeID: "manager", store: state}
+	suggested := handler.suggestEnrollmentNodeID(nodeauth.Credential{AgentURL: "https://192.168.201.18:9080"})
+	if suggested != "192-168-201-18-"+sha256HexPrefix("https://192.168.201.18:9080") {
+		t.Fatalf("suggested node ID = %q", suggested)
+	}
+	if strings.ContainsAny(suggested, "/:") {
+		t.Fatalf("suggested node ID contains endpoint punctuation: %q", suggested)
+	}
+}
+
+func sha256HexPrefix(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])[:8]
+}
 
 func TestEnrollmentIsAuthenticatedSingleUseAndDurable(t *testing.T) {
 	dir := t.TempDir()
@@ -32,7 +53,7 @@ func TestEnrollmentIsAuthenticatedSingleUseAndDurable(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := store.New()
-	handler := &ServerHandler{nodeID: "manager", store: state, service: service.NewPolicyService(state), tlsCertFile: certFile, auth: &authManager{enabled: true, sessions: map[string]sessionState{"admin-session": {Username: "admin", Role: "admin", ExpiresAt: time.Now().Add(time.Hour)}, "viewer-session": {Username: "viewer", Role: "viewer", ExpiresAt: time.Now().Add(time.Hour)}}}}
+	handler := &ServerHandler{nodeID: "manager", store: state, service: service.NewPolicyService(state), tlsCertFile: certFile, auth: &authManager{enabled: true, sessions: map[string]sessionState{"admin-session": {Username: "admin", Role: "admin", CSRFToken: "admin-csrf", ExpiresAt: time.Now().Add(time.Hour)}, "viewer-session": {Username: "viewer", Role: "viewer", ExpiresAt: time.Now().Add(time.Hour)}}}}
 	handler.ConfigureNodeAuth(registry)
 	handler.sshConsole = sshconsole.NewWithKeyPath(filepath.Join(dir, "console-key"))
 	routes := handler.Routes()
@@ -49,6 +70,7 @@ func TestEnrollmentIsAuthenticatedSingleUseAndDurable(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodPost, "https://manager.invalid/nodes/enrollment", nil)
 	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "admin-session"})
+	req.Header.Set("X-NodeWall-CSRF", "admin-csrf")
 	rec := httptest.NewRecorder()
 	routes.ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated {
@@ -102,6 +124,7 @@ func TestEnrollmentIsAuthenticatedSingleUseAndDurable(t *testing.T) {
 	for _, expected := range []string{
 		"CURL_ARGS",
 		"downloading NodeWall agent binary",
+		"ClamAV engine and databases will synchronize automatically from enrolled cluster nodes",
 		"verifying NodeWall agent binary",
 		"progress 'checking curl capabilities'",
 		"progress \"selected interface $JOIN_IFACE ($JOIN_IP)\"",
@@ -118,12 +141,17 @@ func TestEnrollmentIsAuthenticatedSingleUseAndDurable(t *testing.T) {
 		"NODEWALL_AGENT_ADDR=0.0.0.0:9080",
 		"NODEWALL_AGENT_HTTP_ADDR=${JOIN_IP}:9080",
 		"NODEWALL_AGENT_URL=https://${JOIN_IP}:9080",
+		"NODEWALL_SERVER_HTTP_ADDR=${JOIN_IP}:${SERVER_PORT}",
 		"LimitMEMLOCK=infinity",
 		"systemctl daemon-reload",
+		"systemd_enable_unit",
 	} {
 		if !strings.Contains(scriptResponse.Body.String(), expected) {
 			t.Fatalf("join script is missing %q", expected)
 		}
+	}
+	if strings.Contains(scriptResponse.Body.String(), "echo 'NODEWALL_SERVER_ADDR=0.0.0.0:8080'") {
+		t.Fatal("join script overwrites the automatically selected web port")
 	}
 	agentToken, _ := nodeauth.NewToken()
 	certificate, _ := os.ReadFile(certFile)
@@ -146,6 +174,58 @@ func TestEnrollmentIsAuthenticatedSingleUseAndDurable(t *testing.T) {
 	if err != nil || !loaded.Authenticate("node-a", agentToken) {
 		t.Fatalf("credential was not persisted: %v", err)
 	}
+	newCertFile := filepath.Join(dir, "node-new.crt")
+	newKeyFile := filepath.Join(dir, "node-new.key")
+	if err := transporttls.EnsureCertificate(newCertFile, newKeyFile, "192.0.2.20:9080"); err != nil {
+		t.Fatal(err)
+	}
+	newCertificate, err := os.ReadFile(newCertFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticketRequest := httptest.NewRequest(http.MethodPost, "https://manager.invalid/nodes/enrollment", nil)
+	ticketRequest.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "admin-session"})
+	ticketRequest.Header.Set("X-NodeWall-CSRF", "admin-csrf")
+	ticketResponse := httptest.NewRecorder()
+	routes.ServeHTTP(ticketResponse, ticketRequest)
+	if ticketResponse.Code != http.StatusCreated {
+		t.Fatalf("repair enrollment ticket: %s", ticketResponse.Body.String())
+	}
+	var repairTicket struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(ticketResponse.Body.Bytes(), &repairTicket); err != nil {
+		t.Fatal(err)
+	}
+	repairURL, err := url.Parse(repairTicket.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairBody, err := json.Marshal(nodeauth.Credential{
+		NodeID:      "node-a",
+		AgentURL:    "https://192.0.2.20:9080",
+		Token:       agentToken,
+		Certificate: string(newCertificate),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairRequest := httptest.NewRequest(http.MethodPost, "https://manager.invalid/join/enroll", strings.NewReader(string(repairBody)))
+	repairRequest.Header.Set("Content-Type", "application/json")
+	repairRequest.Header.Set("Authorization", "Bearer "+repairURL.Query().Get("token"))
+	repairResponse := httptest.NewRecorder()
+	routes.ServeHTTP(repairResponse, repairRequest)
+	if repairResponse.Code != http.StatusCreated {
+		t.Fatalf("repair enrollment: status=%d body=%s", repairResponse.Code, repairResponse.Body.String())
+	}
+	reloaded, err := nodeauth.Open(filepath.Join(dir, "credentials.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, ok := reloaded.Get("node-a")
+	if !ok || updated.AgentURL != "https://192.0.2.20:9080" || strings.TrimSpace(updated.Certificate) != strings.TrimSpace(string(newCertificate)) {
+		t.Fatalf("repair enrollment did not replace endpoint and certificate: %#v", updated)
+	}
 	publicNodes, _ := json.Marshal(state.ListNodes(t.Context()))
 	if strings.Contains(string(publicNodes), agentToken) {
 		t.Fatal("node API exposed its credential")
@@ -155,5 +235,57 @@ func TestEnrollmentIsAuthenticatedSingleUseAndDurable(t *testing.T) {
 	routes.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatal("anonymous installation script remained available")
+	}
+}
+
+func TestJoinBootstrapRequiresEnrolledNodeAndServesStandbyResources(t *testing.T) {
+	dir := t.TempDir()
+	certFile := filepath.Join(dir, "node.crt")
+	if err := transporttls.EnsureCertificate(certFile, filepath.Join(dir, "node.key"), "127.0.0.1:9080"); err != nil {
+		t.Fatal(err)
+	}
+	authFile := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(authFile, []byte(`{"users":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := nodeauth.Open(filepath.Join(dir, "credentials.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := nodeauth.NewToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, _ := os.ReadFile(certFile)
+	credential := nodeauth.Credential{NodeID: "node-a", AgentURL: "https://127.0.0.1:9080", Token: token, Certificate: string(certificate)}
+	if err := registry.Put(credential); err != nil {
+		t.Fatal(err)
+	}
+	state := store.New()
+	state.UpsertNode(t.Context(), models.Node{ID: "node-a", Name: "node-a", AgentURL: credential.AgentURL})
+	handler := &ServerHandler{
+		nodeID:      "manager",
+		store:       state,
+		service:     service.NewPolicyService(state),
+		tlsCertFile: certFile,
+		auth:        &authManager{authFile: authFile},
+	}
+	handler.ConfigureNodeAuth(registry)
+	routes := handler.Routes()
+	for _, kind := range []string{"state", "credentials", "auth"} {
+		req := httptest.NewRequest(http.MethodGet, "/join/bootstrap/"+kind, nil)
+		req.Header.Set(nodeauth.NodeHeader, credential.NodeID)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		routes.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK || rec.Body.Len() == 0 {
+			t.Fatalf("bootstrap %s failed: status=%d body=%s", kind, rec.Code, rec.Body.String())
+		}
+	}
+	unauthorized := httptest.NewRequest(http.MethodGet, "/join/bootstrap/state", nil)
+	unauthorizedRec := httptest.NewRecorder()
+	routes.ServeHTTP(unauthorizedRec, unauthorized)
+	if unauthorizedRec.Code != http.StatusUnauthorized {
+		t.Fatalf("anonymous bootstrap request returned %d", unauthorizedRec.Code)
 	}
 }

@@ -43,6 +43,44 @@ func TestNormalizeInterfacePolicyMigratesLegacyIngressFields(t *testing.T) {
 	}
 }
 
+func TestDefaultEgressPolicyIncludesCommonOutboundTraffic(t *testing.T) {
+	policy := DefaultDirectionPolicy(DirectionEgress)
+	if !policy.ObserveOnly || policy.DefaultAction != "drop" {
+		t.Fatalf("expected a fail-safe observe-only egress baseline, got %#v", policy)
+	}
+	for _, want := range []PortRule{
+		{Protocol: PortProtocolTCP, Port: 22},
+		{Protocol: PortProtocolTCP, Port: 53},
+		{Protocol: PortProtocolTCP, Port: 80},
+		{Protocol: PortProtocolTCP, Port: 443},
+		{Protocol: PortProtocolUDP, Port: 53},
+		{Protocol: PortProtocolUDP, Port: 123},
+		{Protocol: PortProtocolICMP},
+	} {
+		found := false
+		for _, rule := range policy.AllowedPortRules {
+			if rule == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("default egress policy omitted %#v: %#v", want, policy.AllowedPortRules)
+		}
+	}
+}
+
+func TestNormalizeMigratesEmptyExistingEgressPolicyToBaseline(t *testing.T) {
+	policy := NormalizeInterfacePolicy(InterfacePolicy{
+		Egress: DirectionPolicy{
+			Enabled: true, Mode: "observe", DefaultAction: "pass", ObserveOnly: true,
+		},
+	})
+	if len(policy.Egress.AllowedPortRules) != 7 {
+		t.Fatalf("expected existing observe-only egress policy to receive baseline rules, got %#v", policy.Egress.AllowedPortRules)
+	}
+}
+
 func TestNormalizeInterfacePolicyKeepsPendingPublish(t *testing.T) {
 	now := time.Now().UTC()
 	policy := InterfacePolicy{

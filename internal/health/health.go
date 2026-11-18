@@ -49,11 +49,12 @@ func (p Probe) Check(_ context.Context) models.HealthStatus {
 	for _, iface := range interfaces {
 		runtime, runtimeErr := p.XDP.Runtime(iface)
 		health := models.InterfaceHealth{
-			Interface:   iface,
-			XDPAttached: runtime.Attached,
-			MapOK:       runtime.ProgramLoaded,
-			StatsOK:     false,
-			LastCheckAt: now,
+			Interface:     iface,
+			DataplaneMode: string(runtime.Mode),
+			XDPAttached:   runtime.Attached,
+			MapOK:         runtime.ProgramLoaded,
+			StatsOK:       false,
+			LastCheckAt:   now,
 		}
 		if runtimeErr != nil {
 			health.MapOK = false
@@ -75,7 +76,7 @@ func (p Probe) Check(_ context.Context) models.HealthStatus {
 			// not block traffic. Expose that distinction to the manager so the UI
 			// cannot report a trial or a staged policy as enforced.
 			health.PolicyEnforced = cfg.PolicyEnforced && !cfg.ObserveOnly
-			health.EgressPolicyEnforced = cfg.EgressPolicyEnforced
+			health.EgressPolicyEnforced = cfg.EgressPolicyEnforced && !cfg.EgressObserveOnly
 			// Runtime exposes ingress rule maps. Egress currently uses a TC
 			// tracker for reply-flow discovery, so there is no equivalent
 			// egress rule set here from which to infer an expected gate value.

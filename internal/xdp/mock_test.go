@@ -47,6 +47,22 @@ func TestNewDataplane(t *testing.T) {
 	if _, ok := dp.(*MockManager); !ok {
 		t.Fatalf("expected mock dataplane")
 	}
+	for _, mode := range []string{"", "auto", "real", " AUTO ", " REAL "} {
+		dp, err := NewDataplane(mode, "ignored")
+		if err != nil {
+			t.Fatalf("new %q dataplane failed: %v", mode, err)
+		}
+		if _, ok := dp.(*Manager); !ok {
+			t.Fatalf("mode %q unexpectedly selected the iptables compatibility backend", mode)
+		}
+	}
+	dp, err = NewDataplane("iptables", "ignored")
+	if err != nil {
+		t.Fatalf("new explicit iptables dataplane failed: %v", err)
+	}
+	if _, ok := dp.(*IPTablesManager); !ok {
+		t.Fatal("explicit iptables mode did not select the compatibility backend")
+	}
 }
 
 func TestMockReadSourceStats(t *testing.T) {

@@ -21,3 +21,7 @@ func terminateProcess(pid int) (ProcessTermination, error) {
 func TerminateProcess(pid int) (ProcessTermination, error) {
 	return terminateProcess(pid)
 }
+
+func TerminateProcessVerified(finding Finding) (ProcessTermination, error) {
+	return terminateProcess(finding.PID)
+}

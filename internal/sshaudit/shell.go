@@ -68,8 +68,13 @@ func Run(ctx context.Context, options Options) error {
 		options.Stderr = os.Stderr
 	}
 	var outputMu sync.Mutex
-	options.Stdout = lockedWriter{&outputMu, options.Stdout}
-	options.Stderr = lockedWriter{&outputMu, options.Stderr}
+	// os/exec can pass a *os.File directly to the child, preserving the
+	// controlling terminal allocated by sshd. Wrapping os.Stdout in a generic
+	// io.Writer makes exec create a pipe instead; interactive programs such as
+	// vi then report "Output is not to a terminal". Test and embedding writers
+	// still use the lock because they do not carry a terminal descriptor.
+	options.Stdout = terminalSafeWriter(options.Stdout, &outputMu)
+	options.Stderr = terminalSafeWriter(options.Stderr, &outputMu)
 	var logOnce sync.Once
 	record := func(event, action, command, detail string, truncated bool) {
 		r := options.Identity
@@ -185,6 +190,13 @@ func Run(ctx context.Context, options Options) error {
 		}
 	}
 	return err
+}
+
+func terminalSafeWriter(writer io.Writer, mu *sync.Mutex) io.Writer {
+	if _, ok := writer.(*os.File); ok {
+		return writer
+	}
+	return lockedWriter{mu: mu, writer: writer}
 }
 
 type lockedWriter struct {

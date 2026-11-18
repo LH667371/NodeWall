@@ -34,7 +34,7 @@ type statsValue struct {
 type configValue struct {
 	NonIPv4Action     uint8
 	PortPolicyEnabled uint8
-	Reserved          [6]byte
+	Reserved          [8]byte
 }
 
 type sourceStatsValue struct {
@@ -110,6 +110,7 @@ const (
 	dropReasonRestrictedPolicy uint8 = 3
 	dropReasonSourceNotAllowed uint8 = 4
 	dropReasonRateLimited      uint8 = 5
+	dropReasonDHCPBroadcast    uint8 = 6
 )
 
 func CIDRToKey(cidr string) (lpmKey, string, error) {
@@ -144,6 +145,10 @@ func configToValue(cfg Config) (configValue, error) {
 	if err != nil {
 		return configValue{}, err
 	}
+	egressAction, err := configActionToValue(cfg.EgressNonIPv4Action)
+	if err != nil {
+		return configValue{}, err
+	}
 	if cfg.PortPolicyEnabled {
 		value.PortPolicyEnabled = 1
 	}
@@ -158,6 +163,21 @@ func configToValue(cfg Config) (configValue, error) {
 	}
 	if cfg.ObserveOnly {
 		value.Reserved[4] = 1
+	}
+	if cfg.EgressObserveOnly {
+		value.Reserved[5] = 1
+	}
+	if egressAction.NonIPv4Action == nonIPv4DropUint8 {
+		value.Reserved[6] = egressAction.NonIPv4Action
+	}
+	if cfg.EgressPortPolicyEnabled {
+		value.Reserved[7] |= 1 << 0
+	}
+	if cfg.EgressRateLimitEnabled {
+		value.Reserved[7] |= 1 << 1
+	}
+	if cfg.EgressDefaultDeny {
+		value.Reserved[7] |= 1 << 2
 	}
 	timeout := cfg.ReplyFlowTimeoutSeconds
 	if timeout <= 0 {
@@ -183,7 +203,8 @@ func configActionToValue(action models.NonIPv4Action) (configValue, error) {
 
 func configFromValue(value configValue) Config {
 	cfg := Config{
-		NonIPv4Action: models.NonIPv4Pass,
+		NonIPv4Action:       models.NonIPv4Pass,
+		EgressNonIPv4Action: models.NonIPv4Pass,
 	}
 	if value.NonIPv4Action == nonIPv4DropUint8 {
 		cfg.NonIPv4Action = models.NonIPv4Drop
@@ -193,6 +214,13 @@ func configFromValue(value configValue) Config {
 	cfg.PolicyEnforced = value.Reserved[0] == 1
 	cfg.EgressPolicyEnforced = value.Reserved[2] == 1
 	cfg.ObserveOnly = value.Reserved[4] == 1
+	cfg.EgressObserveOnly = value.Reserved[5] == 1
+	if value.Reserved[6] == nonIPv4DropUint8 {
+		cfg.EgressNonIPv4Action = models.NonIPv4Drop
+	}
+	cfg.EgressPortPolicyEnabled = value.Reserved[7]&(1<<0) != 0
+	cfg.EgressRateLimitEnabled = value.Reserved[7]&(1<<1) != 0
+	cfg.EgressDefaultDeny = value.Reserved[7]&(1<<2) != 0
 	if value.Reserved[1] == 0 {
 		cfg.ReplyFlowTimeoutSeconds = 60
 	} else {
@@ -265,9 +293,27 @@ func dropReasonLabel(reason uint8) string {
 		return "source_not_allowed"
 	case dropReasonRateLimited:
 		return "rate_limited"
+	case dropReasonDHCPBroadcast:
+		return "dhcp_broadcast"
 	default:
 		return "unknown"
 	}
+}
+
+func interceptLogFromMap(key dropLogKey, value dropLogValue, direction models.PolicyDirection) models.InterceptLogEntry {
+	entry := models.InterceptLogEntry{
+		Direction: direction,
+		SourceIP:  sourceIPFromUint32(key.SourceIP),
+		Port:      key.DestPort,
+		Reason:    dropReasonLabel(key.Reason),
+		Count:     value.Drops,
+	}
+	// Keep observation counters separate across mode changes. Reading the
+	// current config would incorrectly relabel old drops or old observations.
+	if key.Reserved&1 == 0 {
+		entry.Drops = value.Drops
+	}
+	return entry
 }
 
 func classifyRisk(passed, dropped uint64) string {

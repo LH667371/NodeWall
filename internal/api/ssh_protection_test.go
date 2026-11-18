@@ -2,17 +2,36 @@ package api
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/ssh"
+
 	"nodewall/internal/models"
+	"nodewall/internal/sshconsole"
 	"nodewall/internal/xdp"
 )
+
+type recordingSSHAuthenticationApplier struct {
+	values []bool
+}
+
+func (a *recordingSSHAuthenticationApplier) ApplyPasswordAuthentication(_ context.Context, allow bool) error {
+	a.values = append(a.values, allow)
+	return nil
+}
+
+func (a *recordingSSHAuthenticationApplier) ClearPasswordAuthentication(context.Context) error {
+	return nil
+}
 
 func TestParseSSHFailureSource(t *testing.T) {
 	tests := []struct {
@@ -126,6 +145,112 @@ func TestSSHActivityEndpointReturnsConnectionAndCommandRecords(t *testing.T) {
 	handler.Routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "echo hi") {
 		t.Fatalf("unexpected activity response: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSSHAuthenticationPolicyEndpointPersistsChoice(t *testing.T) {
+	applier := &recordingSSHAuthenticationApplier{}
+	handler := NewAgentHandler("node-01", xdp.NewMockManager(), memoryStateStore{}, time.Second, nil, nil, SSHProtectionOptions{AuthenticationPolicyApplier: applier})
+	req := httptest.NewRequest(http.MethodPut, "/ssh-protection/authentication", strings.NewReader(`{"allow_password_login":false}`))
+	rec := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || len(applier.values) != 1 || applier.values[0] {
+		t.Fatalf("password-login policy was not applied: %d %#v %s", rec.Code, applier.values, rec.Body.String())
+	}
+	if handler.sshProtectionSettings.AllowPasswordLogin == nil || *handler.sshProtectionSettings.AllowPasswordLogin {
+		t.Fatalf("password-login choice was not stored: %#v", handler.sshProtectionSettings.AllowPasswordLogin)
+	}
+}
+
+func TestSSHAuthorizedKeyEndpointProtectsLastKeyWhenPasswordLoginDisabled(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "authorized_keys")
+	public, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := ssh.NewPublicKey(public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
+	applier := &recordingSSHAuthenticationApplier{}
+	handler := NewAgentHandler("node-01", xdp.NewMockManager(), memoryStateStore{}, time.Second, nil, nil, SSHProtectionOptions{AuthenticationPolicyApplier: applier, AuthorizedKeysPath: path})
+	addReq := httptest.NewRequest(http.MethodPost, "/ssh-protection/keys", strings.NewReader(`{"public_key":"`+line+`","comment":"ops"}`))
+	addRec := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(addRec, addReq)
+	if addRec.Code != http.StatusOK {
+		t.Fatalf("public key was not added: %d %s", addRec.Code, addRec.Body.String())
+	}
+	var listed struct {
+		Keys []models.SSHAuthorizedKey `json:"keys"`
+	}
+	if err := json.Unmarshal(addRec.Body.Bytes(), &listed); err != nil || len(listed.Keys) != 1 {
+		t.Fatalf("unexpected public key response: %s (%v)", addRec.Body.String(), err)
+	}
+	choice := false
+	handler.sshProtectionSettings.AllowPasswordLogin = &choice
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/ssh-protection/keys/"+url.PathEscape(listed.Keys[0].Fingerprint), nil)
+	deleteRec := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusConflict {
+		t.Fatalf("last key removal was not blocked: %d %s", deleteRec.Code, deleteRec.Body.String())
+	}
+	confirmedReq := httptest.NewRequest(http.MethodDelete, "/ssh-protection/keys/"+url.PathEscape(listed.Keys[0].Fingerprint), strings.NewReader(`{"confirmed":true}`))
+	confirmedRec := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(confirmedRec, confirmedReq)
+	if confirmedRec.Code != http.StatusOK {
+		t.Fatalf("confirmed last key removal was rejected: %d %s", confirmedRec.Code, confirmedRec.Body.String())
+	}
+}
+
+func TestSSHAuthorizedKeyEndpointIdentifiesCurrentAndHistoricalConsoleKeys(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "ssh", "id_ed25519")
+	currentPublic, err := sshconsole.NewWithKeyPath(keyPath).PublicKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldPublic, err := sshconsole.NewWithKeyPath(filepath.Join(dir, "old", "id_ed25519")).PublicKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorized := filepath.Join(dir, "authorized_keys")
+	if err := os.WriteFile(authorized, []byte(strings.TrimSpace(oldPublic)+" nodewall-console\n"+strings.TrimSpace(currentPublic)+" nodewall-console\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewAgentHandler("node-01", xdp.NewMockManager(), memoryStateStore{}, time.Second, nil, nil, SSHProtectionOptions{
+		AuthorizedKeysPath:    authorized,
+		ManagedConsoleKeyPath: keyPath,
+	})
+	getReq := httptest.NewRequest(http.MethodGet, "/ssh-protection/keys", nil)
+	getRec := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("key list failed: %d %s", getRec.Code, getRec.Body.String())
+	}
+	var listed struct {
+		Keys []models.SSHAuthorizedKey `json:"keys"`
+	}
+	if err := json.Unmarshal(getRec.Body.Bytes(), &listed); err != nil || len(listed.Keys) != 2 {
+		t.Fatalf("unexpected key list: %s (%v)", getRec.Body.String(), err)
+	}
+	var historical, current models.SSHAuthorizedKey
+	for _, key := range listed.Keys {
+		if key.NodeWallActive {
+			current = key
+		} else {
+			historical = key
+		}
+	}
+	if !current.NodeWallActive || !current.NodeWallActiveKnown || !historical.NodeWallManaged || historical.NodeWallActive || !historical.NodeWallActiveKnown {
+		t.Fatalf("current/historical annotations are wrong: %#v", listed.Keys)
+	}
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/ssh-protection/keys/"+url.PathEscape(historical.Fingerprint), nil)
+	deleteRec := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("historical console key could not be removed without confirmation: %d %s", deleteRec.Code, deleteRec.Body.String())
 	}
 }
 

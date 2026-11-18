@@ -59,3 +59,20 @@ func TestInspectExecutableFileIgnoresSingleMinerName(t *testing.T) {
 		t.Fatalf("single miner name should not be enough: %#v", threat)
 	}
 }
+
+func TestKernelHelperDeletedExecutableIsIgnored(t *testing.T) {
+	for _, comm := range []string{"bpfilter_umh", "kworker/0:1"} {
+		if !isKernelHelper(comm, "", "/ (deleted)") {
+			t.Errorf("legitimate kernel helper was not ignored: %s", comm)
+		}
+	}
+	if !isKernelHelper("none", "bpfilter_umh", "/ (deleted)") {
+		t.Fatal("bpfilter helper with a kernel-style command line was not ignored")
+	}
+	if isKernelHelper("none", "bpfilter_umh --unexpected", "/ (deleted)") {
+		t.Fatal("arbitrary command line was treated as a kernel helper")
+	}
+	if isKernelHelper("xmrig", "", "/ (deleted)") {
+		t.Fatal("ordinary process was treated as a kernel helper")
+	}
+}

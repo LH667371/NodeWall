@@ -68,22 +68,33 @@ func OpenHistory(dir string, maxBytes int64) (*History, error) {
 	return h, h.prune(time.Now().UTC(), "", 0)
 }
 
-// Append fsyncs each sample. A partial last line left by a crash is truncated
-// before the next append, so one interrupted write cannot poison later samples.
 func (h *History) Append(point models.SystemMetricPoint) error {
-	if strings.TrimSpace(point.NodeID) == "" || point.Timestamp.IsZero() {
-		return errors.New("monitoring sample requires a node and timestamp")
+	return h.AppendBatch([]models.SystemMetricPoint{point})
+}
+
+// AppendBatch commits the whole sampling round to the same hourly segment.
+// Readers snapshot the committed length so they cannot see half a round.
+func (h *History) AppendBatch(points []models.SystemMetricPoint) error {
+	if len(points) == 0 {
+		return nil
 	}
-	data, err := json.Marshal(point)
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
+	at := points[0].Timestamp.UTC()
 	now := time.Now().UTC()
-	if point.Timestamp.Before(now.Add(-HistoryRetention)) || point.Timestamp.After(now.Add(time.Minute)) {
+	if at.IsZero() || at.Before(now.Add(-HistoryRetention)) || at.After(now.Add(time.Minute)) {
 		return errors.New("monitoring sample timestamp is outside the retention window")
 	}
-	name := point.Timestamp.UTC().Format("20060102T15.jsonl")
+	var batch bytes.Buffer
+	encoder := json.NewEncoder(&batch)
+	for _, point := range points {
+		if strings.TrimSpace(point.NodeID) == "" || !point.Timestamp.Equal(at) {
+			return errors.New("monitoring batch requires a node and the same timestamp for each sample")
+		}
+		if err := encoder.Encode(point); err != nil {
+			return err
+		}
+	}
+	data := batch.Bytes()
+	name := at.Format("20060102T15.jsonl")
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if err := h.prune(now, name, int64(len(data))); err != nil {
@@ -114,6 +125,7 @@ func (h *History) Append(point models.SystemMetricPoint) error {
 		return err
 	}
 	if err := file.Sync(); err != nil {
+		_ = file.Truncate(start)
 		h.prepared = ""
 		return err
 	}
@@ -124,7 +136,7 @@ func (h *History) Append(point models.SystemMetricPoint) error {
 			return nil
 		}
 	}
-	h.segments = append(h.segments, historySegment{name, point.Timestamp.UTC().Truncate(time.Hour), start + int64(len(data))})
+	h.segments = append(h.segments, historySegment{name, at.Truncate(time.Hour), start + int64(len(data))})
 	sort.Slice(h.segments, func(i, j int) bool { return h.segments[i].at.Before(h.segments[j].at) })
 	h.bytes += start + int64(len(data))
 	dir, err := os.Open(h.dir)
@@ -205,7 +217,7 @@ func (h *History) Query(ctx context.Context, nodes []string, from, to time.Time,
 		if err != nil {
 			return nil, err
 		}
-		err = readHistorySegment(ctx, file, selected, from, to, step)
+		err = readHistorySegment(ctx, io.LimitReader(file, segment.size), selected, from, to, step)
 		file.Close()
 		if err != nil {
 			return nil, fmt.Errorf("read monitoring history %s: %w", segment.name, err)
@@ -224,7 +236,7 @@ func (h *History) Query(ctx context.Context, nodes []string, from, to time.Time,
 	return result, nil
 }
 
-func readHistorySegment(ctx context.Context, file *os.File, selected map[string]map[int64]models.SystemMetricPoint, from, to time.Time, step time.Duration) error {
+func readHistorySegment(ctx context.Context, file io.Reader, selected map[string]map[int64]models.SystemMetricPoint, from, to time.Time, step time.Duration) error {
 	reader := bufio.NewReaderSize(file, 64<<10)
 	for {
 		if err := ctx.Err(); err != nil {
@@ -246,7 +258,7 @@ func readHistorySegment(ctx context.Context, file *os.File, selected map[string]
 			continue
 		}
 		bucket := point.Timestamp.UTC().Truncate(step).UnixNano()
-		if previous, ok := buckets[bucket]; !ok || previous.Timestamp.Before(point.Timestamp) {
+		if previous, ok := buckets[bucket]; !ok || !point.Timestamp.Before(previous.Timestamp) {
 			buckets[bucket] = point
 		}
 	}

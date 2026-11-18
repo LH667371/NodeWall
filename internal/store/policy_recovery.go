@@ -15,6 +15,7 @@ type PolicyRecovery struct {
 	Previous        *models.InterfacePolicy           `json:"previous,omitempty"`
 	StartedAt       time.Time                         `json:"started_at"`
 	TrialExpiresAt  time.Time                         `json:"trial_expires_at,omitempty"`
+	TrialDirection  models.PolicyDirection            `json:"trial_direction,omitempty"`
 	TrialPublishIDs map[models.PolicyDirection]string `json:"trial_publish_ids,omitempty"`
 }
 
@@ -62,7 +63,19 @@ func (s *Store) PendingPolicyUpdate(nodeID, iface string) (PolicyRecovery, bool)
 // MarkPolicyTrial makes an in-flight policy update intentional until the
 // agent's safety timer expires. The durable previous policy remains available
 // so a manager restart can still finish the rollback safely.
-func (s *Store) MarkPolicyTrial(_ context.Context, nodeID, iface string, expiresAt time.Time, publishIDs map[models.PolicyDirection]string) error {
+func (s *Store) MarkPolicyTrial(ctx context.Context, nodeID, iface string, expiresAt time.Time, publishIDs map[models.PolicyDirection]string) error {
+	return s.markPolicyTrial(ctx, nodeID, iface, expiresAt, "", publishIDs)
+}
+
+// MarkPolicyTrialDirection records which direction initiated a trial. The
+// agent still keeps publish IDs for both directions so a rollback can restore
+// the complete interface safely, while the manager can render the trial in the
+// direction the operator actually selected.
+func (s *Store) MarkPolicyTrialDirection(ctx context.Context, nodeID, iface string, expiresAt time.Time, direction models.PolicyDirection, publishIDs map[models.PolicyDirection]string) error {
+	return s.markPolicyTrial(ctx, nodeID, iface, expiresAt, direction, publishIDs)
+}
+
+func (s *Store) markPolicyTrial(_ context.Context, nodeID, iface string, expiresAt time.Time, direction models.PolicyDirection, publishIDs map[models.PolicyDirection]string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := policyKey(nodeID, iface)
@@ -72,6 +85,7 @@ func (s *Store) MarkPolicyTrial(_ context.Context, nodeID, iface string, expires
 	}
 	previous := recovery
 	recovery.TrialExpiresAt = expiresAt.UTC()
+	recovery.TrialDirection = direction
 	recovery.TrialPublishIDs = maps.Clone(publishIDs)
 	s.recoveries[key] = recovery
 	if err := s.saveLocked(); err != nil {

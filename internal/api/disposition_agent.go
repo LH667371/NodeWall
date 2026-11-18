@@ -91,6 +91,16 @@ func (h *AgentHandler) handleCreateTemporaryBlock(w http.ResponseWriter, r *http
 			return
 		}
 	}
+	if direction == models.DirectionEgress && runtime.Egress.Attached {
+		if directional, ok := h.xdp.(xdp.DirectionalDataplane); ok {
+			if err := directional.ApplyDirectionPolicy(iface, models.DirectionEgress, directionPolicyFromRuntime(runtime.Egress)); err != nil {
+				h.setRuntime(iface, previousRuntime)
+				_ = directional.ApplyDirectionPolicy(iface, models.DirectionEgress, directionPolicyFromRuntime(previousRuntime.Egress))
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+		}
+	}
 	if err := h.persist(r.Context()); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -144,6 +154,16 @@ func (h *AgentHandler) handleDeleteTemporaryBlock(w http.ResponseWriter, r *http
 			_ = h.syncPolicyConfig(iface, previousRuntime)
 			writeError(w, http.StatusBadRequest, err)
 			return
+		}
+	}
+	if direction == models.DirectionEgress && runtime.Egress.Attached {
+		if directional, ok := h.xdp.(xdp.DirectionalDataplane); ok {
+			if err := directional.ApplyDirectionPolicy(iface, models.DirectionEgress, directionPolicyFromRuntime(runtime.Egress)); err != nil {
+				h.setRuntime(iface, previousRuntime)
+				_ = directional.ApplyDirectionPolicy(iface, models.DirectionEgress, directionPolicyFromRuntime(previousRuntime.Egress))
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
 		}
 	}
 	if err := h.persist(r.Context()); err != nil {

@@ -1,7 +1,10 @@
 [Unit]
 Description=NodeWall server
-After=network-online.target nodewall-agent.service
-Wants=network-online.target
+# network-online.target may wait indefinitely for an unavailable NFS mount.
+# NodeWall's HTTP and gRPC listeners can start on network.target and clients
+# will retry remote enrollment/connectivity independently.
+After=network.target nodewall-agent.service
+Wants=network.target
 
 [Service]
 Type=simple

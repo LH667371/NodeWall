@@ -26,7 +26,9 @@ const (
 type processSnapshot struct {
 	pid     int
 	ticks   uint64
+	start   string
 	command string
+	comm    string
 	exe     string
 	cgroup  string
 }
@@ -58,7 +60,7 @@ func collectHighCPUFindings(ctx context.Context, limit int) ([]Finding, error) {
 	rows := make([]processCPU, 0)
 	for pid, current := range after {
 		previous, ok := before[pid]
-		if !ok || current.ticks < previous.ticks {
+		if !ok || current.start != previous.start || current.ticks < previous.ticks {
 			continue
 		}
 		percent := float64(current.ticks-previous.ticks) / float64(totalDelta) * 100 * float64(runtime.NumCPU())
@@ -72,6 +74,13 @@ func collectHighCPUFindings(ctx context.Context, limit int) ([]Finding, error) {
 		// is ignored, which also makes scans resilient to short-lived tasks.
 		current = enrichProcessSnapshot(current)
 		if current.exe == "" || isNodeWallTrustedPath(current.exe) {
+			continue
+		}
+		// Kernel user-mode helpers can expose an anonymous deleted executable
+		// while doing normal firewall/BPF work. Their name and command line are
+		// checked together so an ordinary deleted user process cannot hide behind
+		// a single spoofable display name.
+		if isKernelHelper(current.comm, current.command, current.exe) {
 			continue
 		}
 		rows = append(rows, processCPU{snapshot: current, percent: percent})
@@ -97,7 +106,11 @@ func processFinding(row processCPU) Finding {
 	if command == "" {
 		command = filepath.Base(row.snapshot.exe)
 	}
-	detail := fmt.Sprintf("PID %d (%s) used %.1f%% CPU during the sample; executable=%s", row.snapshot.pid, commandName(command), row.percent, row.snapshot.exe)
+	displayExecutable, deleted := normalizeDeletedExecutablePath(row.snapshot.exe)
+	detail := fmt.Sprintf("PID %d (%s) used %.1f%% CPU during the sample; executable=%s", row.snapshot.pid, commandName(command), row.percent, displayExecutable)
+	if deleted {
+		detail += "; executable has already been removed from its original path; inspect and restart it from a trusted package"
+	}
 	if row.snapshot.cgroup != "" {
 		detail += "; cgroup=" + row.snapshot.cgroup
 	}
@@ -106,7 +119,7 @@ func processFinding(row processCPU) Finding {
 	idBytes := sha256.Sum256([]byte(seed))
 	finding := Finding{
 		ID:            "p-" + hex.EncodeToString(idBytes[:8]),
-		Path:          row.snapshot.exe,
+		Path:          displayExecutable,
 		Rule:          "high-cpu-process",
 		Severity:      processSeverity(row.percent),
 		Detail:        detail,
@@ -119,10 +132,16 @@ func processFinding(row processCPU) Finding {
 		PID:           row.snapshot.pid,
 		CPUPercent:    row.percent,
 		Command:       row.snapshot.command,
-		Executable:    row.snapshot.exe,
+		Executable:    displayExecutable,
+		Deleted:       deleted,
+		SystemFile:    isSystemPackageFile(displayExecutable),
 		ContainerID:   containerID(row.snapshot.cgroup),
 	}
-	return EnrichProcessFinding(finding)
+	finding = EnrichProcessFinding(finding)
+	if finding.ProcessStartTime != row.snapshot.start {
+		finding.ProcessStartTime = ""
+	}
+	return finding
 }
 
 func processSeverity(percent float64) string {
@@ -158,11 +177,19 @@ func snapshotProcesses() (map[int]processSnapshot, uint64, error) {
 		if err != nil || pid <= 0 {
 			continue
 		}
+		start, err := ReadProcessStartTime(pid)
+		if err != nil {
+			continue
+		}
 		ticks, err := procProcessTime(pid)
 		if err != nil {
 			continue
 		}
-		result[pid] = processSnapshot{pid: pid, ticks: ticks}
+		end, err := ReadProcessStartTime(pid)
+		if err != nil || end != start {
+			continue
+		}
+		result[pid] = processSnapshot{pid: pid, ticks: ticks, start: start}
 	}
 	return result, total, nil
 }
@@ -173,6 +200,7 @@ func enrichProcessSnapshot(snapshot processSnapshot) processSnapshot {
 	procDir := filepath.Join("/proc", strconv.Itoa(snapshot.pid))
 	command := readProcTextLimited(filepath.Join(procDir, "cmdline"), maxProcMetadataBytes)
 	snapshot.command = strings.TrimSpace(strings.ReplaceAll(command, "\x00", " "))
+	snapshot.comm = strings.TrimSpace(readProcTextLimited(filepath.Join(procDir, "comm"), maxProcMetadataBytes))
 	snapshot.exe, _ = os.Readlink(filepath.Join(procDir, "exe"))
 	snapshot.cgroup = strings.TrimSpace(readProcTextLimited(filepath.Join(procDir, "cgroup"), maxProcMetadataBytes))
 	return snapshot
@@ -312,10 +340,16 @@ func hashProcessExecutable(pid int) (string, int64, string) {
 	}
 	defer file.Close()
 	info, err := file.Stat()
-	if err != nil {
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > processHashLimit {
 		return "", 0, ""
 	}
 	hasher := sha256.New()
-	_, _ = io.CopyN(hasher, file, processHashLimit)
-	return hex.EncodeToString(hasher.Sum(nil)), info.Size(), info.Mode().Perm().String()
+	read, err := io.Copy(hasher, io.LimitReader(file, processHashLimit+1))
+	if err != nil || read != info.Size() {
+		// Never publish a prefix digest as a complete process identity. A
+		// process larger than the bounded inspection window remains evidence
+		// only until a later scan can verify the full image.
+		return "", 0, ""
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), read, info.Mode().Perm().String()
 }

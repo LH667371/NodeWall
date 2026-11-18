@@ -1,6 +1,6 @@
-// Package monitoring collects host resource metrics without external agents
-// or command-line dependencies. Linux exposes the required counters through
-// /proc and /sys, which keeps the NodeWall agent self-contained.
+// Package monitoring collects host resource metrics without a mandatory
+// external agent. Linux exposes the required counters through /proc and /sys;
+// optional vendor tooling is used only when it is already installed.
 package monitoring
 
 import (
@@ -25,19 +25,20 @@ type Collector struct {
 	sysDir  string
 	now     func() time.Time
 
-	mu              sync.Mutex
-	previousCPU     cpuCounters
-	previousCPUAt   time.Time
-	previousNetwork map[string]networkCounters
-	previousDisk    map[string]diskCounters
-	previousKernel  kernelCounters
-	previousProcess map[int]processCounters
-	accelerator     AcceleratorCollector
+	mu                  sync.Mutex
+	previousCPU         cpuCounters
+	previousLogicalCPUs map[string]cpuCounters
+	previousCPUAt       time.Time
+	previousNetwork     map[string]networkCounters
+	previousDisk        map[string]diskCounters
+	previousKernel      kernelCounters
+	previousProcess     map[int]processCounters
+	accelerator         AcceleratorCollector
 }
 
 // AcceleratorCollector keeps vendor-specific GPU support behind a small
-// interface. The default implementation is empty and does not invoke
-// nvidia-smi or require any driver package.
+// interface. Unsupported hosts return an empty list and continue collecting
+// the rest of the system metrics.
 type AcceleratorCollector interface {
 	Collect(context.Context) ([]models.AcceleratorMetrics, error)
 }
@@ -101,12 +102,12 @@ func NewCollector(nodeID string) *Collector {
 		previousNetwork: make(map[string]networkCounters),
 		previousDisk:    make(map[string]diskCounters),
 		previousProcess: make(map[int]processCounters),
-		accelerator:     emptyAcceleratorCollector{},
+		accelerator:     newAutoAcceleratorCollector(),
 	}
 }
 
-// SetAcceleratorCollector allows a future Linux/NVIDIA implementation to be
-// added without changing the system metrics API or the default installation.
+// SetAcceleratorCollector allows tests or a future vendor implementation to
+// replace the best-effort default without changing the system metrics API.
 func (c *Collector) SetAcceleratorCollector(collector AcceleratorCollector) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -127,9 +128,14 @@ func (c *Collector) Collect(ctx context.Context) (models.SystemMetrics, error) {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// A previous collection can hold the lock during a slow device probe. Do
+	// not start another full collection after the caller has already left.
+	if err := ctx.Err(); err != nil {
+		return models.SystemMetrics{}, err
+	}
 
 	capturedAt := c.now()
-	counters, err := c.readCPU()
+	counters, logicalCPUs, err := c.readCPU()
 	if err != nil {
 		return models.SystemMetrics{}, fmt.Errorf("read CPU metrics: %w", err)
 	}
@@ -159,23 +165,23 @@ func (c *Collector) Collect(ctx context.Context) (models.SystemMetrics, error) {
 	}
 	cpu := models.CPUMetrics{Cores: counters.cores, Load1: load1, Load5: load5, Load15: load15}
 	if sampleSeconds > 0 {
-		totalDelta := counterDelta(c.previousCPU.total, counters.total)
-		idleDelta := counterDelta(c.previousCPU.idle, counters.idle)
-		iowaitDelta := counterDelta(c.previousCPU.iowait, counters.iowait)
-		if totalDelta > 0 {
-			busyDelta := totalDelta
-			if idleDelta < busyDelta {
-				busyDelta -= idleDelta
-			} else {
-				busyDelta = 0
-			}
-			cpu.UsagePercent = float64(busyDelta) / float64(totalDelta) * 100
-			cpu.IowaitPercent = float64(iowaitDelta) / float64(totalDelta) * 100
-			cpu.UserPercent = float64(counterDelta(c.previousCPU.user, counters.user)) / float64(totalDelta) * 100
-			cpu.SystemPercent = float64(counterDelta(c.previousCPU.system, counters.system)) / float64(totalDelta) * 100
-			cpu.StealPercent = float64(counterDelta(c.previousCPU.steal, counters.steal)) / float64(totalDelta) * 100
-		}
+		usage := logicalCPUUsage("cpu", counters, c.previousCPU)
+		cpu.UsagePercent, cpu.UserPercent = usage.UsagePercent, usage.UserPercent
+		cpu.SystemPercent, cpu.IowaitPercent, cpu.StealPercent = usage.SystemPercent, usage.IowaitPercent, usage.StealPercent
 	}
+	for name, current := range logicalCPUs {
+		metric := models.LogicalCPUMetric{Name: name}
+		if previous, exists := c.previousLogicalCPUs[name]; exists && sampleSeconds > 0 {
+			metric = logicalCPUUsage(name, current, previous)
+		}
+		cpu.LogicalCPUs = append(cpu.LogicalCPUs, metric)
+	}
+	sort.Slice(cpu.LogicalCPUs, func(i, j int) bool {
+		left, _ := strconv.Atoi(strings.TrimPrefix(cpu.LogicalCPUs[i].Name, "cpu"))
+		right, _ := strconv.Atoi(strings.TrimPrefix(cpu.LogicalCPUs[j].Name, "cpu"))
+		return left < right
+	})
+
 	applyNetworkRates(&network, currentNetwork, c.previousNetwork, sampleSeconds)
 	applyDiskRates(&disk, currentDisk, c.previousDisk, sampleSeconds)
 	applyKernelRates(&kernel, currentKernel, c.previousKernel, sampleSeconds)
@@ -205,6 +211,7 @@ func (c *Collector) Collect(ctx context.Context) (models.SystemMetrics, error) {
 	}
 
 	c.previousCPU = counters
+	c.previousLogicalCPUs = logicalCPUs
 	c.previousCPUAt = capturedAt
 	c.previousNetwork = currentNetwork
 	c.previousDisk = currentDisk
@@ -213,16 +220,12 @@ func (c *Collector) Collect(ctx context.Context) (models.SystemMetrics, error) {
 	return result, nil
 }
 
-func (c *Collector) readCPU() (cpuCounters, error) {
+func (c *Collector) readCPU() (cpuCounters, map[string]cpuCounters, error) {
 	data, err := os.ReadFile(filepath.Join(c.procDir, "stat"))
 	if err != nil {
-		return cpuCounters{}, err
+		return cpuCounters{}, nil, err
 	}
-	counters, err := parseCPUStat(data)
-	if err != nil {
-		return cpuCounters{}, err
-	}
-	return counters, nil
+	return parseCPUStat(data)
 }
 
 func (c *Collector) readMemory() (models.MemoryMetrics, error) {
@@ -586,18 +589,27 @@ func applyKernelRates(metrics *models.KernelMetrics, current, previous kernelCou
 }
 
 func applyDiskRates(metrics *models.DiskMetrics, current, previous map[string]diskCounters, seconds float64) {
+	ready, pending := true, false
+	for index := range metrics.Devices {
+		metrics.Devices[index].SampleReady = &pending
+	}
 	if seconds <= 0 {
 		return
 	}
 	var readAwaitTotal, writeAwaitTotal float64
 	var readOpsTotal, writeOpsTotal uint64
+	validDevices := 0
 	for index := range metrics.Devices {
 		device := &metrics.Devices[index]
 		currentCounters := current[device.Name]
 		previousCounters, existed := previous[device.Name]
-		if !existed {
+		if !existed || currentCounters.readBytes < previousCounters.readBytes || currentCounters.writeBytes < previousCounters.writeBytes ||
+			currentCounters.readOps < previousCounters.readOps || currentCounters.writeOps < previousCounters.writeOps ||
+			currentCounters.ioTimeMs < previousCounters.ioTimeMs {
 			continue
 		}
+		device.SampleReady = &ready
+		validDevices++
 		device.ReadBytesPerSecond = float64(counterDelta(previousCounters.readBytes, currentCounters.readBytes)) / seconds
 		device.WriteBytesPerSecond = float64(counterDelta(previousCounters.writeBytes, currentCounters.writeBytes)) / seconds
 		device.ReadOpsPerSecond = float64(counterDelta(previousCounters.readOps, currentCounters.readOps)) / seconds
@@ -621,8 +633,8 @@ func applyDiskRates(metrics *models.DiskMetrics, current, previous map[string]di
 		metrics.WriteOpsPerSecond += device.WriteOpsPerSecond
 		metrics.IOUtilizationPercent += device.IOUtilizationPercent
 	}
-	if len(metrics.Devices) > 0 {
-		metrics.IOUtilizationPercent /= float64(len(metrics.Devices))
+	if validDevices > 0 {
+		metrics.IOUtilizationPercent /= float64(validDevices)
 	}
 	if readOpsTotal > 0 {
 		metrics.ReadAwaitMilliseconds = readAwaitTotal / float64(readOpsTotal)
@@ -656,43 +668,51 @@ func applyProcessRates(metrics *models.ProcessMetrics, current, previous map[int
 }
 
 func applyNetworkRates(n *models.NetworkMetrics, current map[string]networkCounters, previous map[string]networkCounters, seconds float64) {
+	ready, pending := true, false
+	for index := range n.Interfaces {
+		n.Interfaces[index].SampleReady = &pending
+	}
 	if seconds <= 0 {
 		return
 	}
-	var previousTotal networkCounters
-	for name, item := range current {
-		previousItem := previous[name]
-		previousTotal.rxBytes += previousItem.rxBytes
-		previousTotal.txBytes += previousItem.txBytes
-		previousTotal.rxPackets += previousItem.rxPackets
-		previousTotal.txPackets += previousItem.txPackets
-		previousTotal.rxErrors += previousItem.rxErrors
-		previousTotal.txErrors += previousItem.txErrors
-		previousTotal.rxDropped += previousItem.rxDropped
-		previousTotal.txDropped += previousItem.txDropped
-		for index := range n.Interfaces {
-			if n.Interfaces[index].Name != name {
-				continue
-			}
-			n.Interfaces[index].RxBytesPerSecond = float64(counterDelta(previousItem.rxBytes, item.rxBytes)) / seconds
-			n.Interfaces[index].TxBytesPerSecond = float64(counterDelta(previousItem.txBytes, item.txBytes)) / seconds
-			n.Interfaces[index].RxPacketsPerSecond = float64(counterDelta(previousItem.rxPackets, item.rxPackets)) / seconds
-			n.Interfaces[index].TxPacketsPerSecond = float64(counterDelta(previousItem.txPackets, item.txPackets)) / seconds
-			n.Interfaces[index].RxErrorsPerSecond = float64(counterDelta(previousItem.rxErrors, item.rxErrors)) / seconds
-			n.Interfaces[index].TxErrorsPerSecond = float64(counterDelta(previousItem.txErrors, item.txErrors)) / seconds
-			n.Interfaces[index].RxDroppedPerSecond = float64(counterDelta(previousItem.rxDropped, item.rxDropped)) / seconds
-			n.Interfaces[index].TxDroppedPerSecond = float64(counterDelta(previousItem.txDropped, item.txDropped)) / seconds
-			break
+	// Sum valid per-interface deltas, rather than subtracting two host totals.
+	// A newly discovered or removed NIC must not turn its lifetime counter into
+	// an aggregate traffic spike or inherit another interface's baseline.
+	for index := range n.Interfaces {
+		metric := &n.Interfaces[index]
+		item, present := current[metric.Name]
+		before, existed := previous[metric.Name]
+		if !present || !existed {
+			continue
 		}
+		if item.rxBytes < before.rxBytes ||
+			item.txBytes < before.txBytes ||
+			item.rxPackets < before.rxPackets ||
+			item.txPackets < before.txPackets ||
+			item.rxErrors < before.rxErrors ||
+			item.txErrors < before.txErrors ||
+			item.rxDropped < before.rxDropped ||
+			item.txDropped < before.txDropped {
+			continue
+		}
+		metric.SampleReady = &ready
+		metric.RxBytesPerSecond = float64(item.rxBytes-before.rxBytes) / seconds
+		n.RxBytesPerSecond += metric.RxBytesPerSecond
+		metric.TxBytesPerSecond = float64(item.txBytes-before.txBytes) / seconds
+		n.TxBytesPerSecond += metric.TxBytesPerSecond
+		metric.RxPacketsPerSecond = float64(item.rxPackets-before.rxPackets) / seconds
+		n.RxPacketsPerSecond += metric.RxPacketsPerSecond
+		metric.TxPacketsPerSecond = float64(item.txPackets-before.txPackets) / seconds
+		n.TxPacketsPerSecond += metric.TxPacketsPerSecond
+		metric.RxErrorsPerSecond = float64(item.rxErrors-before.rxErrors) / seconds
+		n.RxErrorsPerSecond += metric.RxErrorsPerSecond
+		metric.TxErrorsPerSecond = float64(item.txErrors-before.txErrors) / seconds
+		n.TxErrorsPerSecond += metric.TxErrorsPerSecond
+		metric.RxDroppedPerSecond = float64(item.rxDropped-before.rxDropped) / seconds
+		n.RxDroppedPerSecond += metric.RxDroppedPerSecond
+		metric.TxDroppedPerSecond = float64(item.txDropped-before.txDropped) / seconds
+		n.TxDroppedPerSecond += metric.TxDroppedPerSecond
 	}
-	n.RxBytesPerSecond = float64(counterDelta(previousTotal.rxBytes, n.RxBytes)) / seconds
-	n.TxBytesPerSecond = float64(counterDelta(previousTotal.txBytes, n.TxBytes)) / seconds
-	n.RxPacketsPerSecond = float64(counterDelta(previousTotal.rxPackets, n.RxPackets)) / seconds
-	n.TxPacketsPerSecond = float64(counterDelta(previousTotal.txPackets, n.TxPackets)) / seconds
-	n.RxErrorsPerSecond = float64(counterDelta(previousTotal.rxErrors, n.RxErrors)) / seconds
-	n.TxErrorsPerSecond = float64(counterDelta(previousTotal.txErrors, n.TxErrors)) / seconds
-	n.RxDroppedPerSecond = float64(counterDelta(previousTotal.rxDropped, n.RxDropped)) / seconds
-	n.TxDroppedPerSecond = float64(counterDelta(previousTotal.txDropped, n.TxDropped)) / seconds
 }
 
 type parsedNetworkInterface struct {
@@ -787,17 +807,49 @@ func isPhysicalOrNFSFilesystem(device, fsType string) bool {
 	return strings.HasPrefix(strings.TrimSpace(device), "/dev/")
 }
 
-func parseCPUStat(data []byte) (cpuCounters, error) {
+func logicalCPUUsage(name string, current, previous cpuCounters) models.LogicalCPUMetric {
+	result := models.LogicalCPUMetric{Name: name}
+	if current.total <= previous.total || current.idle < previous.idle || current.user < previous.user ||
+		current.system < previous.system || current.iowait < previous.iowait || current.steal < previous.steal {
+		return result
+	}
+	total := float64(current.total - previous.total)
+	fraction := func(delta uint64) float64 { return minFloat(100, float64(delta)/total*100) }
+	idle := current.idle - previous.idle
+	busy := current.total - previous.total
+	if idle >= busy {
+		busy = 0
+	} else {
+		busy -= idle
+	}
+	result.SampleReady = true
+	result.UsagePercent = fraction(busy)
+	result.UserPercent = fraction(current.user - previous.user)
+	result.SystemPercent = fraction(current.system - previous.system)
+	result.IowaitPercent = fraction(current.iowait - previous.iowait)
+	result.StealPercent = fraction(current.steal - previous.steal)
+	return result
+}
+
+func parseCPUStat(data []byte) (cpuCounters, map[string]cpuCounters, error) {
+	cores := make(map[string]cpuCounters)
+	var aggregate cpuCounters
+	found := false
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) < 5 || fields[0] != "cpu" {
+		if len(fields) < 5 || !strings.HasPrefix(fields[0], "cpu") {
 			continue
+		}
+		if fields[0] != "cpu" {
+			if _, err := strconv.ParseUint(strings.TrimPrefix(fields[0], "cpu"), 10, 32); err != nil {
+				continue
+			}
 		}
 		var values []uint64
 		for _, value := range fields[1:] {
 			number, err := strconv.ParseUint(value, 10, 64)
 			if err != nil {
-				return cpuCounters{}, fmt.Errorf("invalid CPU counter %q: %w", value, err)
+				return cpuCounters{}, nil, fmt.Errorf("invalid CPU counter %q: %w", value, err)
 			}
 			values = append(values, number)
 		}
@@ -828,9 +880,21 @@ func parseCPUStat(data []byte) (cpuCounters, error) {
 		if len(values) > 7 {
 			steal = values[7]
 		}
-		return cpuCounters{total: total, idle: idle, iowait: iowait, user: user, system: system, steal: steal, cores: countCPUCores(data)}, nil
+		value := cpuCounters{total: total, idle: idle, iowait: iowait, user: user, system: system, steal: steal}
+		if fields[0] == "cpu" {
+			aggregate, found = value, true
+		} else {
+			cores[fields[0]] = value
+		}
 	}
-	return cpuCounters{}, fmt.Errorf("aggregate CPU counter is missing")
+	if !found {
+		return cpuCounters{}, nil, fmt.Errorf("aggregate CPU counter is missing")
+	}
+	aggregate.cores = len(cores)
+	if aggregate.cores == 0 {
+		aggregate.cores = countCPUCores(data)
+	}
+	return aggregate, cores, nil
 }
 
 func countCPUCores(data []byte) int {

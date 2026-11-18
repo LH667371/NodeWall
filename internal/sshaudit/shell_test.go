@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -57,6 +58,20 @@ func TestBashCommandAuditPreservesStatusAndDoesNotRecordPasswordInput(t *testing
 				t.Fatalf("shell commands missing: %#v stderr=%s", records, stderr.String())
 			}
 		})
+	}
+}
+
+func TestTerminalSafeWriterKeepsOSFileForInteractiveShell(t *testing.T) {
+	file, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if got := terminalSafeWriter(file, &sync.Mutex{}); got != file {
+		t.Fatal("os.File was wrapped and would lose its terminal descriptor")
+	}
+	if _, ok := terminalSafeWriter(&bytes.Buffer{}, &sync.Mutex{}).(lockedWriter); !ok {
+		t.Fatal("non-file output should retain the synchronized writer")
 	}
 }
 

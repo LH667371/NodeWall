@@ -10,3 +10,7 @@ import (
 func attachTCEgressFallback(ifaceIndex int, prog *ebpf.Program) (tcCloser, error) {
 	return nil, link.ErrNotSupported
 }
+
+func attachTCBridgeHostFilter(bridgeIndex, portIndex int, prog *ebpf.Program) (tcCloser, error) {
+	return nil, link.ErrNotSupported
+}

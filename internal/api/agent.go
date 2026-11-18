@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"maps"
 	"net/http"
 	"net/netip"
@@ -16,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"nodewall/internal/dnsresolve"
 	"nodewall/internal/geoip"
 	"nodewall/internal/health"
 	"nodewall/internal/integrity"
@@ -45,16 +48,26 @@ type SSHProtectionSettingsStore interface {
 }
 
 type SSHProtectionOptions struct {
-	StateStore            SSHProtectionSettingsStore
-	LogPath               string
-	PollInterval          time.Duration
-	TransferPolicyApplier SSHTransferPolicyApplier
-	IntegrityManifestPath string
-	ActivityLogPath       string
+	StateStore                  SSHProtectionSettingsStore
+	LogPath                     string
+	PollInterval                time.Duration
+	TransferPolicyApplier       SSHTransferPolicyApplier
+	AuthenticationPolicyApplier SSHAuthenticationPolicyApplier
+	IntegrityManifestPath       string
+	ActivityLogPath             string
+	AuthorizedKeysPath          string
+	// ManagedConsoleKeyPath is read only. It lets the key list identify the
+	// current console key without generating a key or changing authorized_keys.
+	ManagedConsoleKeyPath string
 }
 
 type SSHTransferPolicyApplier interface {
 	Apply(context.Context, models.SSHTransferPolicy) error
+}
+
+type SSHAuthenticationPolicyApplier interface {
+	ApplyPasswordAuthentication(context.Context, bool) error
+	ClearPasswordAuthentication(context.Context) error
 }
 
 type AgentHandler struct {
@@ -69,6 +82,7 @@ type AgentHandler struct {
 	state                      AgentStateStore
 	recorder                   DropLogRecorder
 	geoipDB                    *geoip.CountryDB
+	dnsResolver                *dnsresolve.Resolver
 	runtimeMu                  sync.RWMutex
 	runtimes                   map[string]models.InterfaceRuntime
 	sshProtectionMu            sync.RWMutex
@@ -76,8 +90,11 @@ type AgentHandler struct {
 	sshProtectionStore         SSHProtectionSettingsStore
 	sshProtectionLogPath       string
 	sshActivityLogPath         string
+	sshAuthorizedKeysPath      string
+	sshManagedConsoleKeyPath   string
 	sshProtectionPoll          time.Duration
 	sshTransferApplier         SSHTransferPolicyApplier
+	sshAuthenticationApplier   SSHAuthenticationPolicyApplier
 	sshIntegrityMu             sync.RWMutex
 	sshIntegrityPath           string
 	sshIntegrityManifest       integrity.Manifest
@@ -98,11 +115,37 @@ type AgentHandler struct {
 	securityArchiveWarning     string
 	securityArchiveUnavailable string
 	securityReports            map[string]scanReportSummary
+	securityScanSubscribers    map[chan securityScanView]struct{}
 	monitor                    *monitoring.Collector
+	maintenanceUpdateMu        sync.Mutex
+	maintenanceUpdateRunning   bool
+	maintenanceUpdate          func(context.Context) error
+	maintenanceUpdateTarget    func(context.Context, string) error
+}
+
+// SetMaintenanceUpdateFunc wires the runtime-specific self-update operation
+// into the HTTP handler without making the handler depend on process startup
+// configuration. A nil callback keeps the endpoint unavailable in unit tests
+// and in agents that were intentionally built without auto-update support.
+func (h *AgentHandler) SetMaintenanceUpdateFunc(update func(context.Context) error) {
+	h.maintenanceUpdateMu.Lock()
+	defer h.maintenanceUpdateMu.Unlock()
+	h.maintenanceUpdate = update
+}
+
+// SetMaintenanceUpdateTargetFunc wires an update callback that can use the
+// manager URL supplied by the authenticated manager request. This is needed
+// during a web-port migration: an enrolled node may still have the manager's
+// legacy 8080 URL in its environment while the active manager is already on
+// 8086 or another selected port.
+func (h *AgentHandler) SetMaintenanceUpdateTargetFunc(update func(context.Context, string) error) {
+	h.maintenanceUpdateMu.Lock()
+	defer h.maintenanceUpdateMu.Unlock()
+	h.maintenanceUpdateTarget = update
 }
 
 func NewAgentHandler(nodeID string, xdpManager xdp.Dataplane, state AgentStateStore, confirmTimeout time.Duration, recorder DropLogRecorder, geoipDB *geoip.CountryDB, sshOptions ...SSHProtectionOptions) *AgentHandler {
-	options := SSHProtectionOptions{LogPath: detectSSHLogPath(), PollInterval: time.Second, IntegrityManifestPath: "/etc/nodewall/ssh-transfer-integrity.json", ActivityLogPath: "/var/log/nodewall/ssh-activity.log"}
+	options := SSHProtectionOptions{LogPath: detectSSHLogPath(), PollInterval: time.Second, IntegrityManifestPath: "/etc/nodewall/ssh-transfer-integrity.json", ActivityLogPath: "/var/log/nodewall/ssh-activity.log", AuthorizedKeysPath: "/root/.ssh/authorized_keys"}
 	if len(sshOptions) > 0 {
 		options = sshOptions[0]
 		if strings.TrimSpace(options.LogPath) == "" {
@@ -117,35 +160,53 @@ func NewAgentHandler(nodeID string, xdpManager xdp.Dataplane, state AgentStateSt
 		if strings.TrimSpace(options.ActivityLogPath) == "" {
 			options.ActivityLogPath = "/var/log/nodewall/ssh-activity.log"
 		}
+		if strings.TrimSpace(options.AuthorizedKeysPath) == "" {
+			options.AuthorizedKeysPath = "/root/.ssh/authorized_keys"
+		}
 	}
 	handler := &AgentHandler{
-		nodeID:                nodeID,
-		xdp:                   xdpManager,
-		health:                health.Probe{NodeID: nodeID, XDP: xdpManager},
-		confirmTimeout:        confirmTimeout,
-		state:                 state,
-		recorder:              recorder,
-		geoipDB:               geoipDB,
-		runtimes:              make(map[string]models.InterfaceRuntime),
-		sshProtectionSettings: defaultSSHProtectionSettings(options.LogPath),
-		sshProtectionStore:    options.StateStore,
-		sshProtectionLogPath:  options.LogPath,
-		sshActivityLogPath:    options.ActivityLogPath,
-		sshProtectionPoll:     options.PollInterval,
-		sshTransferApplier:    options.TransferPolicyApplier,
-		sshIntegrityPath:      options.IntegrityManifestPath,
-		sshFailures:           make(map[string][]time.Time),
-		securityScanner:       securityscan.New(),
-		monitor:               monitoring.NewCollector(nodeID),
+		nodeID:                   nodeID,
+		xdp:                      xdpManager,
+		health:                   health.Probe{NodeID: nodeID, XDP: xdpManager},
+		confirmTimeout:           confirmTimeout,
+		state:                    state,
+		recorder:                 recorder,
+		geoipDB:                  geoipDB,
+		dnsResolver:              dnsresolve.New(),
+		runtimes:                 make(map[string]models.InterfaceRuntime),
+		sshProtectionSettings:    defaultSSHProtectionSettings(options.LogPath),
+		sshProtectionStore:       options.StateStore,
+		sshProtectionLogPath:     options.LogPath,
+		sshActivityLogPath:       options.ActivityLogPath,
+		sshAuthorizedKeysPath:    options.AuthorizedKeysPath,
+		sshManagedConsoleKeyPath: strings.TrimSpace(options.ManagedConsoleKeyPath),
+		sshProtectionPoll:        options.PollInterval,
+		sshTransferApplier:       options.TransferPolicyApplier,
+		sshAuthenticationApplier: options.AuthenticationPolicyApplier,
+		sshIntegrityPath:         options.IntegrityManifestPath,
+		sshFailures:              make(map[string][]time.Time),
+		securityScanner:          securityscan.New(),
+		securityScanSubscribers:  make(map[chan securityScanView]struct{}),
+		monitor:                  monitoring.NewCollector(nodeID),
 	}
 	if handler.sshTransferApplier == nil {
 		applier := sshpolicy.New()
 		applier.ActivityLogPath = handler.sshActivityLogPath
 		handler.sshTransferApplier = applier
+		if handler.sshAuthenticationApplier == nil {
+			handler.sshAuthenticationApplier = applier
+		}
+	} else if handler.sshAuthenticationApplier == nil {
+		handler.sshAuthenticationApplier = sshpolicy.New()
 	}
 	handler.rollback = rollback.NewManager(confirmTimeout, func(ctx context.Context, snapshot rollback.Snapshot) error {
 		handler.policyMu.Lock()
 		defer handler.policyMu.Unlock()
+		// An apply handler may have finished recovery while this timer was
+		// waiting for the policy lock. Never restore it over a later update.
+		if _, pending := handler.rollback.Pending(snapshot.PublishID); !pending {
+			return nil
+		}
 		return handler.restoreSnapshot(ctx, snapshot)
 	})
 	return handler
@@ -154,23 +215,34 @@ func NewAgentHandler(nodeID string, xdpManager xdp.Dataplane, state AgentStateSt
 func (h *AgentHandler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", h.handleHealth)
+	mux.HandleFunc("GET /clamav/manifest", h.handleClamAVManifest)
+	mux.HandleFunc("GET /clamav/{kind}/{name}", h.handleClamAVFile)
 	mux.HandleFunc("GET /system/ssh", h.handleSSHInfo)
 	mux.HandleFunc("GET /system/metrics", h.handleSystemMetrics)
 	mux.HandleFunc("GET /security/summary", h.handleSecuritySummary)
 	mux.HandleFunc("GET /security/scan", h.handleSecurityScanStatus)
+	mux.HandleFunc("GET /security/scan/events", h.handleSecurityScanEvents)
 	mux.HandleFunc("GET /security/scan/report", h.handleSecurityScanReport)
 	mux.HandleFunc("GET /security/scan/reports", h.handleSecurityScanReports)
 	mux.HandleFunc("GET /security/scan/reports/{scan}", h.handleSecurityScanReport)
 	mux.HandleFunc("POST /security/scan", h.handleSecurityScanStart)
+	mux.HandleFunc("POST /security/scan/stop", h.handleSecurityScanStop)
 	mux.HandleFunc("POST /security/scan/{finding}/terminate", h.handleSecurityProcessTerminate)
 	mux.HandleFunc("POST /security/scan/{finding}/quarantine", h.handleSecurityQuarantine)
+	mux.HandleFunc("POST /security/scan/{finding}/ignore", h.handleSecurityFindingIgnore)
 	mux.HandleFunc("GET /security/quarantine", h.handleSecurityQuarantineList)
 	mux.HandleFunc("DELETE /security/quarantine/{entry}", h.handleSecurityQuarantineDelete)
 	mux.HandleFunc("POST /security/quarantine/{entry}/restore", h.handleSecurityQuarantineRestore)
+	mux.HandleFunc("POST /security/quarantine/{entry}/load", h.handleSecurityQuarantineModuleLoad)
+	mux.HandleFunc("POST /security/quarantine/{entry}/unload", h.handleSecurityQuarantineModuleUnload)
 	mux.HandleFunc("GET /ssh-protection", h.handleSSHProtection)
 	mux.HandleFunc("GET /ssh-protection/activity", h.handleSSHActivity)
 	mux.HandleFunc("PUT /ssh-protection", h.handleSSHProtection)
 	mux.HandleFunc("PUT /ssh-protection/transfer", h.handleSSHTransferPolicy)
+	mux.HandleFunc("GET /ssh-protection/keys", h.handleSSHAuthorizedKeys)
+	mux.HandleFunc("POST /ssh-protection/keys", h.handleSSHAuthorizedKeys)
+	mux.HandleFunc("DELETE /ssh-protection/keys/{fingerprint}", h.handleSSHAuthorizedKeyDelete)
+	mux.HandleFunc("PUT /ssh-protection/authentication", h.handleSSHAuthenticationPolicy)
 	mux.HandleFunc("POST /ssh-protection/integrity/baseline", h.handleSSHIntegrityBaseline)
 	mux.HandleFunc("POST /ssh-protection/integrity/verify", h.handleSSHIntegrityVerify)
 	mux.HandleFunc("DELETE /ssh-protection/blocks/{id}", h.handleDeleteSSHProtectionBlock)
@@ -219,6 +291,7 @@ func (h *AgentHandler) Routes() http.Handler {
 	mux.HandleFunc("POST /interfaces/{iface}/confirm", h.handleConfirm)
 	mux.HandleFunc("POST /interfaces/{iface}/rollback", h.handleRollback)
 	mux.HandleFunc("POST /maintenance/cleanup", h.handleMaintenanceCleanup)
+	mux.HandleFunc("POST /maintenance/update", h.handleMaintenanceUpdate)
 	mux.HandleFunc("POST /maintenance/delete", h.handleMaintenanceDelete)
 	return mux
 }
@@ -242,24 +315,96 @@ func (h *AgentHandler) handleSystemMetrics(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *AgentHandler) handleMaintenanceCleanup(w http.ResponseWriter, r *http.Request) {
-	for _, iface := range h.runtimeKeys() {
-		_ = h.xdp.Detach(iface)
+	if err := h.cleanupDataplane(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
-	h.clearRuntimes()
-	_ = h.persist(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status": "cleaned",
 	})
 }
 
+func (h *AgentHandler) cleanupDataplane(ctx context.Context) error {
+	var detachErrs []error
+	for _, iface := range h.runtimeKeys() {
+		if err := h.xdp.Detach(iface); err != nil {
+			detachErrs = append(detachErrs, fmt.Errorf("detach %s: %w", iface, err))
+		}
+	}
+	if err := errors.Join(detachErrs...); err != nil {
+		return fmt.Errorf("cleanup dataplane failed: %w", err)
+	}
+	h.clearRuntimes()
+	if err := h.persist(ctx); err != nil {
+		return fmt.Errorf("persist cleanup state: %w", err)
+	}
+	return nil
+}
+
+// handleMaintenanceUpdate starts a forced package update in the background so
+// the manager receives a quick acknowledgement before the agent restarts.
+// Duplicate clicks are coalesced while the first update is in progress.
+func (h *AgentHandler) handleMaintenanceUpdate(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		ManagerURL string `json:"manager_url"`
+	}
+	if r.Body != nil {
+		decodeErr := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&request)
+		if decodeErr != nil && !errors.Is(decodeErr, io.EOF) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("decode update request: %w", decodeErr))
+			return
+		}
+	}
+	managerURL := strings.TrimSpace(request.ManagerURL)
+
+	h.maintenanceUpdateMu.Lock()
+	update := h.maintenanceUpdate
+	if managerURL != "" && h.maintenanceUpdateTarget != nil {
+		targetUpdate := h.maintenanceUpdateTarget
+		update = func(ctx context.Context) error {
+			return targetUpdate(ctx, managerURL)
+		}
+	}
+	if update == nil {
+		h.maintenanceUpdateMu.Unlock()
+		writeError(w, http.StatusServiceUnavailable, errors.New("agent self-update is unavailable"))
+		return
+	}
+	if h.maintenanceUpdateRunning {
+		h.maintenanceUpdateMu.Unlock()
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "already_running"})
+		return
+	}
+	h.maintenanceUpdateRunning = true
+	h.maintenanceUpdateMu.Unlock()
+
+	go func() {
+		err := update(context.Background())
+		h.maintenanceUpdateMu.Lock()
+		h.maintenanceUpdateRunning = false
+		h.maintenanceUpdateMu.Unlock()
+		if err != nil {
+			// The process may be replaced before this log is flushed, so keep the
+			// failure useful for direct-agent deployments and tests alike.
+			log.Printf("warning: forced agent update failed: %v", err)
+		}
+	}()
+	writeJSON(w, http.StatusAccepted, map[string]any{"status": "started"})
+}
+
 func (h *AgentHandler) handleMaintenanceDelete(w http.ResponseWriter, r *http.Request) {
-	h.handleMaintenanceCleanup(w, r)
+	if err := h.cleanupDataplane(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	exePath, err := os.Executable()
 	if err != nil {
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "cleaned"})
 		return
 	}
 	script := fmt.Sprintf("nohup sh -c 'sleep 2; %q cleanup --restart-services=true' >/var/log/nodewall-self-delete.log 2>&1 &", exePath)
 	_ = exec.Command("sh", "-c", script).Run()
+	writeJSON(w, http.StatusAccepted, map[string]any{"status": "delete_scheduled"})
 }
 
 func (h *AgentHandler) LoadState(ctx context.Context) error {
@@ -276,6 +421,10 @@ func (h *AgentHandler) LoadState(ctx context.Context) error {
 		legacyUnconfirmed := !runtime.EnforcementConfirmed
 		for direction, snapshot := range runtime.Recovery {
 			runtime = withDirectionState(runtime, direction, snapshot)
+		}
+		if !runtime.Attached {
+			runtime.Egress.Attached = false
+			runtime.Egress.AttachMode = ""
 		}
 		runtime.Recovery = nil
 		if runtime.PendingPublish != nil {
@@ -314,6 +463,8 @@ func (h *AgentHandler) LoadState(ctx context.Context) error {
 }
 
 func (h *AgentHandler) handleAttach(w http.ResponseWriter, r *http.Request) {
+	h.policyMu.Lock()
+	defer h.policyMu.Unlock()
 	iface := r.PathValue("iface")
 	if err := h.validateAttachableInterface(iface); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -324,12 +475,13 @@ func (h *AgentHandler) handleAttach(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
+	previous := h.ensureRuntime(iface)
 	if err := h.xdp.Attach(iface, xdp.ParseAttachMode(req.Mode)); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 
-	runtime := h.ensureRuntime(iface)
+	runtime := previous
 	runtime.Attached = true
 	if !runtime.EnforcementConfirmed {
 		runtime.ObserveOnly = true
@@ -349,19 +501,32 @@ func (h *AgentHandler) handleAttach(w http.ResponseWriter, r *http.Request) {
 		runtime.AttachMode = string(xdp.ParseAttachMode(req.Mode))
 	}
 	runtime.LastUpdatedAt = time.Now().UTC()
-	h.setRuntime(iface, runtime)
+	failAttach := func(cause error) {
+		if !previous.Attached {
+			if err := h.xdp.Detach(iface); err != nil {
+				cause = errors.Join(cause, fmt.Errorf("restore unattached interface: %w", err))
+			}
+		}
+		h.setRuntime(iface, previous)
+		writeError(w, http.StatusInternalServerError, cause)
+	}
 	if err := h.xdp.ReplaceRateLimitRules(iface, runtime.RateLimits); err != nil {
-		_ = h.xdp.Detach(iface)
-		writeError(w, http.StatusBadRequest, err)
+		failAttach(err)
 		return
 	}
 	if err := h.syncPolicyConfig(iface, runtime); err != nil {
-		_ = h.xdp.Detach(iface)
-		writeError(w, http.StatusBadRequest, err)
+		failAttach(err)
 		return
 	}
-	_ = h.persist(r.Context())
-	writeJSON(w, http.StatusOK, runtime)
+	h.setRuntime(iface, runtime)
+	if err := h.persist(r.Context()); err != nil {
+		failAttach(fmt.Errorf("persist interface attach: %w", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		models.InterfaceRuntime
+		PreviouslyAttached bool `json:"previously_attached"`
+	}{runtime, previous.Attached})
 }
 
 func (h *AgentHandler) validateAttachableInterface(iface string) error {
@@ -1060,7 +1225,7 @@ func (h *AgentHandler) handleInsights(w http.ResponseWriter, r *http.Request) {
 	iface := r.PathValue("iface")
 	direction := requestPolicyDirection(r)
 	if direction == models.DirectionEgress {
-		insights, err := h.buildDirectionInsights(iface, direction, 10)
+		insights, err := h.buildDirectionInsights(r.Context(), iface, direction, 10)
 		if err == nil {
 			writeJSON(w, http.StatusOK, insights)
 			return
@@ -1069,7 +1234,7 @@ func (h *AgentHandler) handleInsights(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, emptyDirectionInsights(iface, direction, runtime.Trend))
 		return
 	}
-	insights, err := h.buildInsights(iface, 10)
+	insights, err := h.buildInsights(r.Context(), iface, 10)
 	if err != nil {
 		if xdp.IsNotAttached(err) {
 			writeJSON(w, http.StatusOK, models.InterfaceInsights{
@@ -1099,8 +1264,12 @@ func (h *AgentHandler) handleDropLogs(w http.ResponseWriter, r *http.Request) {
 		if directional, ok := h.xdp.(xdp.DirectionalStats); ok {
 			logs, err := directional.ReadDirectionDropLogs(r.PathValue("iface"), direction, 20)
 			if err == nil {
+				h.enrichInterceptLogs(r.Context(), logs)
 				runtime := h.ensureRuntime(r.PathValue("iface"))
 				for i := range logs {
+					if logs[i].SourceCIDR != "" {
+						continue
+					}
 					if geo, ok := h.lookupGeo(logs[i].SourceIP); ok {
 						logs[i].Geo = &geo
 					}
@@ -1124,7 +1293,11 @@ func (h *AgentHandler) handleDropLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	runtime := h.ensureRuntime(r.PathValue("iface"))
+	h.enrichInterceptLogs(r.Context(), logs)
 	for i := range logs {
+		if logs[i].SourceCIDR != "" {
+			continue
+		}
 		if geo, ok := h.lookupGeo(logs[i].SourceIP); ok {
 			logs[i].Geo = &geo
 		}
@@ -1177,6 +1350,7 @@ func (h *AgentHandler) handleRecentDropLogs(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	h.enrichDropLogRecords(r.Context(), logs)
 	for i := range logs {
 		if geo, ok := h.lookupGeo(logs[i].SourceIP); ok {
 			logs[i].Geo = &geo
@@ -1202,25 +1376,26 @@ func (h *AgentHandler) handlePublish(w http.ResponseWriter, r *http.Request) {
 	defer h.policyMu.Unlock()
 	iface := r.PathValue("iface")
 	var req struct {
-		Direction        models.PolicyDirection `json:"direction"`
-		PublishID        string                 `json:"publish_id"`
-		BypassCIDRs      []string               `json:"bypass_cidrs"`
-		BlockedCIDRs     []string               `json:"blocked_cidrs"`
-		ICMPAllowCIDRs   []string               `json:"icmp_allow_cidrs"`
-		ICMPBlockedCIDRs []string               `json:"icmp_blocked_cidrs"`
-		Allowlist        []string               `json:"allowlist"`
-		PublicPorts      []uint16               `json:"public_ports"`
-		DeniedPorts      []uint16               `json:"denied_ports"`
-		AllowedPorts     []uint16               `json:"allowed_ports"`
-		PublicPortRules  []models.PortRule      `json:"public_port_rules"`
-		DeniedPortRules  []models.PortRule      `json:"denied_port_rules"`
-		AllowedPortRules []models.PortRule      `json:"allowed_port_rules"`
-		NonIPv4Action    models.NonIPv4Action   `json:"non_ipv4_action"`
-		Challenge        models.ChallengeSpec   `json:"challenge"`
-		ConfirmTimeout   int                    `json:"confirm_timeout"`
-		Immediate        bool                   `json:"immediate"`
-		SafetyTimeout    int                    `json:"safety_timeout"`
-		ObserveOnly      bool                   `json:"observe_only"`
+		Direction         models.PolicyDirection `json:"direction"`
+		PublishID         string                 `json:"publish_id"`
+		BypassCIDRs       []string               `json:"bypass_cidrs"`
+		BlockedCIDRs      []string               `json:"blocked_cidrs"`
+		ICMPAllowCIDRs    []string               `json:"icmp_allow_cidrs"`
+		ICMPBlockedCIDRs  []string               `json:"icmp_blocked_cidrs"`
+		Allowlist         []string               `json:"allowlist"`
+		PublicPorts       []uint16               `json:"public_ports"`
+		DeniedPorts       []uint16               `json:"denied_ports"`
+		AllowedPorts      []uint16               `json:"allowed_ports"`
+		PublicPortRules   []models.PortRule      `json:"public_port_rules"`
+		DeniedPortRules   []models.PortRule      `json:"denied_port_rules"`
+		AllowedPortRules  []models.PortRule      `json:"allowed_port_rules"`
+		NonIPv4Action     models.NonIPv4Action   `json:"non_ipv4_action"`
+		Challenge         models.ChallengeSpec   `json:"challenge"`
+		ConfirmTimeout    int                    `json:"confirm_timeout"`
+		Immediate         bool                   `json:"immediate"`
+		SafetyTimeout     int                    `json:"safety_timeout"`
+		ObserveOnly       bool                   `json:"observe_only"`
+		RestoreUnattached bool                   `json:"restore_unattached"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -1236,6 +1411,10 @@ func (h *AgentHandler) handlePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	runtime := h.ensureRuntime(iface)
+	if _, pending := runtime.Recovery[direction]; pending {
+		writeError(w, http.StatusConflict, errors.New("a policy update is already being verified"))
+		return
+	}
 	directionRuntime := directionStateFor(runtime, direction)
 	snapshot := rollback.Snapshot{
 		Direction:        direction,
@@ -1259,6 +1438,16 @@ func (h *AgentHandler) handlePublish(w http.ResponseWriter, r *http.Request) {
 		Challenge:        directionRuntime.Challenge,
 		ObserveOnly:      directionRuntime.ObserveOnly,
 	}
+	if req.RestoreUnattached {
+		if direction != models.DirectionIngress || req.SafetyTimeout <= 0 {
+			writeError(w, http.StatusBadRequest, errors.New("restore_unattached requires an ingress safety update"))
+			return
+		}
+		// /attach runs before /apply for compatibility with older agents. The
+		// manager carries the pre-attach state so a trial can detach on expiry.
+		snapshot.Attached = false
+		snapshot.AttachMode = ""
+	}
 
 	req.PublicPortRules = models.NormalizePortRules(req.PublicPortRules, req.PublicPorts)
 	req.DeniedPortRules = models.NormalizePortRules(req.DeniedPortRules, req.DeniedPorts)
@@ -1276,12 +1465,8 @@ func (h *AgentHandler) handlePublish(w http.ResponseWriter, r *http.Request) {
 		confirmTimeout = time.Duration(req.ConfirmTimeout) * time.Second
 	}
 	safetyStarted := req.SafetyTimeout > 0
-	applyCompleted := false
-	if safetyStarted {
-		if _, pending := runtime.Recovery[direction]; pending {
-			writeError(w, http.StatusConflict, errors.New("a policy update is already being verified"))
-			return
-		}
+	protectedUpdate := safetyStarted || !req.Immediate
+	if protectedUpdate {
 		if publishID == "" {
 			writeError(w, http.StatusBadRequest, errors.New("automatic safety checks require a publish_id"))
 			return
@@ -1290,7 +1475,10 @@ func (h *AgentHandler) handlePublish(w http.ResponseWriter, r *http.Request) {
 		for key, value := range runtime.Recovery {
 			recovery[key] = value
 		}
-		recovery[direction] = directionRuntime
+		baseline := directionRuntime
+		baseline.Attached = snapshot.Attached
+		baseline.AttachMode = snapshot.AttachMode
+		recovery[direction] = baseline
 		runtime.Recovery = recovery
 		h.setRuntime(iface, runtime)
 		if err := h.persist(r.Context()); err != nil {
@@ -1299,78 +1487,85 @@ func (h *AgentHandler) handlePublish(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("save recovery snapshot before policy update: %w", err))
 			return
 		}
-		timeout := time.Duration(min(max(req.SafetyTimeout, 1), 120)) * time.Second
+		timeout := confirmTimeout
+		if safetyStarted {
+			timeout = time.Duration(min(max(req.SafetyTimeout, 1), 120)) * time.Second
+		}
 		h.rollback.BeginWithTimeout(r.Context(), publishID, snapshot, timeout)
-		defer func() {
-			if !applyCompleted {
-				h.rollback.Confirm(publishID)
+	}
+	failApply := func(status int, cause error) {
+		recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 15*time.Second)
+		defer cancel()
+		if err := h.restoreSnapshot(recoveryCtx, snapshot); err != nil {
+			// Keep the safety session alive: canceling it here used to strand
+			// safety_recovery forever when the first restore failed.
+			log.Printf("warning: failed policy apply on %s/%s could not restore its snapshot: %v", iface, direction, err)
+			cause = errors.Join(cause, fmt.Errorf("policy rollback failed; recovery will retry: %w", err))
+			status = http.StatusInternalServerError
+			if protectedUpdate {
+				h.rollback.RetryRollback(publishID)
 			}
-		}()
+		} else if protectedUpdate {
+			h.rollback.CompleteRollback(publishID)
+		}
+		writeError(w, status, cause)
 	}
 
 	if direction == models.DirectionIngress {
 		if err := h.xdp.ReplaceBypassCIDRs(iface, req.BypassCIDRs); err != nil {
-			_ = h.restoreSnapshot(r.Context(), snapshot)
-			writeError(w, http.StatusBadRequest, err)
+			failApply(http.StatusBadRequest, err)
 			return
 		}
 		if err := h.xdp.ReplaceBlockedCIDRs(iface, req.BlockedCIDRs); err != nil {
-			_ = h.restoreSnapshot(r.Context(), snapshot)
-			writeError(w, http.StatusBadRequest, err)
+			failApply(http.StatusBadRequest, err)
 			return
 		}
 		if err := h.xdp.ReplaceICMPAllowCIDRs(iface, req.ICMPAllowCIDRs); err != nil {
-			_ = h.restoreSnapshot(r.Context(), snapshot)
-			writeError(w, http.StatusBadRequest, err)
+			failApply(http.StatusBadRequest, err)
 			return
 		}
 		if err := h.xdp.ReplaceICMPBlockedCIDRs(iface, req.ICMPBlockedCIDRs); err != nil {
-			_ = h.restoreSnapshot(r.Context(), snapshot)
-			writeError(w, http.StatusBadRequest, err)
+			failApply(http.StatusBadRequest, err)
 			return
 		}
 		if err := h.xdp.ReplaceAllowlist(iface, req.Allowlist); err != nil {
-			_ = h.restoreSnapshot(r.Context(), snapshot)
-			writeError(w, http.StatusBadRequest, err)
+			failApply(http.StatusBadRequest, err)
 			return
 		}
 		if err := h.xdp.ReplacePublicPortRules(iface, req.PublicPortRules); err != nil {
-			_ = h.restoreSnapshot(r.Context(), snapshot)
-			writeError(w, http.StatusBadRequest, err)
+			failApply(http.StatusBadRequest, err)
 			return
 		}
 		if err := h.xdp.ReplaceDeniedPortRules(iface, req.DeniedPortRules); err != nil {
-			_ = h.restoreSnapshot(r.Context(), snapshot)
-			writeError(w, http.StatusBadRequest, err)
+			failApply(http.StatusBadRequest, err)
 			return
 		}
 		if err := h.xdp.ReplacePortRules(iface, req.AllowedPortRules); err != nil {
-			_ = h.restoreSnapshot(r.Context(), snapshot)
-			writeError(w, http.StatusBadRequest, err)
+			failApply(http.StatusBadRequest, err)
 			return
 		}
 		if err := h.xdp.ReplaceRateLimitRules(iface, directionRuntime.RateLimits); err != nil {
-			_ = h.restoreSnapshot(r.Context(), snapshot)
-			writeError(w, http.StatusBadRequest, err)
+			failApply(http.StatusBadRequest, err)
 			return
 		}
-		if err := h.xdp.WriteConfig(iface, xdp.Config{
-			NonIPv4Action:           defaultAction(req.NonIPv4Action),
-			PortPolicyEnabled:       len(req.AllowedPortRules) > 0,
-			RateLimitEnabled:        len(directionRuntime.RateLimits) > 0,
-			PolicyEnforced:          policyEnforcedFor(req.BypassCIDRs, req.BlockedCIDRs, req.ICMPAllowCIDRs, req.ICMPBlockedCIDRs, req.Allowlist, req.PublicPorts, req.DeniedPorts, req.AllowedPorts) || len(directionRuntime.TemporaryBlocks) > 0,
-			EgressPolicyEnforced:    directionPolicyEnforced(runtime.Egress),
-			ObserveOnly:             req.ObserveOnly,
-			ReplyFlowTimeoutSeconds: h.replyFlowTimeoutSeconds(),
-		}); err != nil {
-			_ = h.restoreSnapshot(r.Context(), snapshot)
-			writeError(w, http.StatusBadRequest, err)
+		cfg, err := h.xdp.ReadConfig(iface)
+		if err != nil {
+			failApply(http.StatusBadRequest, err)
+			return
+		}
+		cfg.NonIPv4Action = defaultAction(req.NonIPv4Action)
+		cfg.PortPolicyEnabled = len(req.AllowedPortRules) > 0
+		cfg.RateLimitEnabled = len(directionRuntime.RateLimits) > 0
+		cfg.PolicyEnforced = policyEnforcedFor(req.BypassCIDRs, req.BlockedCIDRs, req.ICMPAllowCIDRs, req.ICMPBlockedCIDRs, req.Allowlist, req.PublicPorts, req.DeniedPorts, req.AllowedPorts) || len(directionRuntime.TemporaryBlocks) > 0
+		cfg.ObserveOnly = req.ObserveOnly
+		cfg.ReplyFlowTimeoutSeconds = h.replyFlowTimeoutSeconds()
+		if err := h.xdp.WriteConfig(iface, cfg); err != nil {
+			failApply(http.StatusBadRequest, err)
 			return
 		}
 		for _, item := range directionRuntime.TemporaryBlocks {
 			if err := h.applyTemporaryBlock(iface, item); err != nil {
-				_ = h.restoreSnapshot(r.Context(), snapshot)
-				writeError(w, http.StatusBadRequest, err)
+				failApply(http.StatusBadRequest, err)
 				return
 			}
 		}
@@ -1394,8 +1589,7 @@ func (h *AgentHandler) handlePublish(w http.ResponseWriter, r *http.Request) {
 				ObserveOnly:      req.ObserveOnly,
 			}
 			if err := directional.ApplyDirectionPolicy(iface, models.DirectionEgress, policy); err != nil {
-				_ = h.restoreSnapshot(r.Context(), snapshot)
-				writeError(w, http.StatusBadRequest, err)
+				failApply(http.StatusBadRequest, err)
 				return
 			}
 		}
@@ -1404,8 +1598,7 @@ func (h *AgentHandler) handlePublish(w http.ResponseWriter, r *http.Request) {
 	if direction == models.DirectionIngress {
 		healthStatus := h.health.Check(r.Context())
 		if !isHealthyForInterface(healthStatus, iface) {
-			_ = h.restoreSnapshot(r.Context(), snapshot)
-			writeError(w, http.StatusBadRequest, errors.New("health check failed after publish"))
+			failApply(http.StatusBadRequest, errors.New("health check failed after publish"))
 			return
 		}
 	}
@@ -1455,27 +1648,25 @@ func (h *AgentHandler) handlePublish(w http.ResponseWriter, r *http.Request) {
 	if direction == models.DirectionEgress && runtime.Attached {
 		cfg, err := h.xdp.ReadConfig(iface)
 		if err != nil {
-			_ = h.restoreSnapshot(r.Context(), snapshot)
-			writeError(w, http.StatusBadRequest, err)
+			failApply(http.StatusBadRequest, err)
 			return
 		}
 		cfg.EgressPolicyEnforced = directionPolicyEnforced(nextDirectionRuntime)
+		cfg.EgressObserveOnly = nextDirectionRuntime.ObserveOnly
+		cfg.EgressNonIPv4Action = defaultAction(nextDirectionRuntime.NonIPv4Action)
+		cfg.EgressPortPolicyEnabled = len(nextDirectionRuntime.AllowedPortRules) > 0 || len(nextDirectionRuntime.AllowedPorts) > 0
+		cfg.EgressRateLimitEnabled = len(nextDirectionRuntime.RateLimits) > 0
+		cfg.EgressDefaultDeny = len(nextDirectionRuntime.Allowlist) > 0 || len(nextDirectionRuntime.AllowedPortRules) > 0 || len(nextDirectionRuntime.AllowedPorts) > 0
 		if err := h.xdp.WriteConfig(iface, cfg); err != nil {
-			_ = h.restoreSnapshot(r.Context(), snapshot)
-			writeError(w, http.StatusBadRequest, err)
+			failApply(http.StatusBadRequest, err)
 			return
 		}
 	}
 	h.setRuntime(iface, runtime)
-	if !req.Immediate {
-		h.rollback.BeginWithTimeout(r.Context(), publishID, snapshot, confirmTimeout)
-	}
 	if err := h.persist(r.Context()); err != nil {
-		_ = h.restoreSnapshot(context.WithoutCancel(r.Context()), snapshot)
-		writeError(w, http.StatusInternalServerError, fmt.Errorf("persist policy update: %w", err))
+		failApply(http.StatusInternalServerError, fmt.Errorf("persist policy update: %w", err))
 		return
 	}
-	applyCompleted = true
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"publish_id": publishID,
@@ -1528,13 +1719,14 @@ func (h *AgentHandler) handleConfirm(w http.ResponseWriter, r *http.Request) {
 	}
 
 	session, pending := h.rollback.Pending(req.PublishID)
-	if !pending || session.Snapshot.Interface != r.PathValue("iface") || (req.Direction != "" && session.Snapshot.Direction != req.Direction) || !h.rollback.Confirm(req.PublishID) {
+	if !pending || session.Snapshot.Interface != r.PathValue("iface") || (req.Direction != "" && session.Snapshot.Direction != req.Direction) {
 		writeError(w, http.StatusNotFound, rollback.ErrPendingNotFound)
 		return
 	}
 
 	iface := r.PathValue("iface")
 	runtime := h.ensureRuntime(iface)
+	previous := runtime
 	direction := req.Direction
 	if direction == "" {
 		direction = session.Snapshot.Direction
@@ -1557,10 +1749,25 @@ func (h *AgentHandler) handleConfirm(w http.ResponseWriter, r *http.Request) {
 	}
 	runtime.Recovery = maps.Clone(runtime.Recovery)
 	delete(runtime.Recovery, direction)
-	h.setRuntime(iface, runtime)
-	if err := h.persist(r.Context()); err != nil {
-		_ = h.restoreSnapshot(context.WithoutCancel(r.Context()), session.Snapshot)
+	confirmed, err := h.rollback.ConfirmWith(req.PublishID, func() error {
+		h.setRuntime(iface, runtime)
+		return h.persist(r.Context())
+	})
+	if err != nil {
+		h.setRuntime(iface, previous)
+		recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 15*time.Second)
+		defer cancel()
+		if restoreErr := h.restoreSnapshot(recoveryCtx, session.Snapshot); restoreErr != nil {
+			h.rollback.RetryRollback(req.PublishID)
+			err = errors.Join(err, fmt.Errorf("policy rollback failed; recovery will retry: %w", restoreErr))
+		} else {
+			h.rollback.CompleteRollback(req.PublishID)
+		}
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("persist policy confirmation: %w", err))
+		return
+	}
+	if !confirmed {
+		writeError(w, http.StatusNotFound, rollback.ErrPendingNotFound)
 		return
 	}
 
@@ -1583,7 +1790,11 @@ func (h *AgentHandler) handleRollback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.rollback.RollbackNow(r.Context(), req.PublishID); err != nil {
-		writeError(w, http.StatusNotFound, err)
+		status := http.StatusInternalServerError
+		if errors.Is(err, rollback.ErrPendingNotFound) {
+			status = http.StatusNotFound
+		}
+		writeError(w, status, err)
 		return
 	}
 
@@ -1592,6 +1803,7 @@ func (h *AgentHandler) handleRollback(w http.ResponseWriter, r *http.Request) {
 
 func (h *AgentHandler) restoreSnapshot(ctx context.Context, snapshot rollback.Snapshot) error {
 	runtime := h.ensureRuntime(snapshot.Interface)
+	previousRecovery := runtime.Recovery
 	runtime.Recovery = maps.Clone(runtime.Recovery)
 	delete(runtime.Recovery, snapshot.Direction)
 	if snapshot.Direction == models.DirectionIngress {
@@ -1601,7 +1813,11 @@ func (h *AgentHandler) restoreSnapshot(ctx context.Context, snapshot rollback.Sn
 				return err
 			}
 		} else {
-			_ = h.xdp.Detach(snapshot.Interface)
+			if err := h.xdp.Detach(snapshot.Interface); err != nil {
+				return err
+			}
+			runtime.Egress.Attached = false
+			runtime.Egress.AttachMode = ""
 		}
 
 		if snapshot.Attached {
@@ -1632,15 +1848,23 @@ func (h *AgentHandler) restoreSnapshot(ctx context.Context, snapshot rollback.Sn
 			if err := h.xdp.ReplaceRateLimitRules(snapshot.Interface, snapshot.RateLimitRules); err != nil {
 				return err
 			}
-			if err := h.xdp.WriteConfig(snapshot.Interface, xdp.Config{
-				NonIPv4Action:           defaultAction(snapshot.NonIPv4Action),
-				PortPolicyEnabled:       len(snapshot.AllowedPorts) > 0,
-				RateLimitEnabled:        len(snapshot.RateLimitRules) > 0,
-				PolicyEnforced:          policyEnforcedFor(snapshot.BypassCIDRs, snapshot.BlockedCIDRs, snapshot.ICMPAllowCIDRs, snapshot.ICMPBlockedCIDRs, snapshot.Allowlist, snapshot.PublicPorts, snapshot.DeniedPorts, snapshot.AllowedPorts) || len(snapshot.TemporaryBlocks) > 0,
-				EgressPolicyEnforced:    directionPolicyEnforced(runtime.Egress),
-				ObserveOnly:             snapshot.ObserveOnly,
-				ReplyFlowTimeoutSeconds: h.replyFlowTimeoutSeconds(),
-			}); err != nil {
+			cfg, err := h.xdp.ReadConfig(snapshot.Interface)
+			if err != nil {
+				return err
+			}
+			cfg.NonIPv4Action = defaultAction(snapshot.NonIPv4Action)
+			cfg.PortPolicyEnabled = len(snapshot.AllowedPorts) > 0
+			cfg.RateLimitEnabled = len(snapshot.RateLimitRules) > 0
+			cfg.PolicyEnforced = policyEnforcedFor(snapshot.BypassCIDRs, snapshot.BlockedCIDRs, snapshot.ICMPAllowCIDRs, snapshot.ICMPBlockedCIDRs, snapshot.Allowlist, snapshot.PublicPorts, snapshot.DeniedPorts, snapshot.AllowedPorts) || len(snapshot.TemporaryBlocks) > 0
+			cfg.ObserveOnly = snapshot.ObserveOnly
+			cfg.EgressPolicyEnforced = directionPolicyEnforced(runtime.Egress)
+			cfg.EgressObserveOnly = runtime.Egress.ObserveOnly
+			cfg.EgressNonIPv4Action = defaultAction(runtime.Egress.NonIPv4Action)
+			cfg.EgressPortPolicyEnabled = len(runtime.Egress.AllowedPortRules) > 0 || len(runtime.Egress.AllowedPorts) > 0
+			cfg.EgressRateLimitEnabled = len(runtime.Egress.RateLimits) > 0
+			cfg.EgressDefaultDeny = len(runtime.Egress.Allowlist) > 0 || len(runtime.Egress.AllowedPortRules) > 0 || len(runtime.Egress.AllowedPorts) > 0
+			cfg.ReplyFlowTimeoutSeconds = h.replyFlowTimeoutSeconds()
+			if err := h.xdp.WriteConfig(snapshot.Interface, cfg); err != nil {
 				return err
 			}
 			for _, item := range snapshot.TemporaryBlocks {
@@ -1677,13 +1901,22 @@ func (h *AgentHandler) restoreSnapshot(ctx context.Context, snapshot rollback.Sn
 		runtime.PendingPublish = nil
 		runtime.LastUpdatedAt = time.Now().UTC()
 	} else {
-		if directional, ok := h.xdp.(xdp.DirectionalDataplane); ok {
-			if err := directional.ApplyDirectionPolicy(snapshot.Interface, models.DirectionEgress, directionPolicyFromSnapshot(snapshot)); err != nil {
-				return err
+		// Both directions share the lifetime of the ingress attachment. Its
+		// earlier timer may already have detached XDP and removed the TC maps.
+		// Restoring a disabled egress baseline then only needs durable state.
+		actual, err := h.xdp.Runtime(snapshot.Interface)
+		if err != nil {
+			return err
+		}
+		if actual.Attached {
+			if directional, ok := h.xdp.(xdp.DirectionalDataplane); ok {
+				if err := directional.ApplyDirectionPolicy(snapshot.Interface, models.DirectionEgress, directionPolicyFromSnapshot(snapshot)); err != nil {
+					return err
+				}
 			}
 		}
 		runtime.Egress = models.DirectionRuntime{
-			Attached:         snapshot.Attached,
+			Attached:         snapshot.Attached && actual.Attached,
 			AttachMode:       snapshot.AttachMode,
 			BypassCIDRs:      append([]string(nil), snapshot.BypassCIDRs...),
 			BlockedCIDRs:     append([]string(nil), snapshot.BlockedCIDRs...),
@@ -1704,9 +1937,19 @@ func (h *AgentHandler) restoreSnapshot(ctx context.Context, snapshot rollback.Sn
 			PendingPublish:   nil,
 			LastUpdatedAt:    time.Now().UTC(),
 		}
+		if !runtime.Egress.Attached {
+			runtime.Egress.AttachMode = ""
+		}
 	}
 	h.setRuntime(snapshot.Interface, runtime)
-	return h.persist(ctx)
+	if err := h.persist(ctx); err != nil {
+		// A failed save is not completed recovery. Keep the lock and baseline
+		// in memory until the session can also make that state durable.
+		runtime.Recovery = previousRecovery
+		h.setRuntime(snapshot.Interface, runtime)
+		return err
+	}
+	return nil
 }
 
 func (h *AgentHandler) ensureRuntime(iface string) models.InterfaceRuntime {
@@ -1819,6 +2062,11 @@ func (h *AgentHandler) syncPolicyConfig(iface string, runtime models.InterfaceRu
 		runtime.AllowedPorts,
 	) || len(runtime.TemporaryBlocks) > 0
 	cfg.EgressPolicyEnforced = directionPolicyEnforced(runtime.Egress)
+	cfg.EgressObserveOnly = runtime.Egress.ObserveOnly
+	cfg.EgressNonIPv4Action = defaultAction(runtime.Egress.NonIPv4Action)
+	cfg.EgressPortPolicyEnabled = len(runtime.Egress.AllowedPortRules) > 0 || len(runtime.Egress.AllowedPorts) > 0
+	cfg.EgressRateLimitEnabled = len(runtime.Egress.RateLimits) > 0
+	cfg.EgressDefaultDeny = len(runtime.Egress.Allowlist) > 0 || len(runtime.Egress.AllowedPortRules) > 0 || len(runtime.Egress.AllowedPorts) > 0
 	cfg.ReplyFlowTimeoutSeconds = h.replyFlowTimeoutSeconds()
 
 	if err := h.xdp.WriteConfig(iface, cfg); err != nil {
@@ -1872,15 +2120,18 @@ func (h *AgentHandler) reconcileState(ctx context.Context) error {
 		if err := h.xdp.ReplaceRateLimitRules(iface, runtime.RateLimits); err != nil {
 			return err
 		}
-		if err := h.syncPolicyConfig(iface, runtime); err != nil {
-			return err
-		}
 		if runtime.Egress.Attached {
 			if directional, ok := h.xdp.(xdp.DirectionalDataplane); ok {
 				if err := directional.ApplyDirectionPolicy(iface, models.DirectionEgress, directionPolicyFromRuntime(runtime.Egress)); err != nil {
 					return err
 				}
 			}
+		}
+		// ApplyDirectionPolicy keeps the egress gate disabled while it fills the
+		// separate TC maps. Sync the shared config only after those maps are
+		// complete so a restart cannot briefly enforce an empty default-deny map.
+		if err := h.syncPolicyConfig(iface, runtime); err != nil {
+			return err
 		}
 		for _, item := range runtime.TemporaryBlocks {
 			if err := h.applyTemporaryBlock(iface, item); err != nil {
@@ -1953,7 +2204,7 @@ func withDirectionState(runtime models.InterfaceRuntime, direction models.Policy
 	return runtime
 }
 
-func (h *AgentHandler) buildInsights(iface string, limit int) (models.InterfaceInsights, error) {
+func (h *AgentHandler) buildInsights(ctx context.Context, iface string, limit int) (models.InterfaceInsights, error) {
 	_ = h.pruneExpiredDispositions(context.Background(), iface)
 	items, err := h.xdp.ReadSourceStats(iface, limit)
 	if err != nil {
@@ -1964,7 +2215,7 @@ func (h *AgentHandler) buildInsights(iface string, limit int) (models.InterfaceI
 		h.recordTrend(iface, stats)
 	}
 	portStats, _ := h.xdp.ReadPortStats(iface, limit)
-	h.enrichSourceStats(items)
+	h.enrichSourceStats(ctx, items)
 
 	topDropped := slices.Clone(items)
 	slices.SortFunc(topDropped, func(a, b models.SourceStat) int {
@@ -2022,9 +2273,9 @@ func (h *AgentHandler) buildInsights(iface string, limit int) (models.InterfaceI
 	}, nil
 }
 
-func (h *AgentHandler) buildDirectionInsights(iface string, direction models.PolicyDirection, limit int) (models.InterfaceInsights, error) {
+func (h *AgentHandler) buildDirectionInsights(ctx context.Context, iface string, direction models.PolicyDirection, limit int) (models.InterfaceInsights, error) {
 	if direction != models.DirectionEgress {
-		return h.buildInsights(iface, limit)
+		return h.buildInsights(ctx, iface, limit)
 	}
 	_ = h.pruneExpiredDispositions(context.Background(), iface)
 	directional, ok := h.xdp.(xdp.DirectionalStats)
@@ -2040,7 +2291,7 @@ func (h *AgentHandler) buildDirectionInsights(iface string, direction models.Pol
 		h.recordDirectionTrend(iface, direction, stats)
 	}
 	portStats, _ := directional.ReadDirectionPortStats(iface, direction, limit)
-	h.enrichSourceStats(items)
+	h.enrichSourceStats(ctx, items)
 
 	topDropped := slices.Clone(items)
 	slices.SortFunc(topDropped, func(a, b models.SourceStat) int {
@@ -2157,16 +2408,50 @@ func (h *AgentHandler) recordDirectionTrend(iface string, direction models.Polic
 	_ = h.persist(context.Background())
 }
 
-func (h *AgentHandler) enrichSourceStats(items []models.SourceStat) {
-	for i := range items {
-		geo, ok := h.lookupGeo(items[i].SourceIP)
-		if !ok {
-			continue
-		}
-		items[i].Geo = &geo
-		items[i].CountryCode = geo.CountryCode
-		items[i].CountryName = geo.CountryName
+func (h *AgentHandler) enrichSourceStats(ctx context.Context, items []models.SourceStat) {
+	ips := make([]string, 0, len(items))
+	for _, item := range items {
+		ips = append(ips, item.SourceIP)
 	}
+	domains := h.lookupDomains(ctx, ips)
+	for i := range items {
+		items[i].SourceDomain = domains[items[i].SourceIP]
+		geo, ok := h.lookupGeo(items[i].SourceIP)
+		if ok {
+			items[i].Geo = &geo
+			items[i].CountryCode = geo.CountryCode
+			items[i].CountryName = geo.CountryName
+		}
+	}
+}
+
+func (h *AgentHandler) enrichInterceptLogs(ctx context.Context, items []models.InterceptLogEntry) {
+	ips := make([]string, 0, len(items))
+	for _, item := range items {
+		ips = append(ips, item.SourceIP)
+	}
+	domains := h.lookupDomains(ctx, ips)
+	for i := range items {
+		items[i].SourceDomain = domains[items[i].SourceIP]
+	}
+}
+
+func (h *AgentHandler) enrichDropLogRecords(ctx context.Context, items []models.DropLogRecord) {
+	ips := make([]string, 0, len(items))
+	for _, item := range items {
+		ips = append(ips, item.SourceIP)
+	}
+	domains := h.lookupDomains(ctx, ips)
+	for i := range items {
+		items[i].SourceDomain = domains[items[i].SourceIP]
+	}
+}
+
+func (h *AgentHandler) lookupDomains(ctx context.Context, ips []string) map[string]string {
+	if h.dnsResolver == nil {
+		return map[string]string{}
+	}
+	return h.dnsResolver.LookupMany(ctx, ips)
 }
 
 func (h *AgentHandler) lookupGeo(sourceIP string) (models.GeoLocation, bool) {
@@ -2267,6 +2552,7 @@ func buildBlockSuggestions(items []models.SourceStat, allowlist []string) []mode
 		reason := fmt.Sprintf("drop_ratio=%.2f dropped=%d", item.DropRatio, item.Dropped)
 		suggestions = append(suggestions, models.BlockSuggestion{
 			SourceIP:      item.SourceIP,
+			SourceDomain:  item.SourceDomain,
 			SuggestedCIDR: suggested,
 			Risk:          item.Risk,
 			Reason:        reason,

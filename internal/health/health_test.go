@@ -67,11 +67,13 @@ func TestCheckDoesNotReportObserveOnlyRulesAsEnforced(t *testing.T) {
 	}
 	cfg.PolicyEnforced = true
 	cfg.ObserveOnly = true
+	cfg.EgressPolicyEnforced = true
+	cfg.EgressObserveOnly = true
 	if err := dataplane.WriteConfig("eth0", cfg); err != nil {
 		t.Fatal(err)
 	}
 	status := (Probe{NodeID: "node-01", XDP: dataplane}).Check(context.Background())
-	if len(status.Interfaces) != 1 || !status.Interfaces[0].ObserveOnly || status.Interfaces[0].PolicyEnforced {
+	if len(status.Interfaces) != 1 || !status.Interfaces[0].ObserveOnly || status.Interfaces[0].PolicyEnforced || status.Interfaces[0].EgressPolicyEnforced {
 		t.Fatalf("observe-only dataplane was reported as enforced: %#v", status.Interfaces)
 	}
 }

@@ -8,6 +8,8 @@ const props = defineProps({
   title: { type: String, default: "" },
   copy: { type: String, default: "" },
   fields: { type: Array, default: () => [] },
+  busy: { type: Boolean, default: false },
+  error: { type: String, default: "" },
 });
 
 const emit = defineEmits(["close", "confirm"]);
@@ -28,32 +30,33 @@ watch(
 </script>
 
 <template>
-  <div v-if="open" class="modal-mask" @click.self="emit('close')">
-    <div class="modal-card">
+  <div v-if="open" class="modal-mask" @click.self="!busy && emit('close')">
+    <form class="modal-card" role="dialog" aria-modal="true" aria-labelledby="action-modal-title" @submit.prevent="!busy && emit('confirm', { ...values })">
       <div class="modal-head">
         <div>
           <p>{{ t("modalAction") }}</p>
-          <h3>{{ title }}</h3>
+          <h3 id="action-modal-title">{{ title }}</h3>
         </div>
-        <button class="modal-close-dot icon-button" :title="t('close')" :aria-label="t('close')" @click="emit('close')">
+        <button type="button" class="modal-close-dot icon-button" :disabled="busy" :title="t('close')" :aria-label="t('close')" @click="emit('close')">
           <X :size="18" stroke-width="2" aria-hidden="true" />
         </button>
       </div>
       <p class="modal-copy">{{ copy }}</p>
+      <p v-if="error" class="danger-tag" role="alert">{{ error }}</p>
 
       <div v-for="field in fields" :key="field.key" class="field">
-        <label>{{ field.label }}</label>
-        <select v-if="field.type === 'select'" v-model="values[field.key]">
+        <label :for="`action-modal-${field.key}`">{{ field.label }}</label>
+        <select v-if="field.type === 'select'" :id="`action-modal-${field.key}`" v-model="values[field.key]" :disabled="busy" :required="field.required">
           <option v-for="option in field.options" :key="option.value" :value="option.value">{{ option.label }}</option>
         </select>
-        <textarea v-else-if="field.type === 'textarea'" v-model="values[field.key]" :placeholder="field.placeholder || ''"></textarea>
-        <input v-else v-model="values[field.key]" :type="field.type || 'text'" :placeholder="field.placeholder || ''" />
+        <textarea v-else-if="field.type === 'textarea'" :id="`action-modal-${field.key}`" v-model="values[field.key]" :disabled="busy" :required="field.required" :placeholder="field.placeholder || ''"></textarea>
+        <input v-else :id="`action-modal-${field.key}`" v-model="values[field.key]" :disabled="busy" :required="field.required" :type="field.type || 'text'" :autocomplete="field.type === 'password' ? 'current-password' : 'off'" :placeholder="field.placeholder || ''" />
       </div>
 
       <div class="modal-actions">
-        <button @click="emit('confirm', { ...values })">{{ t("submit") }}</button>
-        <button class="ghost-button" @click="emit('close')">{{ t("cancel") }}</button>
+        <button type="submit" :disabled="busy">{{ busy ? t("settingsSaving") : t("submit") }}</button>
+        <button type="button" class="ghost-button" :disabled="busy" @click="emit('close')">{{ t("cancel") }}</button>
       </div>
-    </div>
+    </form>
   </div>
 </template>

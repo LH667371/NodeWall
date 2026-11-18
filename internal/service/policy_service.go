@@ -20,10 +20,11 @@ import (
 )
 
 type PolicyService struct {
-	applyLocks       sync.Map
-	store            *store.Store
-	httpClient       *http.Client
-	controlPortRules []models.PortRule
+	applyLocks         sync.Map
+	store              *store.Store
+	httpClient         *http.Client
+	httpClientResolver func(string) (*http.Client, map[string]string, error)
+	controlPortRules   []models.PortRule
 }
 
 func NewPolicyService(store *store.Store) *PolicyService {
@@ -42,6 +43,13 @@ func (s *PolicyService) SetHTTPClient(client *http.Client) {
 		return
 	}
 	s.httpClient = client
+}
+
+// SetHTTPClientResolver lets a cluster manager select the enrolled Agent
+// certificate for each endpoint. A single manager CA cannot authenticate
+// independent self-signed certificates on every node.
+func (s *PolicyService) SetHTTPClientResolver(resolver func(string) (*http.Client, map[string]string, error)) {
+	s.httpClientResolver = resolver
 }
 
 // SetControlPortRules configures the manager ports that must remain reachable
@@ -89,7 +97,8 @@ func (s *PolicyService) UpdatePolicy(ctx context.Context, policy models.Interfac
 // safety timer; the manager persists the previous policy so a restart can
 // still complete the rollback.
 type PolicyTrial struct {
-	ExpiresAt time.Time `json:"expires_at"`
+	ExpiresAt time.Time              `json:"expires_at"`
+	Direction models.PolicyDirection `json:"direction,omitempty"`
 }
 
 // BeginPolicyTrial applies a policy without confirming the agent's safety
@@ -97,6 +106,17 @@ type PolicyTrial struct {
 // its previous runtime automatically and the manager recovery loop restores the
 // previous durable policy as well.
 func (s *PolicyService) BeginPolicyTrial(ctx context.Context, policy models.InterfacePolicy, timeout time.Duration) (models.InterfacePolicy, PolicyTrial, error) {
+	return s.beginPolicyTrial(ctx, policy, timeout, "")
+}
+
+// BeginPolicyTrialForDirection keeps the trial label scoped to the direction
+// selected in the console. Both direction publish IDs remain available for
+// atomic rollback of the interface if the manager or agent loses contact.
+func (s *PolicyService) BeginPolicyTrialForDirection(ctx context.Context, policy models.InterfacePolicy, timeout time.Duration, direction models.PolicyDirection) (models.InterfacePolicy, PolicyTrial, error) {
+	return s.beginPolicyTrial(ctx, policy, timeout, direction)
+}
+
+func (s *PolicyService) beginPolicyTrial(ctx context.Context, policy models.InterfacePolicy, timeout time.Duration, trialDirection models.PolicyDirection) (models.InterfacePolicy, PolicyTrial, error) {
 	if timeout <= 0 {
 		return policy, PolicyTrial{}, errors.New("policy trial timeout must be positive")
 	}
@@ -147,7 +167,9 @@ func (s *PolicyService) BeginPolicyTrial(ctx context.Context, policy models.Inte
 		}
 		return policy, PolicyTrial{}, cause
 	}
-	for _, direction := range []models.PolicyDirection{models.DirectionEgress, models.DirectionIngress} {
+	// Ingress attach creates the maps shared by XDP and the TC egress hook.
+	// A fresh interface cannot accept an egress policy before that succeeds.
+	for _, direction := range []models.PolicyDirection{models.DirectionIngress, models.DirectionEgress} {
 		if err := s.applyPolicyWithSafetyTimeout(ctx, node, policy, direction, int(timeout/time.Second), ids[direction]); err != nil {
 			return recoverTrial(err)
 		}
@@ -157,10 +179,10 @@ func (s *PolicyService) BeginPolicyTrial(ctx context.Context, policy models.Inte
 		return recoverTrial(err)
 	}
 	expiresAt := time.Now().Add(timeout).UTC()
-	if err := s.store.MarkPolicyTrial(ctx, policy.NodeID, policy.Interface, expiresAt, ids); err != nil {
+	if err := s.store.MarkPolicyTrialDirection(ctx, policy.NodeID, policy.Interface, expiresAt, trialDirection, ids); err != nil {
 		return recoverTrial(err)
 	}
-	return updated, PolicyTrial{ExpiresAt: expiresAt}, nil
+	return updated, PolicyTrial{ExpiresAt: expiresAt, Direction: trialDirection}, nil
 }
 
 // ConfirmPolicyTrial keeps an active trial in force. The operation is
@@ -235,6 +257,32 @@ func (s *PolicyService) UpdatePolicyAndApply(ctx context.Context, policy models.
 	lock, _ := s.applyLocks.LoadOrStore(policy.NodeID+"/"+policy.Interface, &sync.Mutex{})
 	lock.(*sync.Mutex).Lock()
 	defer lock.(*sync.Mutex).Unlock()
+	return s.updatePolicyAndApplyLocked(ctx, policy)
+}
+
+var ErrPolicyChanged = errors.New("policy changed since it was loaded")
+
+// UpdatePolicyAndApplyIfCurrent protects a complete policy submitted by a Web
+// form from replacing a newer save. Check inside the apply lock so two requests
+// cannot both pass the comparison before either policy becomes durable.
+func (s *PolicyService) UpdatePolicyAndApplyIfCurrent(ctx context.Context, policy models.InterfacePolicy, expected time.Time) (models.InterfacePolicy, error) {
+	lock, _ := s.applyLocks.LoadOrStore(policy.NodeID+"/"+policy.Interface, &sync.Mutex{})
+	lock.(*sync.Mutex).Lock()
+	defer lock.(*sync.Mutex).Unlock()
+	if !expected.IsZero() {
+		current, err := s.store.GetPolicy(ctx, policy.NodeID, policy.Interface)
+		if err != nil || !current.UpdatedAt.Equal(expected) {
+			return policy, ErrPolicyChanged
+		}
+	}
+	return s.updatePolicyAndApplyLocked(ctx, policy)
+}
+
+// updatePolicyAndApplyLocked is the mutation primitive used by ordinary
+// policy writes and temporary egress leases. Callers must hold the per-policy
+// mutex so a lease can keep its snapshot and restoration atomic with the SMTP
+// operation that owns it.
+func (s *PolicyService) updatePolicyAndApplyLocked(ctx context.Context, policy models.InterfacePolicy) (models.InterfacePolicy, error) {
 	policy = s.WithClusterInterconnect(ctx, policy)
 	// Immediate-apply mode has no pending confirmation record. Clear stale
 	// records from policies created by the legacy publish workflow.
@@ -259,10 +307,12 @@ func (s *PolicyService) UpdatePolicyAndApply(ctx context.Context, policy models.
 			rollbackErr := s.postJSON(recoveryCtx, node.AgentURL+"/interfaces/"+policy.Interface+"/rollback", map[string]any{"publish_id": ids[direction], "direction": direction}, nil)
 			// A lost confirmation response may mean the snapshot was already
 			// consumed. Restore the last durable policy in that case as well.
-			if rollbackErr != nil && confirming && previousErr == nil {
+			if rollbackErr != nil && confirming && previousErr == nil && strings.Contains(rollbackErr.Error(), "404") {
 				if err := s.applyPolicy(recoveryCtx, node, previous, direction); err != nil {
 					failures = append(failures, err)
 				}
+			} else if rollbackErr != nil && !strings.Contains(rollbackErr.Error(), "404") {
+				failures = append(failures, rollbackErr)
 			}
 		}
 		if len(failures) == 0 {
@@ -296,6 +346,183 @@ func (s *PolicyService) UpdatePolicyAndApply(ctx context.Context, policy models.
 	return updated, nil
 }
 
+// EgressLeaseTarget is a narrowly scoped destination and service tuple used
+// while an operation such as SMTP is in progress. The lease never changes a
+// permanently open/observe-only policy; it is only needed when egress
+// enforcement is actively denying unmatched traffic.
+type EgressLeaseTarget struct {
+	IP       netip.Addr
+	Port     uint16
+	Protocol models.PortProtocol
+}
+
+type EgressLease struct {
+	releaseOnce sync.Once
+	releaseFn   func() error
+}
+
+func (l *EgressLease) Release() error {
+	if l == nil || l.releaseFn == nil {
+		return nil
+	}
+	var err error
+	l.releaseOnce.Do(func() { err = l.releaseFn() })
+	return err
+}
+
+// AcquireTemporaryEgressLease creates a temporary allowlist entry on the
+// selected node/interface. The policy mutex remains held until Release, so a
+// concurrent UI edit cannot overwrite the snapshot while the operation is in
+// flight. The lease also has an automatic upper bound as a recovery guard.
+func (s *PolicyService) AcquireTemporaryEgressLease(ctx context.Context, nodeID, iface string, targets []EgressLeaseTarget, ttl time.Duration) (*EgressLease, bool, error) {
+	if ttl <= 0 {
+		ttl = 30 * time.Second
+	}
+	if ttl > 2*time.Minute {
+		ttl = 2 * time.Minute
+	}
+	key := strings.TrimSpace(nodeID) + "/" + strings.TrimSpace(iface)
+	if strings.Trim(key, "/") == "" {
+		return nil, false, errors.New("egress lease requires a node and interface")
+	}
+	lock, _ := s.applyLocks.LoadOrStore(key, &sync.Mutex{})
+	mutex := lock.(*sync.Mutex)
+	mutex.Lock()
+
+	current, err := s.store.GetPolicy(ctx, nodeID, iface)
+	if err != nil {
+		mutex.Unlock()
+		return nil, false, err
+	}
+	current = models.NormalizeInterfacePolicy(current)
+	egress := current.Egress
+	// Ingress and egress can be enabled independently. Do not gate an outbound
+	// SMTP/DNS lease on InterfacePolicy.Enabled, which is the legacy ingress
+	// alias and may be false while egress protection is active.
+	if !egress.Enabled || egress.ObserveOnly || !directionHasEnforcement(egress) {
+		mutex.Unlock()
+		return &EgressLease{}, false, nil
+	}
+
+	validTargets := make([]EgressLeaseTarget, 0, len(targets))
+	for _, target := range targets {
+		if !target.IP.IsValid() || !target.IP.Is4() || target.Port == 0 {
+			continue
+		}
+		protocol := models.PortProtocol(strings.ToLower(strings.TrimSpace(string(target.Protocol))))
+		if protocol != models.PortProtocolTCP && protocol != models.PortProtocolUDP {
+			return nil, false, fmt.Errorf("unsupported temporary egress protocol %q", target.Protocol)
+		}
+		for _, blocked := range egress.BlockedCIDRs {
+			if prefix, parseErr := netip.ParsePrefix(strings.TrimSpace(blocked)); parseErr == nil && prefix.Contains(target.IP) {
+				mutex.Unlock()
+				return nil, false, fmt.Errorf("temporary egress target %s is blocked by the current policy", target.IP)
+			}
+		}
+		for _, denied := range models.NormalizePortRules(egress.DeniedPortRules, egress.DeniedPorts) {
+			if denied.Port == target.Port && denied.Protocol == protocol {
+				mutex.Unlock()
+				return nil, false, fmt.Errorf("temporary egress port %d/%s is explicitly denied", target.Port, protocol)
+			}
+		}
+		validTargets = append(validTargets, EgressLeaseTarget{IP: target.IP, Port: target.Port, Protocol: protocol})
+	}
+	if len(validTargets) == 0 {
+		mutex.Unlock()
+		return nil, false, errors.New("temporary egress lease has no IPv4 targets")
+	}
+
+	next := current
+	next.Egress = egress
+	// A policy with an existing destination/port allowlist already has a
+	// default-deny shape. Add the SMTP target and port to that pair. For an
+	// explicit-deny policy with no allowlist, use a /32 bypass so the lease does
+	// not unexpectedly convert all other outbound traffic into default deny.
+	constrained := len(egress.Rules) > 0 || len(egress.AllowedPortRules) > 0 || len(egress.AllowedPorts) > 0
+	for _, target := range validTargets {
+		cidr := netip.PrefixFrom(target.IP, 32).String()
+		if constrained {
+			next.Egress.Rules = appendUniqueACLRule(next.Egress.Rules, models.ACLRule{CIDR: cidr, Action: "allow"})
+			next.Egress.AllowedPortRules = appendUniquePortRule(next.Egress.AllowedPortRules, models.PortRule{Protocol: target.Protocol, Port: target.Port})
+		} else {
+			next.Egress.BypassCIDRs = appendUniqueString(next.Egress.BypassCIDRs, cidr)
+		}
+	}
+	next.Egress.AllowedPorts = models.CollapsePortRules(next.Egress.AllowedPortRules)
+	next = models.NormalizeInterfacePolicy(next)
+	if _, err := s.updatePolicyAndApplyLocked(ctx, next); err != nil {
+		mutex.Unlock()
+		return nil, false, err
+	}
+
+	released := false
+	var timer *time.Timer
+	lease := &EgressLease{}
+	lease.releaseFn = func() error {
+		if timer != nil {
+			timer.Stop()
+		}
+		if released {
+			return nil
+		}
+		released = true
+		_, restoreErr := s.updatePolicyAndApplyLocked(context.WithoutCancel(ctx), current)
+		mutex.Unlock()
+		return restoreErr
+	}
+	timer = time.AfterFunc(ttl, func() { _ = lease.Release() })
+	return lease, true, nil
+}
+
+func directionHasEnforcement(policy models.DirectionPolicy) bool {
+	// A pass/allow default with no explicit deny is a permanently open
+	// direction. Allowed/public port entries are harmless documentation in
+	// that mode and must not trigger a temporary SMTP/DNS lease.
+	defaultPass := strings.EqualFold(strings.TrimSpace(policy.DefaultAction), "pass") ||
+		strings.EqualFold(strings.TrimSpace(policy.DefaultAction), "allow")
+	if defaultPass && len(policy.BlockedCIDRs) == 0 && len(policy.ICMPBlockedCIDRs) == 0 &&
+		len(policy.DeniedPortRules) == 0 && len(policy.DeniedPorts) == 0 {
+		for _, rule := range policy.Rules {
+			action := strings.ToLower(strings.TrimSpace(rule.Action))
+			if action == "deny" || action == "drop" || action == "block" {
+				return true
+			}
+		}
+		return false
+	}
+	return len(policy.Rules) > 0 || len(policy.BypassCIDRs) > 0 || len(policy.BlockedCIDRs) > 0 ||
+		len(policy.ICMPAllowCIDRs) > 0 || len(policy.ICMPBlockedCIDRs) > 0 ||
+		len(policy.PublicPortRules) > 0 || len(policy.DeniedPortRules) > 0 || len(policy.AllowedPortRules) > 0 ||
+		len(policy.PublicPorts) > 0 || len(policy.DeniedPorts) > 0 || len(policy.AllowedPorts) > 0
+}
+
+func appendUniqueString(values []string, value string) []string {
+	for _, existing := range values {
+		if strings.TrimSpace(existing) == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func appendUniquePortRule(values []models.PortRule, value models.PortRule) []models.PortRule {
+	for _, existing := range values {
+		if existing.Protocol == value.Protocol && existing.Port == value.Port {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func appendUniqueACLRule(values []models.ACLRule, value models.ACLRule) []models.ACLRule {
+	for _, existing := range values {
+		if strings.TrimSpace(existing.CIDR) == value.CIDR && strings.EqualFold(strings.TrimSpace(existing.Action), value.Action) {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
 func (s *PolicyService) applyPolicy(ctx context.Context, node models.Node, policy models.InterfacePolicy, direction models.PolicyDirection, safetyIDs ...string) error {
 	if len(safetyIDs) > 0 {
 		return s.applyPolicyWithSafetyTimeout(ctx, node, policy, direction, 30, safetyIDs[0])
@@ -305,8 +532,11 @@ func (s *PolicyService) applyPolicy(ctx context.Context, node models.Node, polic
 
 func (s *PolicyService) applyPolicyWithSafetyTimeout(ctx context.Context, node models.Node, policy models.InterfacePolicy, direction models.PolicyDirection, safetyTimeout int, safetyIDs ...string) error {
 	selected := models.DirectionPolicyFor(policy, direction)
+	previouslyAttached := true
 	if direction == models.DirectionIngress {
-		if err := s.attachWithFallback(ctx, node, policy.Interface); err != nil {
+		var err error
+		previouslyAttached, err = s.attachInterface(ctx, node, policy.Interface)
+		if err != nil {
 			return err
 		}
 	}
@@ -333,16 +563,23 @@ func (s *PolicyService) applyPolicyWithSafetyTimeout(ctx context.Context, node m
 	if len(safetyIDs) > 0 {
 		payload["publish_id"] = safetyIDs[0]
 		payload["safety_timeout"] = safetyTimeout
+		payload["restore_unattached"] = direction == models.DirectionIngress && !previouslyAttached
 	}
 	return s.postJSON(ctx, node.AgentURL+"/interfaces/"+policy.Interface+"/apply", payload, nil)
 }
 
-func (s *PolicyService) attachWithFallback(ctx context.Context, node models.Node, iface string) error {
+func (s *PolicyService) attachInterface(ctx context.Context, node models.Node, iface string) (bool, error) {
 	attachEndpoint := node.AgentURL + "/interfaces/" + iface + "/attach"
-	if err := s.postJSON(ctx, attachEndpoint, map[string]string{"mode": "native"}, nil); err == nil {
-		return nil
+	var response struct {
+		PreviouslyAttached *bool `json:"previously_attached"`
 	}
-	return s.postJSON(ctx, attachEndpoint, map[string]string{"mode": "generic"}, nil)
+	err := s.postJSON(ctx, attachEndpoint, map[string]string{"mode": "native"}, &response)
+	// The agent negotiates native/generic and modern/legacy kernel APIs locally.
+	// Replaying this mutation after a lost response can discard the original
+	// previously_attached=false baseline and invalidate the trial snapshot.
+	// Older agents omit this field; retain their observe-only rollback behavior
+	// during rolling upgrades instead of inventing an unattached baseline.
+	return response.PreviouslyAttached == nil || *response.PreviouslyAttached, err
 }
 
 func (s *PolicyService) postJSON(ctx context.Context, endpoint string, payload any, out any) error {
@@ -356,8 +593,15 @@ func (s *PolicyService) postJSON(ctx context.Context, endpoint string, payload a
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	client, headers, err := s.resolveHTTPClient(endpoint)
+	if err != nil {
+		return err
+	}
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
 
-	resp, err := s.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -380,7 +624,14 @@ func (s *PolicyService) getJSON(ctx context.Context, endpoint string, out any) e
 	if err != nil {
 		return err
 	}
-	resp, err := s.httpClient.Do(req)
+	client, headers, err := s.resolveHTTPClient(endpoint)
+	if err != nil {
+		return err
+	}
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -393,6 +644,13 @@ func (s *PolicyService) getJSON(ctx context.Context, endpoint string, out any) e
 		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func (s *PolicyService) resolveHTTPClient(endpoint string) (*http.Client, map[string]string, error) {
+	if s.httpClientResolver != nil {
+		return s.httpClientResolver(endpoint)
+	}
+	return s.httpClient, nil, nil
 }
 
 func (s *PolicyService) agentInterfaceAttached(ctx context.Context, node models.Node, iface string) (bool, error) {

@@ -1,7 +1,10 @@
 [Unit]
 Description=NodeWall agent
-After=network-online.target
-Wants=network-online.target
+# Do not wait for network-online.target. On hosts with a stale NFS mount that
+# target can block boot and make NodeWall install/update appear hung. The
+# agent binds locally first and retries manager connectivity after startup.
+After=network.target
+Wants=network.target
 
 [Service]
 Type=simple

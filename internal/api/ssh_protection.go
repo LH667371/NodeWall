@@ -22,6 +22,7 @@ import (
 	"nodewall/internal/integrity"
 	"nodewall/internal/models"
 	"nodewall/internal/sshactivity"
+	"nodewall/internal/sshkeys"
 )
 
 var sshFailurePatterns = []*regexp.Regexp{
@@ -163,7 +164,7 @@ func (h *AgentHandler) LoadSSHProtectionState(ctx context.Context) (resultErr er
 		if err != nil {
 			return err
 		}
-		if loaded.MaxFailures != 0 || loaded.WindowSeconds != 0 || loaded.BanDurationSeconds != 0 || loaded.LogPath != "" || !reflect.DeepEqual(loaded.Transfer, models.SSHTransferPolicy{}) {
+		if loaded.MaxFailures != 0 || loaded.WindowSeconds != 0 || loaded.BanDurationSeconds != 0 || loaded.LogPath != "" || loaded.AllowPasswordLogin != nil || !reflect.DeepEqual(loaded.Transfer, models.SSHTransferPolicy{}) {
 			settings = loaded
 		}
 	}
@@ -229,6 +230,27 @@ func (h *AgentHandler) ReconcileSSHTransferPolicy(ctx context.Context) error {
 		h.sshLastError = fmt.Sprintf("SSH transfer policy is not verified: %v", err)
 	}
 	return err
+}
+
+// ReconcileSSHAuthenticationPolicy reapplies the persisted password-login
+// choice after an agent restart. A nil choice means the host's own sshd
+// configuration remains authoritative.
+func (h *AgentHandler) ReconcileSSHAuthenticationPolicy(ctx context.Context) error {
+	h.sshSettingsUpdateMu.Lock()
+	defer h.sshSettingsUpdateMu.Unlock()
+	h.sshProtectionMu.RLock()
+	choice := h.sshProtectionSettings.AllowPasswordLogin
+	h.sshProtectionMu.RUnlock()
+	if choice == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := h.sshAuthenticationApplier.ApplyPasswordAuthentication(ctx, *choice); err != nil {
+		h.setSSHProtectionError(fmt.Errorf("SSH password-login policy is not verified: %w", err))
+		return err
+	}
+	return nil
 }
 
 func (h *AgentHandler) pollSSHProtection(ctx context.Context) error {
@@ -652,6 +674,9 @@ func (h *AgentHandler) handleSSHProtection(w http.ResponseWriter, r *http.Reques
 		// password-confirmed endpoint; a routine login-protection save must not
 		// persist an unapplied transfer policy by accident.
 		settings.Transfer = current.Transfer
+		// PasswordAuthentication has the same lockout risk. It is changed only
+		// by the password-confirmed authentication endpoint below.
+		settings.AllowPasswordLogin = current.AllowPasswordLogin
 		normalized, err := normalizeSSHProtectionSettings(settings, h.sshProtectionLogPath)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -672,6 +697,181 @@ func (h *AgentHandler) handleSSHProtection(w http.ResponseWriter, r *http.Reques
 	default:
 		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("method %s not allowed", r.Method))
 	}
+}
+
+type sshAuthenticationPolicyRequest struct {
+	AllowPasswordLogin *bool `json:"allow_password_login"`
+}
+
+func (h *AgentHandler) handleSSHAuthenticationPolicy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("method %s not allowed", r.Method))
+		return
+	}
+	var request sshAuthenticationPolicyRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if request.AllowPasswordLogin == nil {
+		writeError(w, http.StatusBadRequest, errors.New("allow_password_login is required"))
+		return
+	}
+	h.sshSettingsUpdateMu.Lock()
+	defer h.sshSettingsUpdateMu.Unlock()
+	h.sshProtectionMu.RLock()
+	current := h.sshProtectionSettings
+	h.sshProtectionMu.RUnlock()
+	if current.AllowPasswordLogin != nil && *current.AllowPasswordLogin == *request.AllowPasswordLogin {
+		writeJSON(w, http.StatusOK, h.sshProtectionStatus())
+		return
+	}
+	if err := h.sshAuthenticationApplier.ApplyPasswordAuthentication(r.Context(), *request.AllowPasswordLogin); err != nil {
+		h.setSSHProtectionError(err)
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	previous := current.AllowPasswordLogin
+	current.AllowPasswordLogin = request.AllowPasswordLogin
+	if h.sshProtectionStore != nil {
+		if err := h.sshProtectionStore.Save(r.Context(), current); err != nil {
+			recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
+			var recoveryErr error
+			if previous == nil {
+				recoveryErr = h.sshAuthenticationApplier.ClearPasswordAuthentication(recoveryCtx)
+			} else {
+				recoveryErr = h.sshAuthenticationApplier.ApplyPasswordAuthentication(recoveryCtx, *previous)
+			}
+			cancel()
+			combined := errors.Join(fmt.Errorf("persist SSH authentication settings: %w", err), recoveryErr)
+			h.setSSHProtectionError(combined)
+			writeError(w, http.StatusInternalServerError, combined)
+			return
+		}
+	}
+	h.sshProtectionMu.Lock()
+	h.sshProtectionSettings.AllowPasswordLogin = request.AllowPasswordLogin
+	h.sshLastError = ""
+	h.sshProtectionMu.Unlock()
+	writeJSON(w, http.StatusOK, h.sshProtectionStatus())
+}
+
+func (h *AgentHandler) handleSSHAuthorizedKeys(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		keys, err := sshkeys.List(h.sshAuthorizedKeysPath)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		h.annotateSSHAuthorizedKeys(keys)
+		writeJSON(w, http.StatusOK, map[string]any{"user": "root", "path": h.sshAuthorizedKeysPath, "keys": keys})
+	case http.MethodPost:
+		var request struct {
+			PublicKey string `json:"public_key"`
+			Comment   string `json:"comment"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		entry, err := sshkeys.Add(h.sshAuthorizedKeysPath, request.PublicKey, request.Comment)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		keys, listErr := sshkeys.List(h.sshAuthorizedKeysPath)
+		if listErr != nil {
+			writeError(w, http.StatusInternalServerError, listErr)
+			return
+		}
+		h.annotateSSHAuthorizedKeys(keys)
+		writeJSON(w, http.StatusOK, map[string]any{"user": "root", "path": h.sshAuthorizedKeysPath, "key": entry, "keys": keys})
+	default:
+		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("method %s not allowed", r.Method))
+	}
+}
+
+// annotateSSHAuthorizedKeys makes key ownership explicit to the console. A
+// repeated install can leave several reserved nodewall-console entries behind;
+// only the fingerprint derived from the current private key is active for this
+// Web instance. The annotation is informational and never changes the file.
+func (h *AgentHandler) annotateSSHAuthorizedKeys(keys []sshkeys.Entry) {
+	currentFingerprint := ""
+	activeKnown := false
+	if h.sshManagedConsoleKeyPath != "" {
+		currentFingerprint, _ = sshkeys.FingerprintForPrivateKey(h.sshManagedConsoleKeyPath)
+		activeKnown = currentFingerprint != ""
+	}
+	for index := range keys {
+		managed := strings.EqualFold(strings.TrimSpace(keys[index].Comment), "nodewall-console")
+		keys[index].NodeWallManaged = managed
+		keys[index].NodeWallActiveKnown = activeKnown
+		keys[index].NodeWallActive = activeKnown && keys[index].Fingerprint == currentFingerprint
+	}
+}
+
+func (h *AgentHandler) handleSSHAuthorizedKeyDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("method %s not allowed", r.Method))
+		return
+	}
+	var request struct {
+		Confirmed bool `json:"confirmed"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	fingerprint := strings.TrimSpace(r.PathValue("fingerprint"))
+	keys, err := sshkeys.List(h.sshAuthorizedKeysPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	h.annotateSSHAuthorizedKeys(keys)
+	found := false
+	protected := false
+	for _, key := range keys {
+		if key.Fingerprint == fingerprint {
+			found = true
+			protected = key.NodeWallActive || (key.NodeWallManaged && !key.NodeWallActiveKnown)
+			break
+		}
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, sshkeys.ErrNotFound)
+		return
+	}
+	if protected && !request.Confirmed {
+		writeError(w, http.StatusConflict, errors.New("current NodeWall console key requires explicit confirmation"))
+		return
+	}
+	h.sshProtectionMu.RLock()
+	passwordLogin := h.sshProtectionSettings.AllowPasswordLogin
+	h.sshProtectionMu.RUnlock()
+	if len(keys) <= 1 && passwordLogin != nil && !*passwordLogin && !request.Confirmed {
+		returnError := errors.New("cannot remove the last SSH public key while password login is disabled")
+		writeError(w, http.StatusConflict, returnError)
+		return
+	}
+	if err := sshkeys.Remove(h.sshAuthorizedKeysPath, fingerprint); err != nil {
+		if errors.Is(err, sshkeys.ErrNotFound) {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	keys, err = sshkeys.List(h.sshAuthorizedKeysPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	h.annotateSSHAuthorizedKeys(keys)
+	writeJSON(w, http.StatusOK, map[string]any{"user": "root", "path": h.sshAuthorizedKeysPath, "keys": keys})
 }
 
 func (h *AgentHandler) handleSSHActivity(w http.ResponseWriter, r *http.Request) {

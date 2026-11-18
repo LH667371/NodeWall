@@ -377,6 +377,10 @@ func (h *ServerHandler) nodeJSON(ctx context.Context, nodeID, method, path strin
 	if !ok {
 		return fmt.Errorf("node not found")
 	}
+	client, credential, err := h.nodeHTTPClient(nodeID)
+	if err != nil {
+		return err
+	}
 	var body io.Reader
 	if payload != nil {
 		raw, err := json.Marshal(payload)
@@ -390,7 +394,8 @@ func (h *ServerHandler) nodeJSON(ctx context.Context, nodeID, method, path strin
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := h.reverseHTTP.Do(req)
+	setNodeAuthHeaders(req, credential)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -407,6 +412,9 @@ func (h *ServerHandler) nodeJSON(ctx context.Context, nodeID, method, path strin
 func enrichDropLogsWithDisposition(records []models.DropLogRecord, policyByIface map[string]models.InterfacePolicy, runtimeCache map[string]runtimeDispositionState) {
 	for i := range records {
 		record := &records[i]
+		if record.SourceCIDR != "" {
+			continue
+		}
 		direction := record.Direction
 		if direction == "" {
 			direction = models.DirectionIngress

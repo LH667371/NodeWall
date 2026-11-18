@@ -1,35 +1,46 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
+	"log"
 	"math/big"
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	webauthnlib "github.com/go-webauthn/webauthn/webauthn"
 	"nodewall/internal/config"
 	"nodewall/internal/models"
+	"nodewall/internal/securestore"
 	"nodewall/internal/security"
 )
 
 const sessionCookieName = "nodewall_session"
+const csrfCookieName = "nodewall_csrf"
+const loginOTPChallengeCookieName = "nodewall_login_otp"
 const localeCookieName = "nodewall_locale"
 
 const (
-	loginCaptchaTTL           = 5 * time.Minute
+	authSessionTTL = 12 * time.Hour
+	// Captcha challenges are deliberately short-lived and bound to the source
+	// address that rendered the login page. The challenge is still one-time,
+	// but source binding prevents a copied challenge from being replayed from a
+	// different client while the legitimate login page is open.
+	loginCaptchaTTL           = 3 * time.Minute
 	loginCaptchaLimit         = 4096
 	loginPageRateLimit        = 20
 	loginRefreshRateLimit     = 8
@@ -37,29 +48,56 @@ const (
 	loginRequestRateWindow    = time.Minute
 	loginRateLimitSourceLimit = 8192
 	loginAttemptSourceLimit   = 8192
+	loginOTPChallengeTTL      = 5 * time.Minute
+	loginOTPChallengeLimit    = 8192
+	loginOTPMaxAttempts       = 8
+	passwordVerifyConcurrency = 4
+	// A source lock stops a single client quickly. The higher account threshold
+	// also covers distributed password guessing while making it harder for one
+	// mistaken client to deny a legitimate account.
+	loginAccountMaxFailures = 20
 )
 
 type authManager struct {
-	enabled      bool
-	authFile     string
-	settingsFile string
-	webAccess    string
-	secureCookie bool
-	allowedNets  []netip.Prefix
-	allowedMACs  map[string]struct{}
+	enabled           bool
+	authFile          string
+	settingsFile      string
+	smtpFile          string
+	webAccess         string
+	secureCookie      bool
+	trustProxyHeaders bool
+	allowedNets       []netip.Prefix
+	allowedMACs       map[string]struct{}
 
-	mu            sync.RWMutex
-	sessions      map[string]sessionState
-	loginAttempts map[string]loginAttempt
-	loginCaptchas map[string]loginCaptchaState
-	loginRates    map[string]loginRateWindow
-	settings      models.AuthSecuritySettings
+	mu                  sync.RWMutex
+	sessions            map[string]sessionState
+	loginAttempts       map[string]loginAttempt
+	loginCaptchas       map[string]loginCaptchaState
+	loginOTP            map[string]loginOTPChallenge
+	loginRates          map[string]loginRateWindow
+	passwordVerifySlots chan struct{}
+	otpSetups           map[string]otpSetupState
+	settings            models.AuthSecuritySettings
+	smtpMu              sync.RWMutex
+	smtp                models.SMTPSettings
+	mailSender          func(context.Context, string, string, string) error
+	emailMu             sync.Mutex
+	emailChallenges     map[string]emailChallenge
+	webauthnRPID        string
+	webauthnOrigins     []string
+	webauthnTLSMode     string
+	tlsEnabled          bool
+	tlsCertFile         string
+	tlsKeyFile          string
+	webauthnMu          sync.Mutex
+	webauthnSessions    map[string]webauthnSession
 }
 
 type sessionState struct {
 	ExpiresAt time.Time
 	Username  string
 	Role      string
+	CSRFToken string
 }
 
 type loginAttempt struct {
@@ -78,7 +116,29 @@ type loginCaptchaState struct {
 	Kind        string
 	Answer      string
 	TracePoints []loginCaptchaPoint
+	Source      string
 	ExpiresAt   time.Time
+}
+
+type loginOTPChallenge struct {
+	Username  string
+	Source    string
+	ExpiresAt time.Time
+	Attempts  int
+}
+
+type otpSetupState struct {
+	Secret    string
+	ExpiresAt time.Time
+}
+
+type webauthnSession struct {
+	Data      webauthnlib.SessionData
+	Username  string
+	Purpose   string
+	Label     string
+	Source    string
+	ExpiresAt time.Time
 }
 
 type loginCaptchaPoint struct {
@@ -90,13 +150,23 @@ type loginCaptchaPoint struct {
 }
 
 type loginCaptchaView struct {
-	ID       string
-	Kind     string
-	Prompt   string
-	Image    template.URL
-	Points   []loginCaptchaPoint
-	Sequence []int
+	ID        string
+	Kind      string
+	Prompt    string
+	Image     template.URL
+	Points    []loginCaptchaPoint
+	Sequence  []int
+	ExpiresIn int
 }
+
+type loginCaptchaResult uint8
+
+const (
+	loginCaptchaInvalid loginCaptchaResult = iota
+	loginCaptchaValid
+	loginCaptchaExpired
+	loginCaptchaSourceChanged
+)
 
 func newAuthManager(cfg config.ServerConfig) (*authManager, error) {
 	settingsFile := cfg.AuthSettingsFile
@@ -104,20 +174,39 @@ func newAuthManager(cfg config.ServerConfig) (*authManager, error) {
 		settingsFile = "/etc/nodewall/auth-settings.json"
 	}
 	manager := &authManager{
-		enabled:       cfg.AuthEnabled,
-		authFile:      cfg.AuthFile,
-		settingsFile:  settingsFile,
-		webAccess:     strings.ToLower(strings.TrimSpace(cfg.WebAccessMode)),
-		secureCookie:  cfg.TLSEnabled,
-		allowedMACs:   make(map[string]struct{}),
-		sessions:      make(map[string]sessionState),
-		loginAttempts: make(map[string]loginAttempt),
-		loginCaptchas: make(map[string]loginCaptchaState),
-		loginRates:    make(map[string]loginRateWindow),
+		enabled:             cfg.AuthEnabled,
+		authFile:            cfg.AuthFile,
+		settingsFile:        settingsFile,
+		smtpFile:            cfg.SMTPSettingsFile,
+		webAccess:           strings.ToLower(strings.TrimSpace(cfg.WebAccessMode)),
+		secureCookie:        cfg.TLSEnabled || cfg.TrustProxyHeaders,
+		trustProxyHeaders:   cfg.TrustProxyHeaders,
+		allowedMACs:         make(map[string]struct{}),
+		sessions:            make(map[string]sessionState),
+		loginAttempts:       make(map[string]loginAttempt),
+		loginCaptchas:       make(map[string]loginCaptchaState),
+		loginOTP:            make(map[string]loginOTPChallenge),
+		loginRates:          make(map[string]loginRateWindow),
+		passwordVerifySlots: make(chan struct{}, passwordVerifyConcurrency),
+		otpSetups:           make(map[string]otpSetupState),
+		emailChallenges:     make(map[string]emailChallenge),
+		webauthnRPID:        strings.TrimSpace(cfg.WebAuthnRPID),
+		webauthnOrigins:     append([]string(nil), cfg.WebAuthnOrigins...),
+		webauthnTLSMode:     "local",
+		tlsEnabled:          cfg.TLSEnabled,
+		tlsCertFile:         strings.TrimSpace(cfg.TLSCertFile),
+		tlsKeyFile:          strings.TrimSpace(cfg.TLSKeyFile),
+		webauthnSessions:    make(map[string]webauthnSession),
 		settings: normalizeAuthSettings(models.AuthSecuritySettings{
 			MaxFailures:         5,
 			WindowSeconds:       int((10 * time.Minute) / time.Second),
 			LockDurationSeconds: int((15 * time.Minute) / time.Second),
+			PasskeyRPID:         strings.TrimSpace(cfg.WebAuthnRPID),
+			PasskeyOrigins:      append([]string(nil), cfg.WebAuthnOrigins...),
+			// Passkey is an explicit opt-in feature. Keeping configured RP/Origin
+			// values is useful for the administrator's prerequisite view, but they
+			// must not expose a login method until the setting is enabled.
+			PasskeyEnabled: false,
 		}),
 	}
 
@@ -145,7 +234,14 @@ func newAuthManager(cfg config.ServerConfig) (*authManager, error) {
 	}
 
 	if err := manager.loadSettings(); err != nil {
-		return nil, err
+		// Authentication settings are auxiliary to the login database. If a
+		// damaged copy and all backups are unavailable, keep the conservative
+		// defaults so the management server still starts and an administrator can
+		// repair the file through the authenticated settings endpoint.
+		log.Printf("warning: load authentication settings failed: %v; using defaults", err)
+	}
+	if err := manager.loadSMTPSettings(); err != nil {
+		log.Printf("warning: load SMTP settings failed: %v; using defaults", err)
 	}
 
 	return manager, nil
@@ -176,16 +272,38 @@ func (a *authManager) wrap(next http.Handler) http.Handler {
 				a.handleLogin(w, r)
 				return
 			}
+		case "/login/otp":
+			if r.Method == http.MethodGet {
+				a.serveLoginOTP(w, r, "")
+				return
+			}
+			if r.Method == http.MethodPost {
+				a.handleLoginOTP(w, r)
+				return
+			}
+		case "/login/forgot":
+			if r.Method == http.MethodGet {
+				a.serveForgotPassword(w, r)
+				return
+			}
 		case "/login/captcha/refresh":
 			if r.Method == http.MethodPost {
 				a.handleLoginCaptchaRefresh(w, r)
 				return
 			}
 		case "/logout":
+			if r.Method != http.MethodGet {
+				if session, ok := a.sessionFromRequest(r); ok && !a.validSessionCSRF(r, session) {
+					writeError(w, http.StatusForbidden, errors.New("csrf validation failed"))
+					return
+				}
+			}
 			a.handleLogout(w, r)
 			return
 		}
-		if strings.HasPrefix(r.URL.Path, "/join/") || r.URL.Path == "/version" {
+		if strings.HasPrefix(r.URL.Path, "/join/") || r.URL.Path == "/version" ||
+			strings.HasPrefix(r.URL.Path, "/auth/forgot-password/") ||
+			strings.HasPrefix(r.URL.Path, "/auth/passkey/login/") {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -199,6 +317,10 @@ func (a *authManager) wrap(next http.Handler) http.Handler {
 
 		session, ok := a.sessionFromRequest(r)
 		if ok {
+			if isStateChangingMethod(r.Method) && !a.validSessionCSRF(r, session) {
+				writeError(w, http.StatusForbidden, errors.New("csrf validation failed"))
+				return
+			}
 			if !a.authorize(session.Role, r) {
 				writeJSON(w, http.StatusForbidden, map[string]any{
 					"error": "permission denied",
@@ -266,15 +388,141 @@ func (a *authManager) sessionFromRequest(r *http.Request) (sessionState, bool) {
 	return session, true
 }
 
+func isStateChangingMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *authManager) validSessionCSRF(r *http.Request, session sessionState) bool {
+	token := strings.TrimSpace(r.Header.Get("X-NodeWall-CSRF"))
+	if token == "" || session.CSRFToken == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(token), []byte(session.CSRFToken)) == 1
+}
+
+// requestIsHTTPS only accepts a forwarded scheme when the administrator has
+// explicitly declared that the listener is behind a trusted TLS proxy. A
+// client can otherwise send X-Forwarded-Proto directly and incorrectly make a
+// plain HTTP request look like a secure WebAuthn origin.
+func (a *authManager) requestIsHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	return a.trustProxyHeaders && strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+}
+
+// verifyLoginPassword bounds concurrent Argon2 work. Without a small global
+// budget, an attacker can rotate source addresses and turn the deliberately
+// expensive password hash into a memory exhaustion primitive.
+func (a *authManager) verifyLoginPassword(ctx context.Context, password string, record security.PasswordRecord) bool {
+	if a.passwordVerifySlots == nil {
+		return security.VerifyPassword(password, record)
+	}
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case a.passwordVerifySlots <- struct{}{}:
+		defer func() { <-a.passwordVerifySlots }()
+		return security.VerifyPassword(password, record)
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
+}
+
+func (a *authManager) issueSession(w http.ResponseWriter, username, role string) error {
+	token, err := randomToken()
+	if err != nil {
+		return err
+	}
+	csrfToken, err := randomToken()
+	if err != nil {
+		return err
+	}
+	a.mu.Lock()
+	if a.sessions == nil {
+		a.sessions = make(map[string]sessionState)
+	}
+	a.sessions[token] = sessionState{
+		ExpiresAt: time.Now().Add(authSessionTTL),
+		Username:  username,
+		Role:      security.NormalizeRole(role),
+		CSRFToken: csrfToken,
+	}
+	a.mu.Unlock()
+	a.setSessionCookies(w, token, csrfToken)
+	return nil
+}
+
+func (a *authManager) setSessionCookies(w http.ResponseWriter, token, csrfToken string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   a.secureCookie,
+		MaxAge:   int(authSessionTTL / time.Second),
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     csrfCookieName,
+		Value:    csrfToken,
+		Path:     "/",
+		HttpOnly: false,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   a.secureCookie,
+		MaxAge:   int(authSessionTTL / time.Second),
+	})
+}
+
+func clearSessionCookies(w http.ResponseWriter, secure bool) {
+	for _, name := range []string{sessionCookieName, csrfCookieName} {
+		http.SetCookie(w, &http.Cookie{
+			Name:     name,
+			Value:    "",
+			Path:     "/",
+			MaxAge:   -1,
+			HttpOnly: name == sessionCookieName,
+			SameSite: http.SameSiteStrictMode,
+			Secure:   secure,
+		})
+	}
+}
+
+func (a *authManager) revokeUserSessions(username, keepToken string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for token, session := range a.sessions {
+		if strings.EqualFold(session.Username, username) && token != keepToken {
+			delete(a.sessions, token)
+		}
+	}
+}
+
 func (a *authManager) authorize(role string, r *http.Request) bool {
+	path := r.URL.Path
+	role = security.NormalizeRole(role)
+	if path == "/settings/auth" || strings.HasPrefix(path, "/settings/smtp") {
+		return role == security.RoleAdmin
+	}
+	if path == "/settings/passkey" {
+		return role == security.RoleAdmin
+	}
+	if path == "/auth/users" || strings.HasPrefix(path, "/auth/users/") {
+		return role == security.RoleAdmin
+	}
 	if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
 		return true
 	}
-	path := r.URL.Path
 	if path == "/auth/session" || path == "/logout" {
 		return true
 	}
-	role = security.NormalizeRole(role)
 	if role == security.RoleAdmin {
 		return true
 	}
@@ -285,6 +533,9 @@ func (a *authManager) authorize(role string, r *http.Request) bool {
 		return false
 	}
 	if path == "/auth/password" {
+		return true
+	}
+	if strings.HasPrefix(path, "/account/") {
 		return true
 	}
 	if path == "/settings/logging" {
@@ -311,57 +562,261 @@ func (a *authManager) handleLogin(w http.ResponseWriter, r *http.Request) {
 		username = "admin"
 	}
 	sourceKey := loginSourceKey(r)
+	accountKey := loginAccountKey(username)
 	if _, blocked := a.loginLockedUntil(sourceKey); blocked {
 		a.serveLogin(w, r, "loginErrorLocked", username)
 		return
 	}
-
-	if !a.consumeLoginCaptcha(r.FormValue("captcha_id"), r.FormValue("captcha_answer")) {
-		a.recordLoginFailure(sourceKey)
-		a.serveLogin(w, r, "loginErrorCaptcha", username)
+	if accountKey != "" {
+		if _, blocked := a.loginLockedUntil(accountKey); blocked {
+			a.serveLogin(w, r, "loginErrorLocked", username)
+			return
+		}
+	}
+	if result := a.validateLoginCaptchaForSource(r.FormValue("captcha_id"), r.FormValue("captcha_answer"), sourceKey); result != loginCaptchaValid {
+		// Expired, refreshed, or mistyped challenges are not password guesses.
+		// The independent submit limiter still bounds automated captcha attempts.
+		errorKey := "loginErrorCaptcha"
+		if result == loginCaptchaExpired {
+			errorKey = "loginErrorCaptchaExpired"
+		} else if result == loginCaptchaSourceChanged {
+			errorKey = "loginErrorCaptchaSourceChanged"
+		}
+		a.serveLogin(w, r, errorKey, username)
 		return
 	}
 
 	password := r.FormValue("password")
 	store, err := security.LoadUserStore(a.authFile)
-	user, _ := store.Find(username)
-	if err != nil || user == nil || !user.Enabled || !security.VerifyPassword(password, user.Password) {
+	user, userIndex := store.Find(username)
+	passwordRecord := security.DummyPasswordRecord()
+	if user != nil {
+		passwordRecord = user.Password
+	}
+	passwordValid := a.verifyLoginPassword(r.Context(), password, passwordRecord)
+	// Legacy SHA-256 records are intentionally supported for migration, but
+	// their verification is much faster than Argon2id. Run the dummy Argon2id
+	// work as well so an attacker cannot enumerate accounts by timing old versus
+	// migrated password records.
+	if user != nil && security.NeedsRehash(user.Password) {
+		_ = a.verifyLoginPassword(r.Context(), password, security.DummyPasswordRecord())
+	}
+	if err != nil || user == nil || !user.Enabled || !passwordValid {
 		a.recordLoginFailure(sourceKey)
+		if accountKey != "" {
+			a.recordLoginFailureWithLimit(accountKey, loginAccountMaxFailures)
+		}
 		time.Sleep(400 * time.Millisecond)
 		a.serveLogin(w, r, "loginErrorInvalidCredentials", username)
 		return
 	}
+	if security.NeedsRehash(user.Password) {
+		if upgraded, upgradeErr := security.NewPasswordRecord(password); upgradeErr == nil {
+			user.Password = upgraded
+			store.Users[userIndex] = *user
+			if saveErr := security.SaveUserStore(a.authFile, store); saveErr != nil {
+				log.Printf("warning: upgrade password hash for %q: %v", user.Username, saveErr)
+			}
+		}
+	}
+	a.mu.RLock()
+	securitySettings := a.settings
+	a.mu.RUnlock()
+	policyRequiresMFA := securitySettings.MFARequired || (securitySettings.RequireMFAForAdmin && security.NormalizeRole(user.Role) == security.RoleAdmin)
+	otpAllowed := false
+	for _, method := range securitySettings.AllowedMFAMethods {
+		if method == "otp" {
+			otpAllowed = true
+			break
+		}
+	}
+	if policyRequiresMFA && (!user.MFA.OTPEnabled || !otpAllowed) {
+		a.recordLoginFailure(sourceKey)
+		a.serveLogin(w, r, "loginErrorMFA", username)
+		return
+	}
+	if user.MFA.OTPEnabled && otpAllowed {
+		challengeID, challengeErr := a.createLoginOTPChallenge(user.Username, sourceKey)
+		if challengeErr != nil {
+			a.serveLogin(w, r, "loginErrorSessionCreate", username)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     loginOTPChallengeCookieName,
+			Value:    challengeID,
+			Path:     "/login/otp",
+			HttpOnly: true,
+			SameSite: http.SameSiteStrictMode,
+			Secure:   a.secureCookie,
+			MaxAge:   int(loginOTPChallengeTTL / time.Second),
+		})
+		locale := loginLocaleFromRequest(r)
+		location := "/login/otp?lang=" + url.QueryEscape(locale)
+		http.Redirect(w, r, location, http.StatusSeeOther)
+		return
+	}
 
-	token, err := randomToken()
-	if err != nil {
+	if err := a.issueSession(w, user.Username, user.Role); err != nil {
 		a.serveLogin(w, r, "loginErrorSessionCreate", username)
 		return
 	}
 
 	a.mu.Lock()
-	a.sessions[token] = sessionState{
-		ExpiresAt: time.Now().Add(12 * time.Hour),
-		Username:  user.Username,
-		Role:      security.NormalizeRole(user.Role),
-	}
 	delete(a.loginAttempts, sourceKey)
+	if accountKey != "" {
+		delete(a.loginAttempts, accountKey)
+	}
 	a.mu.Unlock()
-
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    token,
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-		Secure:   a.secureCookie,
-	})
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (a *authManager) createLoginOTPChallenge(username, source string) (string, error) {
+	token, err := randomToken()
+	if err != nil {
+		return "", err
+	}
+	now := time.Now()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.loginOTP == nil {
+		a.loginOTP = make(map[string]loginOTPChallenge)
+	}
+	for id, challenge := range a.loginOTP {
+		if !challenge.ExpiresAt.After(now) {
+			delete(a.loginOTP, id)
+		}
+	}
+	if len(a.loginOTP) >= loginOTPChallengeLimit {
+		return "", errors.New("too many pending OTP login challenges")
+	}
+	a.loginOTP[token] = loginOTPChallenge{
+		Username:  username,
+		Source:    source,
+		ExpiresAt: now.Add(loginOTPChallengeTTL),
+	}
+	return token, nil
+}
+
+func (a *authManager) takeLoginOTPChallenge(r *http.Request) (string, loginOTPChallenge, bool) {
+	cookie, err := r.Cookie(loginOTPChallengeCookieName)
+	if err != nil || strings.TrimSpace(cookie.Value) == "" {
+		return "", loginOTPChallenge{}, false
+	}
+	token := strings.TrimSpace(cookie.Value)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	challenge, ok := a.loginOTP[token]
+	if !ok || !challenge.ExpiresAt.After(time.Now()) {
+		delete(a.loginOTP, token)
+		return token, loginOTPChallenge{}, false
+	}
+	if challenge.Source != "" && challenge.Source != loginSourceKey(r) {
+		return token, loginOTPChallenge{}, false
+	}
+	return token, challenge, true
+}
+
+func clearLoginOTPChallengeCookie(w http.ResponseWriter, secure bool) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     loginOTPChallengeCookieName,
+		Value:    "",
+		Path:     "/login/otp",
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   secure,
+	})
+}
+
+func (a *authManager) handleLoginOTP(w http.ResponseWriter, r *http.Request) {
+	if a.rejectLoginRate(w, r, "otp-login", loginSubmitRateLimit) {
+		return
+	}
+	token, challenge, ok := a.takeLoginOTPChallenge(r)
+	if !ok {
+		clearLoginOTPChallengeCookie(w, a.secureCookie)
+		a.serveLoginOTP(w, r, "loginOTPExpired")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	if err := r.ParseForm(); err != nil {
+		a.serveLoginOTP(w, r, "loginErrorInvalidForm")
+		return
+	}
+	code := strings.TrimSpace(r.FormValue("otp_code"))
+	store, err := security.LoadUserStore(a.authFile)
+	user, userIndex := store.Find(challenge.Username)
+	valid := err == nil && user != nil && user.Enabled && user.MFA.OTPEnabled && security.VerifyTOTPCode(user.MFA.OTPSecret, code, time.Now())
+	if !valid && err == nil && user != nil && user.Enabled && user.MFA.OTPEnabled {
+		var remaining []string
+		remaining, valid = security.ConsumeRecoveryCode(code, user.MFA.RecoveryCodeHashes)
+		if valid {
+			user.MFA.RecoveryCodeHashes = remaining
+			if userIndex >= 0 {
+				store.Users[userIndex] = *user
+			}
+			if saveErr := security.SaveUserStore(a.authFile, store); saveErr != nil {
+				valid = false
+			}
+		}
+	}
+	if !valid {
+		var pending loginOTPChallenge
+		var exists bool
+		a.mu.Lock()
+		pending, exists = a.loginOTP[token]
+		if exists {
+			pending.Attempts++
+			if pending.Attempts >= loginOTPMaxAttempts {
+				delete(a.loginOTP, token)
+			} else {
+				a.loginOTP[token] = pending
+			}
+		}
+		a.mu.Unlock()
+		a.recordLoginFailure(challenge.Source)
+		a.recordLoginFailureWithLimit(loginAccountKey(challenge.Username), loginAccountMaxFailures)
+		if !exists || pending.Attempts >= loginOTPMaxAttempts {
+			clearLoginOTPChallengeCookie(w, a.secureCookie)
+			a.serveLoginOTP(w, r, "loginOTPExpired")
+			return
+		}
+		a.serveLoginOTP(w, r, "loginErrorMFA")
+		return
+	}
+
+	a.mu.Lock()
+	delete(a.loginOTP, token)
+	delete(a.loginAttempts, challenge.Source)
+	delete(a.loginAttempts, loginAccountKey(challenge.Username))
+	a.mu.Unlock()
+	if err := a.issueSession(w, user.Username, user.Role); err != nil {
+		clearLoginOTPChallengeCookie(w, a.secureCookie)
+		a.serveLoginOTP(w, r, "loginErrorSessionCreate")
+		return
+	}
+	clearLoginOTPChallengeCookie(w, a.secureCookie)
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (a *authManager) serveLoginOTP(w http.ResponseWriter, r *http.Request, errorKey string) {
+	locale := loginLocaleFromRequest(r)
+	msg := loginMessages(locale)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+	tmpl := template.Must(template.New("login-otp").Parse(loginOTPHTML))
+	_ = tmpl.Execute(w, map[string]any{
+		"Locale": locale, "Title": msg["otpLoginTitle"], "Hint": msg["otpLoginHint"],
+		"Code": msg["otpLoginCode"], "Submit": msg["otpLoginSubmit"],
+		"Back": msg["otpLoginBack"], "Error": msg[errorKey],
+	})
 }
 
 func (a *authManager) handleLoginCaptchaRefresh(w http.ResponseWriter, r *http.Request) {
 	source := loginSourceKey(r)
 	if until, blocked := a.loginLockedUntil(source); blocked {
-		writeLoginRateLimited(w, r, time.Until(until), "loginLocked")
+		writeLoginRateLimited(w, r, time.Until(until), "loginLockedRetry")
 		return
 	}
 	if a.rejectLoginRate(w, r, "captcha-refresh", loginRefreshRateLimit) {
@@ -393,15 +848,7 @@ func (a *authManager) handleLogout(w http.ResponseWriter, r *http.Request) {
 		delete(a.sessions, cookie.Value)
 		a.mu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-		Secure:   a.secureCookie,
-	})
+	clearSessionCookies(w, a.secureCookie)
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
@@ -409,10 +856,26 @@ func (a *authManager) serveLogin(w http.ResponseWriter, r *http.Request, errorKe
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Robots-Tag", "noindex, nofollow")
+	w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
 	locale := loginLocaleFromRequest(r)
 	msg := loginMessages(locale)
-	captcha, err := a.newLoginCaptcha()
+	retryAfter := 0
+	for _, key := range []string{loginSourceKey(r), loginAccountKey(username)} {
+		if until, locked := a.loginLockedUntil(key); locked {
+			if seconds := loginRetrySeconds(time.Until(until)); seconds > retryAfter {
+				retryAfter = seconds
+			}
+		}
+	}
+	lockedMessage := msg["loginErrorLocked"]
+	if retryAfter > 0 {
+		errorKey = "loginErrorLocked"
+		lockedMessage = fmt.Sprintf(msg["loginLockedRetry"], retryAfter)
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+	}
+	captcha, err := a.newLoginCaptchaForSource(loginSourceKey(r))
 	if err != nil {
 		http.Error(w, "unable to prepare login verification", http.StatusInternalServerError)
 		return
@@ -438,32 +901,62 @@ func (a *authManager) serveLogin(w http.ResponseWriter, r *http.Request, errorKe
 	}
 	tmpl := template.Must(template.New("login").Parse(loginPageHTML))
 	_ = tmpl.Execute(w, map[string]any{
-		"Locale":                  locale,
-		"Title":                   msg["title"],
-		"UsernamePlaceholder":     msg["usernamePlaceholder"],
-		"PasswordPlaceholder":     msg["passwordPlaceholder"],
-		"Submit":                  msg["submit"],
-		"LocaleLabel":             msg["localeLabel"],
-		"LocaleChinese":           msg["localeChinese"],
-		"LocaleEnglish":           msg["localeEnglish"],
-		"LoginErrorInvalidForm":   msg["loginErrorInvalidForm"],
-		"LoginErrorLocked":        msg["loginErrorLocked"],
-		"LoginErrorInvalidCreds":  msg["loginErrorInvalidCredentials"],
-		"LoginErrorCaptcha":       msg["loginErrorCaptcha"],
-		"LoginErrorSessionCreate": msg["loginErrorSessionCreate"],
-		"CaptchaLabel":            msg["captchaLabel"],
-		"CaptchaPlaceholder":      msg["captchaPlaceholder"],
-		"CaptchaRefresh":          msg["captchaRefresh"],
-		"CaptchaTraceHint":        msg["captchaTraceHint"],
-		"CaptchaTraceDone":        msg["captchaTraceDone"],
-		"CaptchaTraceReset":       msg["captchaTraceReset"],
-		"ErrorKey":                errorKey,
-		"Username":                username,
-		"Captcha":                 captcha,
+		"Locale":                         locale,
+		"Title":                          msg["title"],
+		"UsernamePlaceholder":            msg["usernamePlaceholder"],
+		"PasswordPlaceholder":            msg["passwordPlaceholder"],
+		"Submit":                         msg["submit"],
+		"LocaleLabel":                    msg["localeLabel"],
+		"LocaleChinese":                  msg["localeChinese"],
+		"LocaleEnglish":                  msg["localeEnglish"],
+		"ForgotLink":                     msg["forgotLink"],
+		"PasskeyLogin":                   msg["passkeyLogin"],
+		"LoginErrorInvalidForm":          msg["loginErrorInvalidForm"],
+		"LoginErrorLocked":               lockedMessage,
+		"LoginErrorInvalidCreds":         msg["loginErrorInvalidCredentials"],
+		"LoginErrorCaptcha":              msg["loginErrorCaptcha"],
+		"LoginErrorCaptchaExpired":       msg["loginErrorCaptchaExpired"],
+		"LoginErrorCaptchaSourceChanged": msg["loginErrorCaptchaSourceChanged"],
+		"LoginErrorMFA":                  msg["loginErrorMFA"],
+		"LoginErrorSessionCreate":        msg["loginErrorSessionCreate"],
+		"PasskeyLoginUnavailable":        msg["passkeyLoginUnavailable"],
+		"PasskeyLoginFailed":             msg["passkeyLoginFailed"],
+		"PasskeyLoginOrigin":             msg["passkeyLoginOrigin"],
+		"PasskeyLoginUnsupported":        msg["passkeyLoginUnsupported"],
+		"PasskeyLoginDisabled":           msg["passkeyLoginDisabled"],
+		"CaptchaRefreshFailed":           msg["captchaRefreshFailed"],
+		"LoginRequestFailed":             msg["loginRequestFailed"],
+		"LoginNetworkFailed":             msg["loginNetworkFailed"],
+		"MFALabel":                       msg["mfaLabel"],
+		"MFAPlaceholder":                 msg["mfaPlaceholder"],
+		"MFAHint":                        msg["mfaHint"],
+		"CaptchaLabel":                   msg["captchaLabel"],
+		"CaptchaPlaceholder":             msg["captchaPlaceholder"],
+		"CaptchaMathPlaceholder":         msg["captchaMathPlaceholder"],
+		"CaptchaLettersLabel":            msg["captchaLettersLabel"],
+		"CaptchaMathLabel":               msg["captchaMathLabel"],
+		"CaptchaRefresh":                 msg["captchaRefresh"],
+		"CaptchaTraceHint":               msg["captchaTraceHint"],
+		"CaptchaTraceDone":               msg["captchaTraceDone"],
+		"CaptchaTraceReset":              msg["captchaTraceReset"],
+		"CaptchaImageAlt":                msg["captchaImageAlt"],
+		"BrandSubtitle":                  msg["brandSubtitle"],
+		"BrandCopy":                      msg["brandCopy"],
+		"BrandDescription":               msg["brandDescription"],
+		"BrandMeta":                      msg["brandMeta"],
+		"PasskeyEnabled":                 a.passkeyEnabled(),
+		"ErrorKey":                       errorKey,
+		"Username":                       username,
+		"Captcha":                        captcha,
+		"RetryAfter":                     retryAfter,
 	})
 }
 
 func (a *authManager) newLoginCaptcha() (loginCaptchaView, error) {
+	return a.newLoginCaptchaForSource("")
+}
+
+func (a *authManager) newLoginCaptchaForSource(source string) (loginCaptchaView, error) {
 	id, err := randomToken()
 	if err != nil {
 		return loginCaptchaView{}, err
@@ -472,7 +965,7 @@ func (a *authManager) newLoginCaptcha() (loginCaptchaView, error) {
 	if err != nil {
 		return loginCaptchaView{}, err
 	}
-	view := loginCaptchaView{ID: id}
+	view := loginCaptchaView{ID: id, ExpiresIn: int(loginCaptchaTTL / time.Second)}
 	state := loginCaptchaState{ExpiresAt: time.Now().Add(loginCaptchaTTL)}
 	switch kindIndex {
 	case 0:
@@ -484,8 +977,10 @@ func (a *authManager) newLoginCaptcha() (loginCaptchaView, error) {
 		if err != nil {
 			return loginCaptchaView{}, err
 		}
-		left += 2
-		right += 2
+		// Two-digit operands keep the visual challenge human-solvable while
+		// avoiding the tiny answer space of the old 2..9 arithmetic puzzle.
+		left += 10
+		right += 10
 		subtract, err := secureRandomInt(2)
 		if err != nil {
 			return loginCaptchaView{}, err
@@ -508,7 +1003,7 @@ func (a *authManager) newLoginCaptcha() (loginCaptchaView, error) {
 	case 1:
 		const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 		var code strings.Builder
-		for i := 0; i < 5; i++ {
+		for i := 0; i < 6; i++ {
 			index, err := secureRandomInt(int64(len(alphabet)))
 			if err != nil {
 				return loginCaptchaView{}, err
@@ -566,6 +1061,7 @@ func (a *authManager) newLoginCaptcha() (loginCaptchaView, error) {
 		}
 	}
 	state.Kind = view.Kind
+	state.Source = strings.TrimSpace(source)
 
 	now := time.Now()
 	a.mu.Lock()
@@ -593,20 +1089,56 @@ func (a *authManager) newLoginCaptcha() (loginCaptchaView, error) {
 }
 
 func (a *authManager) consumeLoginCaptcha(id, answer string) bool {
+	return a.consumeLoginCaptchaForSource(id, answer, "")
+}
+
+func (a *authManager) consumeLoginCaptchaForSource(id, answer, source string) bool {
+	return a.validateLoginCaptchaForSource(id, answer, source) == loginCaptchaValid
+}
+
+func (a *authManager) validateLoginCaptchaForSource(id, answer, source string) loginCaptchaResult {
 	a.mu.Lock()
 	challenge, ok := a.loginCaptchas[id]
+	if ok && challenge.Source != "" && challenge.Source != strings.TrimSpace(source) {
+		a.mu.Unlock()
+		return loginCaptchaSourceChanged
+	}
 	if ok {
 		delete(a.loginCaptchas, id)
 	}
 	a.mu.Unlock()
-	if !ok || !challenge.ExpiresAt.After(time.Now()) || len(answer) > 256 {
-		return false
+	if !ok || !challenge.ExpiresAt.After(time.Now()) {
+		return loginCaptchaExpired
+	}
+	if len(answer) > 256 {
+		return loginCaptchaInvalid
 	}
 	if challenge.Kind == "trace" {
-		return validateLoginTraceAnswer(answer, challenge.TracePoints)
+		if validateLoginTraceAnswer(answer, challenge.TracePoints) {
+			return loginCaptchaValid
+		}
+		return loginCaptchaInvalid
 	}
 	answer = strings.ToUpper(strings.TrimSpace(answer))
-	return subtle.ConstantTimeCompare([]byte(answer), []byte(challenge.Answer)) == 1
+	if challenge.Kind == "math" {
+		// Chinese IMEs can produce full-width digits; compare the numeric result
+		// so equivalent input such as 03 and ３ is accepted for arithmetic only.
+		answer = strings.Map(func(char rune) rune {
+			if char >= '０' && char <= '９' {
+				return char - '０' + '0'
+			}
+			return char
+		}, answer)
+		value, err := strconv.ParseUint(answer, 10, 32)
+		if err != nil {
+			return loginCaptchaInvalid
+		}
+		answer = strconv.FormatUint(value, 10)
+	}
+	if subtle.ConstantTimeCompare([]byte(answer), []byte(challenge.Answer)) == 1 {
+		return loginCaptchaValid
+	}
+	return loginCaptchaInvalid
 }
 
 func (a *authManager) allowLoginRequest(source, action string, limit int, window time.Duration) (bool, time.Duration) {
@@ -666,7 +1198,7 @@ func (a *authManager) rejectLoginRate(w http.ResponseWriter, r *http.Request, ac
 	return true
 }
 
-func writeLoginRateLimited(w http.ResponseWriter, r *http.Request, retryAfter time.Duration, messageKey string) {
+func loginRetrySeconds(retryAfter time.Duration) int {
 	seconds := int(retryAfter.Seconds())
 	if time.Duration(seconds)*time.Second < retryAfter {
 		seconds++
@@ -674,6 +1206,11 @@ func writeLoginRateLimited(w http.ResponseWriter, r *http.Request, retryAfter ti
 	if seconds < 1 {
 		seconds = 1
 	}
+	return seconds
+}
+
+func writeLoginRateLimited(w http.ResponseWriter, r *http.Request, retryAfter time.Duration, messageKey string) {
+	seconds := loginRetrySeconds(retryAfter)
 	w.Header().Set("Retry-After", strconv.Itoa(seconds))
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -685,6 +1222,11 @@ func writeLoginRateLimited(w http.ResponseWriter, r *http.Request, retryAfter ti
 	}
 	http.Error(w, message, http.StatusTooManyRequests)
 }
+
+const (
+	loginTraceImageWidth  = 320
+	loginTraceImageHeight = 150
+)
 
 func validateLoginTraceAnswer(answer string, expected []loginCaptchaPoint) bool {
 	if len(expected) == 0 {
@@ -706,8 +1248,8 @@ func validateLoginTraceAnswer(answer string, expected []loginCaptchaPoint) bool 
 		}
 		// Compare in the image's pixel space so the click tolerance stays
 		// consistent when the responsive image is rendered at different sizes.
-		dx := (x - float64(expected[i].X)) * 3.2
-		dy := (y - float64(expected[i].Y)) * 1.5
+		dx := (x - float64(expected[i].X)) * float64(loginTraceImageWidth) / 100
+		dy := (y - float64(expected[i].Y)) * float64(loginTraceImageHeight) / 100
 		if dx*dx+dy*dy > 24*24 {
 			return false
 		}
@@ -758,150 +1300,6 @@ func randomTraceDecoy(existing []loginCaptchaPoint) (loginCaptchaPoint, error) {
 	return loginCaptchaPoint{}, fmt.Errorf("unable to position trace captcha decoy")
 }
 
-func makeLoginCaptchaImage(code string) (template.URL, error) {
-	const width, height = 240, 72
-	const allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+-−=? "
-	runes := []rune(code)
-	if len(runes) == 0 || len(runes) > 12 {
-		return "", fmt.Errorf("captcha text length is invalid")
-	}
-	for _, char := range runes {
-		if !strings.ContainsRune(allowed, char) {
-			return "", fmt.Errorf("captcha contains an unsupported character")
-		}
-	}
-
-	var svg strings.Builder
-	fmt.Fprintf(&svg, `<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d"><rect width="%d" height="%d" rx="10" fill="#e8eef5"/>`, width, height, width, height, width, height)
-	colors := []string{"#174f70", "#8a3d5d", "#365c3b", "#754d20", "#4338ca"}
-	for i := 0; i < 13; i++ {
-		x1, err := secureRandomInt(width)
-		if err != nil {
-			return "", err
-		}
-		y1, err := secureRandomInt(height)
-		if err != nil {
-			return "", err
-		}
-		x2, err := secureRandomInt(width)
-		if err != nil {
-			return "", err
-		}
-		y2, err := secureRandomInt(height)
-		if err != nil {
-			return "", err
-		}
-		color, err := secureRandomInt(int64(len(colors)))
-		if err != nil {
-			return "", err
-		}
-		fmt.Fprintf(&svg, `<path d="M%d %d L%d %d" stroke="%s" stroke-opacity=".28" stroke-width="1.2"/>`, x1, y1, x2, y2, colors[color])
-	}
-	for i := 0; i < 30; i++ {
-		x, err := secureRandomInt(width)
-		if err != nil {
-			return "", err
-		}
-		y, err := secureRandomInt(height)
-		if err != nil {
-			return "", err
-		}
-		radius, err := secureRandomInt(2)
-		if err != nil {
-			return "", err
-		}
-		color, err := secureRandomInt(int64(len(colors)))
-		if err != nil {
-			return "", err
-		}
-		fmt.Fprintf(&svg, `<circle cx="%d" cy="%d" r="%d" fill="%s" fill-opacity=".34"/>`, x, y, radius+1, colors[color])
-	}
-	slot := float64(width-24) / float64(len(runes))
-	fontSize := 31
-	if len(runes) > 7 {
-		fontSize = 24
-	}
-	for i, char := range runes {
-		if char == ' ' {
-			continue
-		}
-		rotation, err := secureRandomInt(31)
-		if err != nil {
-			return "", err
-		}
-		yOffset, err := secureRandomInt(9)
-		if err != nil {
-			return "", err
-		}
-		color, err := secureRandomInt(int64(len(colors)))
-		if err != nil {
-			return "", err
-		}
-		x := 12 + slot*(float64(i)+0.5)
-		y := 42 + int(yOffset) - 4
-		fmt.Fprintf(&svg, `<text x="%.1f" y="%d" transform="rotate(%d %.1f 36)" text-anchor="middle" font-family="monospace" font-size="%d" font-weight="700" fill="%s">%c</text>`, x, y, rotation-15, x, fontSize, colors[color], char)
-	}
-	svg.WriteString(`</svg>`)
-	encoded := base64.StdEncoding.EncodeToString([]byte(svg.String()))
-	return template.URL("data:image/svg+xml;base64," + encoded), nil
-}
-
-func makeLoginTraceCaptchaImage(points []loginCaptchaPoint) (template.URL, error) {
-	const width, height = 320, 150
-	var svg strings.Builder
-	fmt.Fprintf(&svg, `<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d"><defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#1e293b"/><stop offset="1" stop-color="#111827"/></linearGradient></defs><rect width="%d" height="%d" rx="12" fill="url(#bg)"/>`, width, height, width, height, width, height)
-	colors := []string{"#38bdf8", "#a78bfa", "#f472b6", "#fbbf24", "#34d399"}
-	for i := 0; i < 12; i++ {
-		x1, err := secureRandomInt(width)
-		if err != nil {
-			return "", err
-		}
-		y1, err := secureRandomInt(height)
-		if err != nil {
-			return "", err
-		}
-		x2, err := secureRandomInt(width)
-		if err != nil {
-			return "", err
-		}
-		y2, err := secureRandomInt(height)
-		if err != nil {
-			return "", err
-		}
-		color, err := secureRandomInt(int64(len(colors)))
-		if err != nil {
-			return "", err
-		}
-		fmt.Fprintf(&svg, `<path d="M%d %d Q%d %d %d %d" fill="none" stroke="%s" stroke-opacity=".24" stroke-width="1.4"/>`, x1, y1, (x1+x2)/2, (y1+y2)/2+12, x2, y2, colors[color])
-	}
-	for i := 0; i < 38; i++ {
-		x, err := secureRandomInt(width)
-		if err != nil {
-			return "", err
-		}
-		y, err := secureRandomInt(height)
-		if err != nil {
-			return "", err
-		}
-		radius, err := secureRandomInt(3)
-		if err != nil {
-			return "", err
-		}
-		fmt.Fprintf(&svg, `<circle cx="%d" cy="%d" r="%d" fill="#cbd5e1" fill-opacity=".24"/>`, x, y, radius+1)
-	}
-	for _, point := range points {
-		cx, cy := point.X*width/100, point.Y*height/100
-		if point.Decoy {
-			fmt.Fprintf(&svg, `<circle class="decoy" cx="%d" cy="%d" r="16" fill="#475569" fill-opacity=".72" stroke="#94a3b8" stroke-width="2"/><circle cx="%d" cy="%d" r="3" fill="#cbd5e1" fill-opacity=".8"/>`, cx, cy, cx, cy)
-			continue
-		}
-		fmt.Fprintf(&svg, `<circle class="target" cx="%d" cy="%d" r="17" fill="#0f766e" stroke="#5eead4" stroke-width="2.5"/><text x="%d" y="%d" text-anchor="middle" dominant-baseline="central" font-family="sans-serif" font-size="18" font-weight="700" fill="#f8fafc">%d</text>`, cx, cy, cx, cy, point.Label)
-	}
-	svg.WriteString(`</svg>`)
-	encoded := base64.StdEncoding.EncodeToString([]byte(svg.String()))
-	return template.URL("data:image/svg+xml;base64," + encoded), nil
-}
-
 func normalizeLoginLocale(locale string) string {
 	switch strings.ToLower(strings.TrimSpace(locale)) {
 	case "en", "en-us":
@@ -931,51 +1329,166 @@ func loginLocaleFromRequest(r *http.Request) string {
 func loginMessages(locale string) map[string]string {
 	if normalizeLoginLocale(locale) == "en-US" {
 		return map[string]string{
-			"title":                        "NodeWall Sign In",
-			"usernamePlaceholder":          "Username",
-			"passwordPlaceholder":          "Password",
-			"submit":                       "Sign In",
-			"localeLabel":                  "Language",
-			"localeChinese":                "简体中文",
-			"localeEnglish":                "English",
-			"loginErrorInvalidForm":        "Invalid form data.",
-			"loginErrorLocked":             "Too many attempts. Please try again later.",
-			"loginErrorInvalidCredentials": "Invalid username or password.",
-			"loginErrorCaptcha":            "Verification failed. Please try the new challenge.",
-			"loginErrorSessionCreate":      "Unable to create session.",
-			"captchaLabel":                 "Human verification",
-			"captchaPlaceholder":           "Code",
-			"captchaRefresh":               "Try another",
-			"loginRateLimited":             "Too many requests. Retry in %d seconds.",
-			"captchaRefreshRateLimited":    "Captcha refresh is temporarily limited. Retry in %d seconds.",
-			"captchaTracePrompt":           "Click the numbered dots in this order: %s",
-			"captchaTraceHint":             "Click each dot in order; avoid the unnumbered decoys.",
-			"captchaTraceDone":             "Five points selected",
-			"captchaTraceReset":            "Reset",
+			"title":                          "NodeWall Sign In",
+			"brandSubtitle":                  "Host protection center",
+			"brandCopy":                      "Host protection and network control",
+			"brandDescription":               "Manage node security, network policy, and recoverable changes from one trusted console.",
+			"brandMeta":                      "Encrypted state · auditable policy · recoverable changes",
+			"usernamePlaceholder":            "Username",
+			"passwordPlaceholder":            "Password",
+			"submit":                         "Sign In",
+			"localeLabel":                    "Language",
+			"localeChinese":                  "简体中文",
+			"localeEnglish":                  "English",
+			"loginErrorInvalidForm":          "Invalid form data.",
+			"loginErrorLocked":               "Too many attempts. Please try again later.",
+			"loginErrorInvalidCredentials":   "Invalid username or password.",
+			"loginErrorCaptcha":              "Verification failed. Please try the new challenge.",
+			"loginErrorCaptchaExpired":       "The previous challenge expired or was replaced. Complete the new one.",
+			"loginErrorCaptchaSourceChanged": "Your network source changed. Complete the new challenge.",
+			"loginLockedRetry":               "Too many attempts. Retry in %d seconds.",
+			"loginErrorMFA":                  "This account requires a valid OTP/recovery code or Passkey login.",
+			"loginErrorSessionCreate":        "Unable to create session.",
+			"loginOTPTitle":                  "Additional verification",
+			"otpLoginTitle":                  "Additional verification",
+			"otpLoginHint":                   "Enter the one-time code from your authenticator app or a recovery code to finish signing in.",
+			"otpLoginCode":                   "6-digit OTP or recovery code",
+			"otpLoginSubmit":                 "Verify and sign in",
+			"otpLoginBack":                   "Return to sign in",
+			"loginOTPExpired":                "This verification step expired. Sign in again.",
+			"passkeyLoginUnavailable":        "This account has no registered Passkey.",
+			"passkeyLoginFailed":             "Passkey sign-in failed. Check the browser, HTTPS origin, and credential, then try again.",
+			"passkeyLoginOrigin":             "Passkey requires an HTTPS DNS host name. Open NodeWall through its configured host name instead of an IP address.",
+			"passkeyLoginDisabled":           "Passkey login is disabled in NodeWall System Settings.",
+			"captchaRefreshFailed":           "Captcha refresh failed. Try again.",
+			"loginRequestFailed":             "Sign-in request failed. Try again.",
+			"loginNetworkFailed":             "The sign-in result could not be confirmed. Try a new challenge before retrying; your account and password are kept in this form.",
+			"mfaLabel":                       "Additional verification (if enabled)",
+			"mfaPlaceholder":                 "6-digit OTP or recovery code",
+			"mfaHint":                        "Leave blank unless this account has additional verification enabled.",
+			"forgotTitle":                    "Reset NodeWall password",
+			"forgotHeading":                  "Reset password",
+			"forgotLink":                     "Forgot password?",
+			"forgotCode":                     "Email verification code",
+			"forgotNewPassword":              "New password",
+			"forgotConfirmPassword":          "Confirm new password",
+			"forgotRequest":                  "Send reset code",
+			"forgotReset":                    "Reset password",
+			"forgotResetStep":                "Set new password",
+			"forgotStepsLabel":               "Password recovery steps",
+			"forgotBack":                     "Back to sign in",
+			"forgotEditAccount":              "Change account",
+			"forgotResend":                   "Resend code",
+			"forgotResendAccepted":           "The resend request was accepted.",
+			"forgotHint":                     "Enter the username for an account with a verified email address.",
+			"forgotRequestSent":              "If the account has a verified email address, check that inbox for the reset code.",
+			"forgotSendPending":              "Sending code…",
+			"forgotResetPending":             "Resetting password…",
+			"forgotResetSuccess":             "Password reset. Redirecting to sign in...",
+			"forgotRequestFailed":            "The reset request failed. Try again.",
+			"forgotUsernameRequired":         "Enter your username.",
+			"forgotResetFailed":              "Password reset failed. Check the code and try again.",
+			"forgotCodeInvalid":              "The reset code is invalid or expired.",
+			"forgotPasswordsMismatch":        "The new passwords do not match.",
+			"forgotPasswordTooShort":         "Use at least 8 characters for the new password.",
+			"forgotRateLimited":              "Too many requests. Try again later.",
+			"forgotResetUncertain":           "The result could not be confirmed. Return to sign in or request a new code.",
+			"passkeyLogin":                   "Sign in with Passkey",
+			"passkeyLoginUnsupported":        "Passkey is unavailable in this browser or origin.",
+			"captchaLabel":                   "Security check",
+			"captchaPlaceholder":             "Code",
+			"captchaMathPlaceholder":         "Answer",
+			"captchaImageAlt":                "Security verification image",
+			"captchaLettersLabel":            "Enter the characters in the image",
+			"captchaMathLabel":               "Enter the result of the calculation",
+			"captchaRefresh":                 "Try another",
+			"loginRateLimited":               "Too many requests. Retry in %d seconds.",
+			"captchaRefreshRateLimited":      "Captcha refresh is temporarily limited. Retry in %d seconds.",
+			"captchaTracePrompt":             "Click the numbered dots in this order: %s",
+			"captchaTraceHint":               "Click each dot in order; avoid the unnumbered decoys.",
+			"captchaTraceDone":               "Five points selected",
+			"captchaTraceReset":              "Reset",
 		}
 	}
 	return map[string]string{
-		"title":                        "NodeWall 登录",
-		"usernamePlaceholder":          "账号",
-		"passwordPlaceholder":          "密码",
-		"submit":                       "登录",
-		"localeLabel":                  "语言",
-		"localeChinese":                "简体中文",
-		"localeEnglish":                "English",
-		"loginErrorInvalidForm":        "表单格式无效。",
-		"loginErrorLocked":             "尝试次数过多，请稍后重试。",
-		"loginErrorInvalidCredentials": "账号或密码错误。",
-		"loginErrorCaptcha":            "人机验证未通过，请完成新的验证。",
-		"loginErrorSessionCreate":      "会话创建失败。",
-		"captchaLabel":                 "人机验证",
-		"captchaPlaceholder":           "验证码",
-		"captchaRefresh":               "换一题",
-		"loginRateLimited":             "请求过于频繁，请 %d 秒后重试。",
-		"captchaRefreshRateLimited":    "验证码切换太频繁，请 %d 秒后重试。",
-		"captchaTracePrompt":           "按 %s 顺序点击圆点",
-		"captchaTraceHint":             "按顺序点击编号圆点，避开无编号干扰点。",
-		"captchaTraceDone":             "已选中 5 个点",
-		"captchaTraceReset":            "重选",
+		"title":                          "NodeWall 登录",
+		"brandSubtitle":                  "主机防护中心",
+		"brandCopy":                      "主机防护与网络控制",
+		"brandDescription":               "统一管理节点安全、网络策略与可恢复的变更。",
+		"brandMeta":                      "加密状态 · 可审计策略 · 可恢复变更",
+		"usernamePlaceholder":            "账号",
+		"passwordPlaceholder":            "密码",
+		"submit":                         "登录",
+		"localeLabel":                    "语言",
+		"localeChinese":                  "简体中文",
+		"localeEnglish":                  "English",
+		"loginErrorInvalidForm":          "表单格式无效。",
+		"loginErrorLocked":               "尝试次数过多，请稍后重试。",
+		"loginErrorInvalidCredentials":   "账号或密码错误。",
+		"loginErrorCaptcha":              "人机验证未通过，请完成新的验证。",
+		"loginErrorCaptchaExpired":       "原验证码已失效，已换新题，请重新验证。",
+		"loginErrorCaptchaSourceChanged": "网络来源已变化，请完成新的验证。",
+		"loginLockedRetry":               "尝试次数过多，请 %d 秒后重试。",
+		"loginErrorMFA":                  "此账号需要有效的 OTP、恢复码或使用 Passkey 登录。",
+		"loginErrorSessionCreate":        "会话创建失败。",
+		"otpLoginTitle":                  "辅助验证",
+		"otpLoginHint":                   "请输入验证器应用中的一次性验证码或恢复码，完成登录。",
+		"otpLoginCode":                   "6 位 OTP 或恢复码",
+		"otpLoginSubmit":                 "验证并登录",
+		"otpLoginBack":                   "返回登录",
+		"loginOTPExpired":                "本次辅助验证已过期，请重新登录。",
+		"passkeyLoginUnavailable":        "此账号尚未登记可用的 Passkey。",
+		"passkeyLoginFailed":             "Passkey 登录失败，请确认浏览器、HTTPS 来源和凭证后重试。",
+		"passkeyLoginOrigin":             "Passkey 需要 HTTPS DNS 主机名，请使用已配置的主机名访问 NodeWall，不要直接使用 IP 地址。",
+		"passkeyLoginDisabled":           "Passkey 登录尚未在 NodeWall 系统设置中启用。",
+		"captchaRefreshFailed":           "验证码刷新失败，请重试。",
+		"loginRequestFailed":             "登录请求失败，请重试。",
+		"loginNetworkFailed":             "网络异常，尚未确认登录结果。请换一题后重试，账号和密码已保留。",
+		"mfaLabel":                       "辅助验证（如已启用）",
+		"mfaPlaceholder":                 "6 位 OTP 或恢复码",
+		"mfaHint":                        "只有账号启用了辅助验证时才需要填写。",
+		"forgotTitle":                    "找回 NodeWall 密码",
+		"forgotHeading":                  "找回密码",
+		"forgotLink":                     "忘记密码？",
+		"forgotCode":                     "邮箱验证码",
+		"forgotNewPassword":              "新密码",
+		"forgotConfirmPassword":          "确认新密码",
+		"forgotRequest":                  "发送验证码",
+		"forgotReset":                    "重置密码",
+		"forgotResetStep":                "设置新密码",
+		"forgotStepsLabel":               "找回密码步骤",
+		"forgotBack":                     "返回登录",
+		"forgotEditAccount":              "修改账号",
+		"forgotResend":                   "重新发送",
+		"forgotResendAccepted":           "重发请求已受理。",
+		"forgotHint":                     "输入已绑定并验证邮箱的账号。",
+		"forgotRequestSent":              "如果账号符合条件，找回验证码已发送到已验证的邮箱。",
+		"forgotSendPending":              "正在发送…",
+		"forgotResetPending":             "正在重置…",
+		"forgotResetSuccess":             "密码已重置，正在返回登录页……",
+		"forgotRequestFailed":            "找回请求失败，请重试。",
+		"forgotUsernameRequired":         "请输入账号。",
+		"forgotResetFailed":              "密码重置失败，请检查验证码后重试。",
+		"forgotCodeInvalid":              "找回验证码无效或已过期。",
+		"forgotPasswordsMismatch":        "两次输入的新密码不一致。",
+		"forgotPasswordTooShort":         "新密码至少需要 8 个字符。",
+		"forgotRateLimited":              "请求过于频繁，请稍后再试。",
+		"forgotResetUncertain":           "未能确认重置结果。可以返回登录，或重新发送验证码。",
+		"passkeyLogin":                   "使用 Passkey 登录",
+		"passkeyLoginUnsupported":        "当前浏览器或页面来源不支持 Passkey。",
+		"captchaLabel":                   "安全验证码",
+		"captchaPlaceholder":             "验证码",
+		"captchaMathPlaceholder":         "计算结果",
+		"captchaImageAlt":                "安全验证码图片",
+		"captchaLettersLabel":            "输入图中的字符",
+		"captchaMathLabel":               "输入算式的结果",
+		"captchaRefresh":                 "换一题",
+		"loginRateLimited":               "请求过于频繁，请 %d 秒后重试。",
+		"captchaRefreshRateLimited":      "验证码切换太频繁，请 %d 秒后重试。",
+		"captchaTracePrompt":             "按 %s 顺序点击圆点",
+		"captchaTraceHint":               "按顺序点击编号圆点，避开无编号干扰点。",
+		"captchaTraceDone":               "已选中 5 个点",
+		"captchaTraceReset":              "重选",
 	}
 }
 
@@ -1009,10 +1522,53 @@ func (a *authManager) authSettings() models.AuthSecuritySettings {
 }
 
 func (a *authManager) updateAuthSettings(settings models.AuthSecuritySettings) error {
+	settings = normalizeAuthSettings(settings)
+	if err := a.validatePasskeySettings(settings, nil); err != nil {
+		return err
+	}
+	if settings.MFARequired || settings.RequireMFAForAdmin {
+		otpAllowed := false
+		passkeyAllowed := false
+		for _, method := range settings.AllowedMFAMethods {
+			if method == "otp" {
+				otpAllowed = true
+			}
+			if method == "passkey" {
+				passkeyAllowed = true
+			}
+		}
+		if !otpAllowed && !passkeyAllowed {
+			return fmt.Errorf("at least one additional verification method must be allowed")
+		}
+		if passkeyAllowed && !otpAllowed && !settings.PasskeyEnabled {
+			return fmt.Errorf("Passkey must be enabled and ready before it is the only allowed MFA method")
+		}
+		store, err := security.LoadUserStore(a.authFile)
+		if err != nil {
+			return fmt.Errorf("cannot validate MFA policy: %w", err)
+		}
+		for _, user := range store.Users {
+			if !user.Enabled {
+				continue
+			}
+			if settings.RequireMFAForAdmin && security.NormalizeRole(user.Role) != security.RoleAdmin && !settings.MFARequired {
+				continue
+			}
+			hasAllowedMethod := (otpAllowed && user.MFA.OTPEnabled) || (passkeyAllowed && len(user.MFA.Passkeys) > 0)
+			if !hasAllowedMethod {
+				return fmt.Errorf("user %q must enroll an allowed MFA method before MFA is required", user.Username)
+			}
+		}
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.settings = normalizeAuthSettings(settings)
-	return a.saveSettingsLocked()
+	previous := a.settings
+	a.settings = settings
+	if err := a.saveSettingsLocked(); err != nil {
+		a.settings = previous
+		return err
+	}
+	return nil
 }
 
 func (a *authManager) loginLockedUntil(source string) (time.Time, bool) {
@@ -1036,6 +1592,13 @@ func (a *authManager) loginLockedUntil(source string) (time.Time, bool) {
 }
 
 func (a *authManager) recordLoginFailure(source string) {
+	a.mu.RLock()
+	maxFailures := a.settings.MaxFailures
+	a.mu.RUnlock()
+	a.recordLoginFailureWithLimit(source, maxFailures)
+}
+
+func (a *authManager) recordLoginFailureWithLimit(source string, maxFailures int) {
 	if source == "" {
 		return
 	}
@@ -1046,6 +1609,15 @@ func (a *authManager) recordLoginFailure(source string) {
 		a.loginAttempts = make(map[string]loginAttempt)
 	}
 	settings := a.settings
+	if settings.MaxFailures <= 0 {
+		settings.MaxFailures = 5
+	}
+	if settings.WindowSeconds <= 0 {
+		settings.WindowSeconds = int((10 * time.Minute) / time.Second)
+	}
+	if settings.LockDurationSeconds <= 0 {
+		settings.LockDurationSeconds = int((15 * time.Minute) / time.Second)
+	}
 	window := time.Duration(settings.WindowSeconds) * time.Second
 	if _, exists := a.loginAttempts[source]; !exists && len(a.loginAttempts) >= loginAttemptSourceLimit {
 		var oldestKey string
@@ -1077,14 +1649,20 @@ func (a *authManager) recordLoginFailure(source string) {
 	if attempt.FirstFailed.IsZero() {
 		attempt.FirstFailed = now
 	}
-	if attempt.Failures >= settings.MaxFailures {
+	if maxFailures <= 0 {
+		maxFailures = settings.MaxFailures
+	}
+	if attempt.Failures >= maxFailures {
 		attempt.LockedUntil = now.Add(lockDuration)
 	}
 	a.loginAttempts[source] = attempt
 }
 
 func (a *authManager) loadSettings() error {
-	data, err := os.ReadFile(a.settingsFile)
+	data, needsRewrite, recovered, err := securestore.ReadValid(a.settingsFile, func(payload []byte) error {
+		var settings models.AuthSecuritySettings
+		return json.Unmarshal(payload, &settings)
+	})
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -1095,46 +1673,42 @@ func (a *authManager) loadSettings() error {
 	if err := json.Unmarshal(data, &settings); err != nil {
 		return err
 	}
+	var storedFields map[string]json.RawMessage
+	_ = json.Unmarshal(data, &storedFields)
+	if _, present := storedFields["passkey_rp_id"]; !present {
+		settings.PasskeyRPID = strings.TrimSpace(a.webauthnRPID)
+		settings.PasskeyOrigins = append([]string(nil), a.webauthnOrigins...)
+	}
+	// Older settings files did not persist an explicit feature switch. Treat
+	// those files as disabled so importing a legacy RP ID cannot silently expose
+	// Passkey login; the administrator can enable it after reviewing the checks.
+	if _, present := storedFields["passkey_enabled"]; !present {
+		settings.PasskeyEnabled = false
+	}
 	a.settings = normalizeAuthSettings(settings)
+	if strings.TrimSpace(a.settings.PasskeyRPID) != "" {
+		a.webauthnRPID = strings.TrimSpace(a.settings.PasskeyRPID)
+	}
+	if len(a.settings.PasskeyOrigins) > 0 {
+		a.webauthnOrigins = append([]string(nil), a.settings.PasskeyOrigins...)
+	}
+	if strings.TrimSpace(a.settings.PasskeyTLSMode) != "" {
+		a.webauthnTLSMode = a.settings.PasskeyTLSMode
+	}
+	if needsRewrite || recovered {
+		return a.saveSettingsLocked()
+	}
 	return nil
 }
 
 func (a *authManager) saveSettingsLocked() error {
-	if err := os.MkdirAll(filepath.Dir(a.settingsFile), 0o755); err != nil {
-		return err
-	}
 	payload := a.settings
 	payload.ActiveLocks = 0
 	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(a.settingsFile), filepath.Base(a.settingsFile)+".tmp.*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	cleanup := true
-	defer func() {
-		_ = tmp.Close()
-		if cleanup {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-	if _, err := tmp.Write(data); err != nil {
-		return err
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, a.settingsFile); err != nil {
-		return err
-	}
-	cleanup = false
-	return nil
+	return securestore.Write(a.settingsFile, data, 0o600)
 }
 
 func normalizeAuthSettings(settings models.AuthSecuritySettings) models.AuthSecuritySettings {
@@ -1147,6 +1721,52 @@ func normalizeAuthSettings(settings models.AuthSecuritySettings) models.AuthSecu
 	if settings.LockDurationSeconds <= 0 {
 		settings.LockDurationSeconds = int((15 * time.Minute) / time.Second)
 	}
+	methods := make([]string, 0, len(settings.AllowedMFAMethods))
+	seen := make(map[string]struct{})
+	for _, method := range settings.AllowedMFAMethods {
+		method = strings.ToLower(strings.TrimSpace(method))
+		if method == "otp" || method == "passkey" {
+			if _, exists := seen[method]; exists {
+				continue
+			}
+			seen[method] = struct{}{}
+			methods = append(methods, method)
+		}
+	}
+	if !settings.PasskeyEnabled {
+		filtered := methods[:0]
+		for _, method := range methods {
+			if method != "passkey" {
+				filtered = append(filtered, method)
+			}
+		}
+		methods = filtered
+	}
+	if len(methods) == 0 {
+		// OTP is the established fallback. Passkey remains an explicit method
+		// choice after the administrator enables and configures it.
+		methods = []string{"otp"}
+	}
+	settings.AllowedMFAMethods = methods
+	settings.PasskeyRPID = strings.TrimSpace(settings.PasskeyRPID)
+	settings.PasskeyTLSMode = strings.ToLower(strings.TrimSpace(settings.PasskeyTLSMode))
+	if settings.PasskeyTLSMode != "proxy" {
+		settings.PasskeyTLSMode = "local"
+	}
+	origins := make([]string, 0, len(settings.PasskeyOrigins))
+	seenOrigins := make(map[string]struct{})
+	for _, origin := range settings.PasskeyOrigins {
+		origin = strings.TrimRight(strings.TrimSpace(origin), "/")
+		if origin == "" {
+			continue
+		}
+		if _, exists := seenOrigins[origin]; exists {
+			continue
+		}
+		seenOrigins[origin] = struct{}{}
+		origins = append(origins, origin)
+	}
+	settings.PasskeyOrigins = origins
 	settings.ActiveLocks = 0
 	return settings
 }
@@ -1212,11 +1832,229 @@ func (a *authManager) handlePasswordChange(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	keepToken := ""
+	if cookie, cookieErr := r.Cookie(sessionCookieName); cookieErr == nil {
+		keepToken = cookie.Value
+	}
+	a.revokeUserSessions(user.Username, keepToken)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":  "updated",
 		"message": "password updated",
 	})
+}
+
+func (a *authManager) accountUser(r *http.Request) (security.UserStore, *security.UserRecord, int, error) {
+	session, ok := a.sessionFromRequest(r)
+	if !ok {
+		return security.UserStore{}, nil, -1, fmt.Errorf("authentication required")
+	}
+	store, err := security.LoadUserStore(a.authFile)
+	if err != nil {
+		return security.UserStore{}, nil, -1, err
+	}
+	user, index := store.Find(session.Username)
+	if user == nil || !user.Enabled {
+		return security.UserStore{}, nil, -1, fmt.Errorf("current user not found")
+	}
+	return store, user, index, nil
+}
+
+func (a *authManager) handleAccountSecurity(w http.ResponseWriter, r *http.Request) {
+	if !a.enabled {
+		writeJSON(w, http.StatusOK, map[string]any{"auth_enabled": false, "otp_enabled": false, "passkeys": 0})
+		return
+	}
+	_, user, _, err := a.accountUser(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err)
+		return
+	}
+	a.mu.RLock()
+	settings := a.settings
+	a.mu.RUnlock()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"auth_enabled":             true,
+		"username":                 user.Username,
+		"email":                    user.Email,
+		"email_verified":           user.EmailVerified,
+		"otp_enabled":              user.MFA.OTPEnabled,
+		"recovery_codes_remaining": len(user.MFA.RecoveryCodeHashes),
+		"passkeys":                 len(user.MFA.Passkeys),
+		"passkey_enabled":          settings.PasskeyEnabled,
+		"passkey_rp_id":            settings.PasskeyRPID,
+		"passkey_origins":          settings.PasskeyOrigins,
+		"passkey_tls_mode":         settings.PasskeyTLSMode,
+		"mfa_required":             settings.MFARequired,
+		"require_mfa_for_admin":    settings.RequireMFAForAdmin,
+		"allowed_methods":          settings.AllowedMFAMethods,
+	})
+}
+
+func (a *authManager) handleOTPSetup(w http.ResponseWriter, r *http.Request) {
+	if !a.enabled {
+		writeError(w, http.StatusNotImplemented, fmt.Errorf("authentication is disabled"))
+		return
+	}
+	if a.rejectLoginRate(w, r, "otp-setup", 5) {
+		return
+	}
+	var req struct {
+		CurrentPassword string `json:"current_password"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	_, user, _, err := a.accountUser(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err)
+		return
+	}
+	if !security.VerifyPassword(strings.TrimSpace(req.CurrentPassword), user.Password) {
+		writeError(w, http.StatusUnauthorized, fmt.Errorf("current password is invalid"))
+		return
+	}
+	if user.MFA.OTPEnabled {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("OTP is already enabled"))
+		return
+	}
+	secret, err := security.GenerateTOTPSecret()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	// Keep the secret in memory until the user proves that the authenticator
+	// was configured correctly. The encrypted user store is not changed by the
+	// setup request, so abandoned setup attempts cannot enable MFA accidentally.
+	a.mu.Lock()
+	if a.otpSetups == nil {
+		a.otpSetups = make(map[string]otpSetupState)
+	}
+	a.otpSetups[user.Username] = otpSetupState{Secret: secret, ExpiresAt: time.Now().Add(10 * time.Minute)}
+	a.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"username":    user.Username,
+		"secret":      secret,
+		"otpauth_uri": security.OTPAuthURI(secret, "NodeWall", user.Username),
+		"expires_at":  time.Now().Add(10 * time.Minute),
+	})
+}
+
+func (a *authManager) handleOTPVerify(w http.ResponseWriter, r *http.Request) {
+	if !a.enabled {
+		writeError(w, http.StatusNotImplemented, fmt.Errorf("authentication is disabled"))
+		return
+	}
+	if a.rejectLoginRate(w, r, "otp-verify", 10) {
+		return
+	}
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	store, user, index, err := a.accountUser(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err)
+		return
+	}
+	a.mu.Lock()
+	setup, ok := a.otpSetups[user.Username]
+	if ok && !setup.ExpiresAt.After(time.Now()) {
+		delete(a.otpSetups, user.Username)
+		ok = false
+	}
+	if ok {
+		delete(a.otpSetups, user.Username)
+	}
+	a.mu.Unlock()
+	if !ok || !security.VerifyTOTPCode(setup.Secret, strings.TrimSpace(req.Code), time.Now()) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("OTP verification failed or setup expired"))
+		return
+	}
+	codes, hashes, err := security.GenerateRecoveryCodes(10)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	now := time.Now().UTC()
+	user.MFA.OTPSecret = setup.Secret
+	user.MFA.OTPEnabled = true
+	user.MFA.OTPVerifiedAt = &now
+	user.MFA.RecoveryCodeHashes = hashes
+	store.Users[index] = *user
+	if err := security.SaveUserStore(a.authFile, store); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":         "enabled",
+		"recovery_codes": codes,
+	})
+}
+
+func (a *authManager) handleOTPDisable(w http.ResponseWriter, r *http.Request) {
+	if !a.enabled {
+		writeError(w, http.StatusNotImplemented, fmt.Errorf("authentication is disabled"))
+		return
+	}
+	if a.rejectLoginRate(w, r, "otp-disable", 5) {
+		return
+	}
+	var req struct {
+		CurrentPassword string `json:"current_password"`
+		Code            string `json:"code"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	store, user, index, err := a.accountUser(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err)
+		return
+	}
+	a.mu.RLock()
+	settings := a.settings
+	a.mu.RUnlock()
+	policyRequiresMFA := settings.MFARequired || (settings.RequireMFAForAdmin && security.NormalizeRole(user.Role) == security.RoleAdmin)
+	passkeyAllowed := false
+	for _, method := range settings.AllowedMFAMethods {
+		if method == "passkey" {
+			passkeyAllowed = true
+			break
+		}
+	}
+	if policyRequiresMFA && !(passkeyAllowed && len(user.MFA.Passkeys) > 0) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("MFA policy prevents disabling the last verification method"))
+		return
+	}
+	if !security.VerifyPassword(strings.TrimSpace(req.CurrentPassword), user.Password) {
+		writeError(w, http.StatusUnauthorized, fmt.Errorf("current password is invalid"))
+		return
+	}
+	valid := security.VerifyTOTPCode(user.MFA.OTPSecret, strings.TrimSpace(req.Code), time.Now())
+	if !valid {
+		var remaining []string
+		remaining, valid = security.ConsumeRecoveryCode(req.Code, user.MFA.RecoveryCodeHashes)
+		if valid {
+			user.MFA.RecoveryCodeHashes = remaining
+		}
+	}
+	if !valid {
+		writeError(w, http.StatusUnauthorized, fmt.Errorf("valid OTP or recovery code is required"))
+		return
+	}
+	user.MFA = security.MFAMethods{Passkeys: user.MFA.Passkeys}
+	store.Users[index] = *user
+	if err := security.SaveUserStore(a.authFile, store); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "disabled"})
 }
 
 func (a *authManager) listUsers(w http.ResponseWriter, r *http.Request) {
@@ -1226,22 +2064,30 @@ func (a *authManager) listUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type userInfo struct {
-		Username  string     `json:"username"`
-		Role      string     `json:"role"`
-		Enabled   bool       `json:"enabled"`
-		CreatedAt time.Time  `json:"created_at"`
-		UpdatedAt time.Time  `json:"updated_at"`
-		LastLogin *time.Time `json:"last_login,omitempty"`
+		Username      string     `json:"username"`
+		Role          string     `json:"role"`
+		Enabled       bool       `json:"enabled"`
+		Email         string     `json:"email,omitempty"`
+		EmailVerified bool       `json:"email_verified"`
+		OTPEnabled    bool       `json:"otp_enabled"`
+		Passkeys      int        `json:"passkeys"`
+		CreatedAt     time.Time  `json:"created_at"`
+		UpdatedAt     time.Time  `json:"updated_at"`
+		LastLogin     *time.Time `json:"last_login,omitempty"`
 	}
 	items := make([]userInfo, 0, len(store.Users))
 	for _, user := range store.Users {
 		items = append(items, userInfo{
-			Username:  user.Username,
-			Role:      security.NormalizeRole(user.Role),
-			Enabled:   user.Enabled,
-			CreatedAt: user.CreatedAt,
-			UpdatedAt: user.UpdatedAt,
-			LastLogin: user.LastLogin,
+			Username:      user.Username,
+			Role:          security.NormalizeRole(user.Role),
+			Enabled:       user.Enabled,
+			Email:         user.Email,
+			EmailVerified: user.EmailVerified,
+			OTPEnabled:    user.MFA.OTPEnabled,
+			Passkeys:      len(user.MFA.Passkeys),
+			CreatedAt:     user.CreatedAt,
+			UpdatedAt:     user.UpdatedAt,
+			LastLogin:     user.LastLogin,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"users": items})
@@ -1340,6 +2186,10 @@ func (a *authManager) updateUser(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	a.revokeUserSessions(user.Username, "")
+	a.mu.Lock()
+	delete(a.loginAttempts, loginAccountKey(user.Username))
+	a.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"status": "updated"})
 }
 
@@ -1384,6 +2234,10 @@ func (a *authManager) resetUserPassword(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	a.revokeUserSessions(user.Username, "")
+	a.mu.Lock()
+	delete(a.loginAttempts, loginAccountKey(user.Username))
+	a.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"status": "updated"})
 }
 
@@ -1425,6 +2279,10 @@ func (a *authManager) deleteUser(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	a.revokeUserSessions(username, "")
+	a.mu.Lock()
+	delete(a.loginAttempts, loginAccountKey(username))
+	a.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted"})
 }
 
@@ -1448,9 +2306,8 @@ func (a *authManager) allowRemote(r *http.Request) bool {
 	}
 
 	if a.webAccess == "drop" {
-		if source, ok := requestSourceAddr(r); ok && !source.IsLoopback() {
-			return false
-		}
+		source, ok := requestSourceAddr(r)
+		return ok && source.IsLoopback()
 	}
 	if a.webAccess != "restricted" && a.webAccess != "allowlist" && a.webAccess != "drop" {
 		// Preserve the legacy behavior for direct zero-value authManager tests or
@@ -1539,6 +2396,14 @@ func loginSourceKey(r *http.Request) string {
 	return host
 }
 
+func loginAccountKey(username string) string {
+	username = strings.ToLower(strings.TrimSpace(username))
+	if username == "" || len(username) > 256 {
+		return ""
+	}
+	return "account:" + username
+}
+
 func randomToken() (string, error) {
 	var b [24]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -1554,78 +2419,176 @@ const loginPageHTML = `<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>{{.Title}}</title>
     <link rel="icon" type="image/svg+xml" href="/nodewall-mark.svg" />
-    <style>
+    <style>` + authBackdropCSS + `
+      :root{color-scheme:dark}
       *{box-sizing:border-box}
-      body{margin:0;min-height:100vh;display:grid;place-items:center;padding:16px;background:linear-gradient(135deg,#111827,#1f2937 55%,#7c2d12);font-family:"IBM Plex Sans",sans-serif;color:#f9fafb}
-      .card{width:min(420px,100%);max-width:420px;padding:28px;border-radius:24px;background:rgba(17,24,39,.82);box-shadow:0 24px 60px rgba(0,0,0,.32);border:1px solid rgba(255,255,255,.08)}
-      h1{margin:0 0 18px;font-size:2rem}
-      input,button{display:block;width:100%;max-width:100%;padding:13px 15px;border-radius:12px;border:none;font:inherit}
-      input{margin-bottom:10px;background:#f8fafc;color:#111827}
-      button{background:linear-gradient(90deg,#0f766e,#14b8a6);color:#fff;font-weight:600;cursor:pointer}
-      button:disabled{opacity:.65;cursor:wait}
-      .challenge{margin:4px 0 12px;padding:12px;border:1px solid rgba(255,255,255,.12);border-radius:14px;background:rgba(15,23,42,.62)}
-      .challenge-header{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
-      .challenge-label{margin:0;color:#cbd5e1;font-size:.88rem}
-      .captcha-refresh{width:auto;padding:5px 9px;border:1px solid rgba(255,255,255,.16);background:transparent;color:#cbd5e1;font-size:.8rem;font-weight:500}
-      .captcha-row{display:grid;grid-template-columns:166px minmax(0,1fr);gap:10px;align-items:center}
-      .captcha-row input{min-width:0;margin:0;padding:12px}
-      .captcha-image{display:block;width:166px;height:50px;max-width:100%;margin:0;border:1px solid rgba(255,255,255,.15);border-radius:8px;background:#e8eef5;object-fit:fill}
-      .trace-prompt{margin:0 0 8px;font-size:1rem;font-weight:650;letter-spacing:.02em}
-      .trace-image-wrap{position:relative;width:100%;margin:8px 0 4px;overflow:hidden;border:1px solid rgba(255,255,255,.12);border-radius:11px;background:#172033;aspect-ratio:320/150}
-      .trace-image{display:block;width:100%;height:100%;object-fit:fill;cursor:crosshair;touch-action:manipulation;user-select:none}
+      body{margin:0;min-height:100vh;background:#0a121d;color:#f8fafc;font-family:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+      .login-shell{position:relative;isolation:isolate;min-height:100vh;display:grid;grid-template-columns:minmax(300px,.9fr) minmax(420px,1.1fr);overflow:hidden}
+      .brand-panel{position:relative;display:flex;flex-direction:column;justify-content:space-between;min-height:100vh;padding:clamp(32px,6vw,80px)}
+      .brand-top,.brand-body,.brand-meta{position:relative;z-index:1}
+      .brand-top{display:flex;align-items:center;gap:14px}
+      .brand-mark{display:grid;place-items:center;width:54px;height:54px;padding:8px;border:1px solid rgba(94,234,212,.52);border-radius:16px;background:linear-gradient(145deg,rgba(15,118,110,.34),rgba(15,23,42,.16));box-shadow:0 0 0 7px rgba(20,184,166,.06),0 14px 34px rgba(20,184,166,.16),inset 0 1px 0 rgba(255,255,255,.12)}
+      .brand-mark img{display:block;width:100%;height:100%}
+      .brand-eyebrow{margin:0;color:#99f6e4;font-size:.8rem;letter-spacing:.16em;text-transform:uppercase}
+      .brand-name{margin:2px 0 0;font-size:1.4rem;letter-spacing:-.03em}
+      .brand-body{position:relative;max-width:400px;margin-top:auto;margin-bottom:auto;padding:42px 0 24px}
+      .brand-body:before{content:"";position:absolute;left:-26px;top:38px;width:2px;height:116px;border-radius:2px;background:linear-gradient(180deg,#5eead4,rgba(94,234,212,0));box-shadow:0 0 20px rgba(94,234,212,.55);opacity:.72}
+      .brand-subtitle{margin:0 0 16px;color:#cbd5e1;font-size:1rem;letter-spacing:.04em}
+      .brand-copy{margin:0;color:#e8fffc;font-size:clamp(1.65rem,2.6vw,2.8rem);font-weight:650;line-height:1.25;letter-spacing:-.04em;text-shadow:0 2px 24px rgba(45,212,191,.1)}
+      .brand-description{max-width:330px;margin:16px 0 0;color:#b8c7d5;font-size:.98rem;line-height:1.65}
+      .brand-signal{display:block;width:min(100%,360px);height:auto;margin:24px 0 0;overflow:visible;pointer-events:none}
+      .signal-wire{fill:none;stroke:url(#signal-wire-gradient);stroke-width:1.2}
+      .signal-node{fill:#102c3b;stroke:#67e8df;stroke-width:1.3}
+      .signal-pulse{fill:none;stroke:#5eead4;stroke-width:1;opacity:.3;animation:signalPulse 3.2s steps(4,end) infinite}
+      .signal-pulse-alt{animation-delay:-1.6s;stroke:#a5b4fc}
+      .login-shell:focus-within .signal-pulse{animation-play-state:paused}
+      .brand-meta{margin:0;color:#94a3b8;font-size:.82rem;line-height:1.5}
+      .login-main{position:relative;display:flex;align-items:center;justify-content:center;min-width:0;padding:clamp(24px,5vw,72px)}
+      .login-form{position:relative;z-index:1;isolation:isolate;width:min(100%,470px);margin:0;color:#f8fafc}
+      .login-form:before{content:"";position:absolute;z-index:-1;inset:-30px;pointer-events:none;border:1px solid transparent;border-radius:22px;background:linear-gradient(#101f2e,#0e1c2a) padding-box,linear-gradient(135deg,rgba(94,234,212,.65),rgba(56,189,248,.12) 43%,rgba(167,139,250,.42)) border-box;box-shadow:0 24px 64px rgba(2,6,23,.32),0 0 32px rgba(20,184,166,.035)}
+      .login-form:after{content:"";position:absolute;left:0;top:-30px;width:100px;height:2px;border-radius:2px;pointer-events:none;background:linear-gradient(90deg,transparent,#67e8df,transparent);box-shadow:0 0 12px rgba(94,234,212,.32)}
+      .login-heading{margin:0 0 22px}
+      .login-kicker{margin:0 0 8px;color:#5eead4;font-size:.82rem;font-weight:650;letter-spacing:.12em;text-transform:uppercase}
+      h2{margin:0;font-size:clamp(1.7rem,3vw,2.4rem);letter-spacing:-.04em}
+      .field-label{display:block;margin:0 0 8px;color:#cbd5e1;font-size:.84rem;font-weight:600}
+      .field{margin-bottom:16px}
+      input,button{display:block;width:100%;max-width:100%;padding:13px 15px;border-radius:10px;font:inherit}
+      input{border:1px solid #304357;background:#172536;color:#f8fafc;outline:none}
+      input::placeholder{color:#7890a2}
+      input:focus{border-color:#5eead4;background:#182b3e;box-shadow:0 0 0 3px rgba(45,212,191,.14)}
+      button{border:1px solid transparent;background:linear-gradient(100deg,#0f766e,#14b8a6);color:#fff;font-weight:700;cursor:pointer}
+      button:hover:not(:disabled){border-color:#5eead4}
+      button:disabled{opacity:.62;cursor:wait}
+      /* Reserve feedback inside the fixed challenge so errors cannot move the form. */
+      .challenge{display:grid;grid-template-rows:auto minmax(0,1fr) 36px;gap:10px;height:304px;min-height:304px;margin:16px 0 14px;padding:12px 14px;border:1px solid #304357;border-radius:12px;background:#0c1927}
+      .challenge-header{display:flex;align-items:center;justify-content:space-between;gap:12px}
+      .challenge-label{margin:0;color:#f8fafc;font-size:.93rem;font-weight:650}
+      .captcha-refresh{width:auto;padding:6px 10px;border-color:#3b5063;background:transparent;color:#cbd5e1;font-size:.78rem;font-weight:600}
+      .captcha-refresh:hover:not(:disabled){border-color:#5eead4;color:#99f6e4}
+      .captcha-content{min-width:0;min-height:0}
+      .captcha-content input{min-width:0;padding:12px}
+      .captcha-text{display:flex;flex-wrap:wrap;align-content:center;align-items:center;gap:12px}
+      .captcha-image{display:block;flex:none;width:min(100%,224px);height:auto;border:1px solid #304357;border-radius:9px;background:#e8eef5}
+      .captcha-entry{flex:1 1 156px;min-width:0}
+      .trace-content{display:grid;grid-template-rows:auto minmax(0,1fr) auto;gap:6px}
+      .trace-prompt{margin:0;color:#f8fafc;font-size:.9rem;font-weight:650;line-height:1.35}
+      .trace-image-wrap{position:relative;min-height:0;overflow:hidden;border:1px solid #304357;border-radius:10px;background:#172033}
+      .trace-image{display:block;width:100%;height:100%;object-fit:contain;cursor:crosshair;touch-action:manipulation;user-select:none}
       .trace-markers{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
-      .trace-markers polyline{fill:none;stroke:#5eead4;stroke-width:1.3;stroke-linecap:round;stroke-linejoin:round}
-      .trace-markers circle{fill:#0f766e;stroke:#99f6e4;stroke-width:.8}
-      .trace-markers text{fill:#fff;font:700 4px sans-serif;text-anchor:middle;dominant-baseline:central}
+      .trace-markers polyline{fill:none;stroke:url(#trace-selection-gradient);stroke-width:3.2;stroke-linecap:round;stroke-linejoin:round;filter:drop-shadow(0 1px 1px rgba(2,6,23,.5))}
+      .trace-markers circle{fill:#0f172a;stroke-width:3}
+      .trace-markers text{fill:#fff;font:700 14px sans-serif;text-anchor:middle;dominant-baseline:central;paint-order:stroke;stroke:#0f172a;stroke-width:2px}
+      .trace-markers .trace-marker-1{stroke:#22d3ee}
+      .trace-markers .trace-marker-2{stroke:#fbbf24}
+      .trace-markers .trace-marker-3{stroke:#f472b6}
+      .trace-markers .trace-marker-4{stroke:#a78bfa}
+      .trace-markers .trace-marker-5{stroke:#34d399}
       .trace-toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px}
-      .trace-status{min-height:1.25em;margin:4px 0 10px;color:#cbd5e1;font-size:.82rem}
-      .trace-reset{display:inline-flex;width:auto;padding:5px 9px;border:1px solid rgba(255,255,255,.16);background:transparent;color:#cbd5e1;font-size:.8rem;font-weight:500}
-      .error{margin:0 0 12px;color:#fca5a5;line-height:1.5;word-break:break-word}
-      .error:empty{display:none}
-      .locale{margin-top:12px;display:flex;align-items:center;gap:8px;color:#cbd5e1}
-      .locale select{background:#0f172a;color:#f8fafc;border:1px solid rgba(255,255,255,.16);padding:8px 10px;border-radius:10px}
-      @media(max-width:390px){.card{padding:22px}.captcha-row{grid-template-columns:132px minmax(0,1fr);gap:8px}.captcha-image{width:132px;height:40px}.captcha-row input{padding:11px}}
+      .trace-status{min-width:0;margin:0;color:#aabccc;font-size:.78rem;line-height:1.35}
+      .trace-reset{display:inline-flex;flex:none;width:auto;padding:6px 10px;border-color:#3b5063;background:transparent;color:#cbd5e1;font-size:.78rem;font-weight:600}
+      .error{min-height:0;overflow:auto;color:#fca5a5;font-size:.82rem;line-height:1.35;overflow-wrap:anywhere}
+      #login-submit{margin-top:2px;position:relative;border-color:rgba(94,234,212,.28);background:linear-gradient(105deg,#0d9488,#0891b2);box-shadow:inset 0 1px 0 rgba(255,255,255,.16),0 4px 18px rgba(8,145,178,.16)}
+      #login-submit:hover:not(:disabled){border-color:#99f6e4;background:linear-gradient(105deg,#0faaa0,#089ab9)}
+      .passkey-login{margin-top:10px;background:rgba(15,23,42,.18);border-color:rgba(94,234,212,.55);color:#99f6e4;box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}
+      .login-footer{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:24px;color:#94a3b8;font-size:.82rem}
+      .locale{display:flex;align-items:center;gap:8px}
+      .locale select{border:1px solid #304357;background:#172536;color:#f8fafc;padding:7px 10px;border-radius:8px;font:inherit}
+      .forgot-link{color:#99f6e4;text-decoration:none}
+      .forgot-link:hover{text-decoration:underline}
+      @keyframes signalPulse{0%,100%{opacity:.18}50%{opacity:.6}}
+      @media(prefers-reduced-motion:reduce){.signal-pulse{animation:none}}
+      @media(max-height:780px){.brand-signal{max-width:280px;margin-top:12px}.brand-body{padding:28px 0 18px}}
+      @media(max-width:820px){.login-shell{display:block}.brand-panel{min-height:270px;padding:28px 26px 29px}.brand-body{max-width:600px;margin:38px 0 24px;padding:0}.brand-body:before{left:-14px;top:14px;height:88px}.brand-copy{max-width:600px;font-size:clamp(1.35rem,5vw,1.9rem)}.brand-signal{display:none}.login-main{min-height:calc(100vh - 270px);padding:56px 38px 64px}.login-form:before{inset:-24px}.login-form:after{top:-24px}}
+      @media(max-width:430px){.login-main{padding:48px 28px 56px}.login-form:before{inset:-16px;border-radius:16px}.login-form:after{top:-16px}.challenge{height:284px;min-height:284px;padding-inline:10px}.login-footer{align-items:flex-start;flex-direction:column;gap:12px}}
     </style>
   </head>
   <body>
-    <form class="card" id="login-form" method="post" action="/login">
-      <h1>NodeWall</h1>
+    <div class="login-shell">
+      <aside class="brand-panel">
+        <div class="brand-top">
+          <div class="brand-mark" aria-hidden="true"><img src="/nodewall-mark.svg" alt="" /></div>
+          <div><p class="brand-eyebrow">NodeWall</p><p class="brand-name">{{.BrandSubtitle}}</p></div>
+        </div>
+        <div class="brand-body">
+          <p class="brand-subtitle">{{.BrandSubtitle}}</p>
+          <h1 class="brand-copy">{{.BrandCopy}}</h1>
+          <p class="brand-description">{{.BrandDescription}}</p>
+          <svg class="brand-signal" viewBox="0 0 360 228" aria-hidden="true" focusable="false">
+            <defs>
+              <linearGradient id="signal-wire-gradient" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#5eead4" stop-opacity=".7"/><stop offset=".55" stop-color="#38bdf8" stop-opacity=".24"/><stop offset="1" stop-color="#a78bfa" stop-opacity=".65"/></linearGradient>
+              <linearGradient id="signal-core-gradient" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#123e49"/><stop offset="1" stop-color="#18223f"/></linearGradient>
+              <radialGradient id="signal-field-gradient"><stop stop-color="#2dd4bf" stop-opacity=".12"/><stop offset="1" stop-color="#2dd4bf" stop-opacity="0"/></radialGradient>
+            </defs>
+            <ellipse cx="180" cy="114" rx="154" ry="104" fill="url(#signal-field-gradient)"/>
+            <g fill="none" stroke="url(#signal-wire-gradient)">
+              <ellipse cx="180" cy="114" rx="145" ry="77" transform="rotate(-12 180 114)" opacity=".45"/>
+              <path d="M180 20 262 67v94l-82 47-82-47V67Z" opacity=".28"/>
+              <path d="M180 41 244 78v73l-64 37-64-37V78Z" stroke-dasharray="3 8" opacity=".45"/>
+            </g>
+            <g class="signal-wire">
+              <path d="M35 114h51l35-35h34M77 45l31 32M282 47l-38 31h-37M324 145h-55l-31-31h-24M280 201l-39-39h-33M91 195l37-37h28"/>
+              <path d="M145 71h-9V59M215 71h9V59M145 157h-9v12M215 157h9v12" stroke-width="2"/>
+            </g>
+            <path d="m180 65 39 16v35c0 27-21 43-39 52-18-9-39-25-39-52V81Z" fill="url(#signal-core-gradient)" stroke="#5eead4" stroke-opacity=".6"/>
+            <image href="/nodewall-mark.svg" x="155" y="86" width="50" height="60"/>
+            <g class="signal-node"><circle cx="35" cy="114" r="4"/><circle cx="77" cy="45" r="3"/><circle cx="282" cy="47" r="4"/><circle cx="324" cy="145" r="3"/><circle cx="280" cy="201" r="4"/><circle cx="91" cy="195" r="3"/></g>
+            <circle class="signal-pulse" cx="35" cy="114" r="9"/>
+            <circle class="signal-pulse signal-pulse-alt" cx="280" cy="201" r="9"/>
+          </svg>
+        </div>
+        <p class="brand-meta">{{.BrandMeta}}</p>
+      </aside>
+      <main class="login-main">
+        <form class="login-form" id="login-form" method="post" action="/login" data-retry-after="{{.RetryAfter}}">
+          <div class="login-heading"><p class="login-kicker">{{.BrandSubtitle}}</p><h2>{{.Title}}</h2></div>
       <input type="hidden" name="locale" value="{{.Locale}}" />
       <input type="hidden" name="captcha_id" id="login-captcha-id" value="{{.Captcha.ID}}" />
-      <input type="text" name="username" value="{{.Username}}" placeholder="{{.UsernamePlaceholder}}" autocomplete="username" autofocus required />
-      <input type="password" name="password" placeholder="{{.PasswordPlaceholder}}" autocomplete="current-password" required />
-      <div class="error" id="login-error" role="alert" aria-live="polite">{{if eq .ErrorKey "loginErrorInvalidForm"}}{{.LoginErrorInvalidForm}}{{else if eq .ErrorKey "loginErrorLocked"}}{{.LoginErrorLocked}}{{else if eq .ErrorKey "loginErrorInvalidCredentials"}}{{.LoginErrorInvalidCreds}}{{else if eq .ErrorKey "loginErrorCaptcha"}}{{.LoginErrorCaptcha}}{{else if eq .ErrorKey "loginErrorSessionCreate"}}{{.LoginErrorSessionCreate}}{{end}}</div>
-      <section class="challenge" id="login-challenge" aria-label="{{.CaptchaLabel}}">
+          <div class="field"><label class="field-label" for="login-username">{{.UsernamePlaceholder}}</label><input id="login-username" type="text" name="username" value="{{.Username}}" placeholder="{{.UsernamePlaceholder}}" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" autofocus required /></div>
+          <div class="field"><label class="field-label" for="login-password">{{.PasswordPlaceholder}}</label><input id="login-password" type="password" name="password" placeholder="{{.PasswordPlaceholder}}" autocomplete="current-password" autocapitalize="none" autocorrect="off" spellcheck="false" required /></div>
+      <section class="challenge" id="login-challenge" data-expires-in="{{.Captcha.ExpiresIn}}" aria-label="{{.CaptchaLabel}}">
         <div class="challenge-header"><p class="challenge-label">{{.CaptchaLabel}}</p><button class="captcha-refresh" id="captcha-refresh" type="button">{{.CaptchaRefresh}}</button></div>
         {{if or (eq .Captcha.Kind "math") (eq .Captcha.Kind "letters")}}
-          <div class="captcha-row">
-            <img class="captcha-image" data-kind="{{.Captcha.Kind}}" src="{{.Captcha.Image}}" alt="验证码图片" />
-            <input type="text" id="captcha-answer" name="captcha_answer" {{if eq .Captcha.Kind "math"}}inputmode="numeric" pattern="[0-9]+"{{else}}autocapitalize="characters" spellcheck="false"{{end}} placeholder="{{.CaptchaPlaceholder}}" autocomplete="off" required />
+          <div class="captcha-content captcha-text" id="captcha-content">
+            <img class="captcha-image" data-kind="{{.Captcha.Kind}}" src="{{.Captcha.Image}}" alt="{{.CaptchaImageAlt}}" width="240" height="72" />
+            <div class="captcha-entry">
+              <label class="field-label" for="captcha-answer">{{if eq .Captcha.Kind "math"}}{{.CaptchaMathLabel}}{{else}}{{.CaptchaLettersLabel}}{{end}}</label>
+              <input type="text" id="captcha-answer" name="captcha_answer" maxlength="12" {{if eq .Captcha.Kind "math"}}inputmode="numeric" placeholder="{{.CaptchaMathPlaceholder}}"{{else}}autocapitalize="characters" spellcheck="false" inputmode="text" placeholder="{{.CaptchaPlaceholder}}"{{end}} autocomplete="off" required />
+            </div>
           </div>
         {{else}}
-          <p class="trace-prompt">{{.Captcha.Prompt}}</p>
-          <div class="trace-image-wrap">
-            <img class="trace-image" id="trace-image" src="{{.Captcha.Image}}" alt="{{.CaptchaTraceHint}}" draggable="false" />
-            <svg class="trace-markers" id="trace-markers" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"><polyline points=""></polyline></svg>
+          <div class="captcha-content trace-content" id="captcha-content">
+            <p class="trace-prompt" tabindex="-1">{{.Captcha.Prompt}}</p>
+            <div class="trace-image-wrap">
+              <img class="trace-image" id="trace-image" src="{{.Captcha.Image}}" alt="{{.CaptchaTraceHint}}" draggable="false" />
+              <svg class="trace-markers" id="trace-markers" viewBox="0 0 320 150" preserveAspectRatio="xMidYMid meet" aria-hidden="true"><defs><linearGradient id="trace-selection-gradient" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#22d3ee"/><stop offset=".48" stop-color="#fbbf24"/><stop offset="1" stop-color="#f472b6"/></linearGradient></defs><polyline points=""></polyline></svg>
+            </div>
+            <div class="trace-toolbar"><p class="trace-status" id="trace-status" aria-live="polite">{{.CaptchaTraceHint}}</p><button class="trace-reset" id="trace-reset" type="button">{{.CaptchaTraceReset}}</button></div>
+            <input type="hidden" id="captcha-answer" name="captcha_answer" />
           </div>
-          <div class="trace-toolbar"><p class="trace-status" id="trace-status" aria-live="polite">{{.CaptchaTraceHint}}</p><button class="trace-reset" id="trace-reset" type="button">{{.CaptchaTraceReset}}</button></div>
-          <input type="hidden" id="captcha-answer" name="captcha_answer" />
         {{end}}
+        <div class="error" id="login-error" role="alert" aria-live="polite">{{if eq .ErrorKey "loginErrorInvalidForm"}}{{.LoginErrorInvalidForm}}{{else if eq .ErrorKey "loginErrorLocked"}}{{.LoginErrorLocked}}{{else if eq .ErrorKey "loginErrorInvalidCredentials"}}{{.LoginErrorInvalidCreds}}{{else if eq .ErrorKey "loginErrorCaptcha"}}{{.LoginErrorCaptcha}}{{else if eq .ErrorKey "loginErrorCaptchaExpired"}}{{.LoginErrorCaptchaExpired}}{{else if eq .ErrorKey "loginErrorCaptchaSourceChanged"}}{{.LoginErrorCaptchaSourceChanged}}{{else if eq .ErrorKey "loginErrorMFA"}}{{.LoginErrorMFA}}{{else if eq .ErrorKey "loginErrorSessionCreate"}}{{.LoginErrorSessionCreate}}{{end}}</div>
       </section>
       <button type="submit" id="login-submit">{{.Submit}}</button>
-      <div class="locale">
-        <label for="login-locale">{{.LocaleLabel}}</label>
-        <select id="login-locale" onchange="window.location.href='/login?lang='+encodeURIComponent(this.value)">
-          <option value="zh-CN" {{if eq .Locale "zh-CN"}}selected{{end}}>{{.LocaleChinese}}</option>
-          <option value="en-US" {{if eq .Locale "en-US"}}selected{{end}}>{{.LocaleEnglish}}</option>
-        </select>
-      </div>
-    </form>
+      {{if .PasskeyEnabled}}<button type="button" id="passkey-login" class="passkey-login">{{.PasskeyLogin}}</button>{{end}}
+          <div class="login-footer"><div class="locale"><label for="login-locale">{{.LocaleLabel}}</label><select id="login-locale" onchange="window.location.href='/login?lang='+encodeURIComponent(this.value)"><option value="zh-CN" {{if eq .Locale "zh-CN"}}selected{{end}}>{{.LocaleChinese}}</option><option value="en-US" {{if eq .Locale "en-US"}}selected{{end}}>{{.LocaleEnglish}}</option></select></div><a class="forgot-link" href="/login/forgot?lang={{.Locale}}">{{.ForgotLink}}</a></div>
+        </form>
+      </main>
+    </div>
     <script>
       (() => {
         const form = document.getElementById('login-form');
-        const traceHint = {{printf "%q" .CaptchaTraceHint}};
-        const traceDone = {{printf "%q" .CaptchaTraceDone}};
+        const traceHint = {{.CaptchaTraceHint}};
+        const traceDone = {{.CaptchaTraceDone}};
+        const passkeyUnavailable = {{.PasskeyLoginUnavailable}};
+        const passkeyFailed = {{.PasskeyLoginFailed}};
+        const passkeyOrigin = {{.PasskeyLoginOrigin}};
+        const passkeyDisabled = {{.PasskeyLoginDisabled}};
+        const passkeyUnsupported = {{.PasskeyLoginUnsupported}};
+        const usernamePlaceholder = {{.UsernamePlaceholder}};
+        const captchaRefreshFailed = {{.CaptchaRefreshFailed}};
+        const loginRequestFailed = {{.LoginRequestFailed}};
+        const loginNetworkFailed = {{.LoginNetworkFailed}};
+        const captchaExpiredMessage = {{.LoginErrorCaptchaExpired}};
         const formError = form.querySelector('#login-error');
         const setupTrace = (root) => {
           const image = root.querySelector('#trace-image');
@@ -1637,6 +2600,23 @@ const loginPageHTML = `<!DOCTYPE html>
           const resetButton = root.querySelector('#trace-reset');
           const clicks = [];
           const ns = 'http://www.w3.org/2000/svg';
+          const traceWidth = 320;
+          const traceHeight = 150;
+          // The SVG keeps its 320x150 aspect ratio inside the responsive
+          // image box. Use that inner rendered rectangle for hit testing so
+          // letterboxing does not shift every horizontal click.
+          const traceContentRect = () => {
+            const rect = image.getBoundingClientRect();
+            const scale = Math.min(rect.width / traceWidth, rect.height / traceHeight);
+            const width = traceWidth * scale;
+            const height = traceHeight * scale;
+            return {
+              left: rect.left + (rect.width - width) / 2,
+              top: rect.top + (rect.height - height) / 2,
+              width,
+              height,
+            };
+          };
           const reset = () => {
             clicks.length = 0;
             answer.value = '';
@@ -1646,23 +2626,27 @@ const loginPageHTML = `<!DOCTYPE html>
           };
           const addMarker = (point, index) => {
             const circle = document.createElementNS(ns, 'circle');
-            circle.setAttribute('cx', point.x);
-            circle.setAttribute('cy', point.y);
-            circle.setAttribute('r', '3.2');
+            circle.setAttribute('cx', point.markerX);
+            circle.setAttribute('cy', point.markerY);
+            circle.setAttribute('r', '9');
+            circle.classList.add('trace-marker-' + (index + 1));
             const label = document.createElementNS(ns, 'text');
-            label.setAttribute('x', point.x);
-            label.setAttribute('y', point.y);
+            label.setAttribute('x', point.markerX);
+            label.setAttribute('y', point.markerY);
+            label.classList.add('trace-marker-' + (index + 1));
             label.textContent = String(index + 1);
             overlay.append(circle, label);
           };
           image.addEventListener('click', (event) => {
+            const rect = traceContentRect();
+            if (!rect.width || !rect.height) return;
+            const x = (event.clientX - rect.left) / rect.width * 100;
+            const y = (event.clientY - rect.top) / rect.height * 100;
+            if (x < 0 || x > 100 || y < 0 || y > 100) return;
             if (clicks.length === 5) reset();
-            const rect = image.getBoundingClientRect();
-            const x = Math.max(0, Math.min(100, (event.clientX - rect.left) / rect.width * 100));
-            const y = Math.max(0, Math.min(100, (event.clientY - rect.top) / rect.height * 100));
-            const point = { x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) };
+            const point = { x: Number(x.toFixed(2)), y: Number(y.toFixed(2)), markerX: Number((x * traceWidth / 100).toFixed(2)), markerY: Number((y * traceHeight / 100).toFixed(2)) };
             clicks.push(point);
-            line.setAttribute('points', clicks.map((item) => item.x + ',' + item.y).join(' '));
+            line.setAttribute('points', clicks.map((item) => item.markerX + ',' + item.markerY).join(' '));
             addMarker(point, clicks.length - 1);
             answer.value = clicks.map((item) => item.x.toFixed(2) + ',' + item.y.toFixed(2)).join(';');
             if (clicks.length === 5) {
@@ -1674,33 +2658,68 @@ const loginPageHTML = `<!DOCTYPE html>
           resetButton.addEventListener('click', reset);
         };
 
+        let requestPending = false;
+        let captchaUnavailable = false;
+        let captchaDeadline = 0;
+        const retryDeadlines = { submit: 0, refresh: 0 };
+        const updateControls = () => {
+          const now = Date.now();
+          form.querySelector('#login-submit').disabled = requestPending || captchaUnavailable || now < retryDeadlines.submit;
+          form.querySelector('#captcha-refresh').disabled = requestPending || now < retryDeadlines.refresh;
+        };
+        const resetChallengeDeadline = (challenge) => {
+          const seconds = Number(challenge.dataset.expiresIn) || 0;
+          captchaDeadline = Date.now() + seconds * 1000;
+          captchaUnavailable = false;
+        };
+        const applyFormCooldown = (page) => {
+          const seconds = Number(page.querySelector('#login-form')?.dataset.retryAfter);
+          if (!Number.isFinite(seconds) || seconds < 1) return;
+          retryDeadlines.submit = retryDeadlines.refresh = Date.now() + seconds * 1000;
+          window.setTimeout(updateControls, seconds * 1000);
+        };
         const replaceChallenge = (page) => {
           const nextChallenge = page.querySelector('#login-challenge');
+          const nextContent = page.querySelector('#captcha-content');
           const nextID = page.querySelector('#login-captcha-id');
-          if (!nextChallenge || !nextID) return false;
+          if (!nextChallenge || !nextContent || !nextID?.value) return false;
           form.querySelector('#login-captcha-id').value = nextID.value;
-          form.querySelector('#login-challenge').replaceWith(nextChallenge);
-          const nextUsername = page.querySelector('[name="username"]');
-          if (nextUsername && nextUsername.value !== '') form.querySelector('[name="username"]').value = nextUsername.value;
+          form.querySelector('#captcha-content').replaceWith(nextContent);
           setupTrace(form);
+          resetChallengeDeadline(nextChallenge);
+          applyFormCooldown(page);
           return true;
         };
+        const focusChallenge = () => {
+          form.querySelector('.trace-prompt, #captcha-answer:not([type="hidden"])')?.focus({ preventScroll: true });
+        };
 
-        const deferRetry = (button, response) => {
+        const deferRetry = (action, response) => {
           if (response.status !== 429) return false;
           const seconds = Number.parseInt(response.headers.get('Retry-After') || '', 10);
           if (!Number.isFinite(seconds) || seconds < 1) return false;
-          button.disabled = true;
-          window.setTimeout(() => { button.disabled = false; }, seconds * 1000);
+          retryDeadlines[action] = Date.now() + seconds * 1000;
+          window.setTimeout(updateControls, seconds * 1000);
           return true;
         };
 
         setupTrace(form);
-        form.addEventListener('click', async (event) => {
-          const button = event.target.closest('#captcha-refresh');
-          if (!button) return;
-          button.disabled = true;
-          let cooldown = false;
+        resetChallengeDeadline(form.querySelector('#login-challenge'));
+        applyFormCooldown(document);
+        updateControls();
+        window.addEventListener('pageshow', (event) => {
+          if (!event.persisted) return;
+          // A history-restored image may have been consumed on the server.
+          captchaDeadline = 0;
+          captchaUnavailable = false;
+          updateControls();
+        });
+        const refreshChallenge = async (message = '') => {
+          if (requestPending || Date.now() < retryDeadlines.refresh) return;
+          // Refresh invalidates the current server-side ID. Keep it mutually
+          // exclusive with login, including Enter and programmatic submits.
+          requestPending = true;
+          updateControls();
           try {
             const locale = form.querySelector('[name="locale"]').value;
             const response = await fetch('/login/captcha/refresh?lang=' + encodeURIComponent(locale), {
@@ -1711,28 +2730,39 @@ const loginPageHTML = `<!DOCTYPE html>
             });
             const body = await response.text();
             if (!response.ok) {
-              cooldown = deferRetry(button, response);
-              formError.textContent = body.trim() || '验证码暂时无法切换，请稍后重试。';
+              deferRetry('refresh', response);
+              if (response.status !== 429) captchaUnavailable = true;
+              formError.textContent = body.trim() || captchaRefreshFailed;
               return;
             }
             const page = new DOMParser().parseFromString(body, 'text/html');
             if (!replaceChallenge(page)) {
-              formError.textContent = '验证码刷新失败，请重试。';
+              captchaUnavailable = true;
+              formError.textContent = captchaRefreshFailed;
               return;
             }
-            formError.textContent = '';
+            formError.textContent = page.querySelector('#login-error')?.textContent.trim() || message;
+            if (message) focusChallenge();
           } catch (_) {
-            formError.textContent = '验证码刷新失败，请检查网络后重试。';
+            captchaUnavailable = true;
+            formError.textContent = loginNetworkFailed;
           } finally {
-            if (!cooldown) button.disabled = false;
+            requestPending = false;
+            updateControls();
           }
+        };
+        form.addEventListener('click', (event) => {
+          if (event.target.closest('#captcha-refresh')) return refreshChallenge();
         });
 
         form.addEventListener('submit', async (event) => {
           event.preventDefault();
-          const submit = form.querySelector('#login-submit');
-          submit.disabled = true;
-          let cooldown = false;
+          if (requestPending || captchaUnavailable || Date.now() < retryDeadlines.submit) return;
+          // An expired image needs a new answer. Only send its ID to refresh,
+          // and let the next explicit submit send the password with that answer.
+          if (Date.now() >= captchaDeadline) return refreshChallenge(captchaExpiredMessage);
+          requestPending = true;
+          updateControls();
           try {
             const response = await fetch(form.action, {
               method: 'POST',
@@ -1740,29 +2770,121 @@ const loginPageHTML = `<!DOCTYPE html>
               credentials: 'same-origin',
               redirect: 'follow'
             });
-            if (response.redirected && new URL(response.url).pathname !== '/login') {
-              window.location.assign('/');
-              return;
+            if (response.redirected) {
+              const redirectedPath = new URL(response.url).pathname;
+              if (redirectedPath === '/login/otp') {
+                captchaUnavailable = true;
+                window.location.assign(response.url);
+                return;
+              }
+              if (redirectedPath !== '/login') {
+                captchaUnavailable = true;
+                window.location.assign('/');
+                return;
+              }
             }
             const body = await response.text();
             if (!response.ok) {
-              cooldown = deferRetry(submit, response);
-              formError.textContent = body.trim() || '登录请求过于频繁，请稍后重试。';
+              deferRetry('submit', response);
+              if (response.status !== 429) captchaUnavailable = true;
+              formError.textContent = body.trim() || loginRequestFailed;
               return;
             }
             const page = new DOMParser().parseFromString(body, 'text/html');
             if (!replaceChallenge(page)) {
-              formError.textContent = '登录请求失败，请重试。';
+              captchaUnavailable = true;
+              formError.textContent = loginRequestFailed;
               return;
             }
             formError.textContent = page.querySelector('#login-error')?.textContent.trim() || '';
+            focusChallenge();
           } catch (_) {
-            HTMLFormElement.prototype.submit.call(form);
+            // The server may have consumed this one-time challenge even when
+            // the response was lost. Never silently replay a password POST.
+            captchaUnavailable = true;
+            formError.textContent = loginNetworkFailed;
           } finally {
-            if (!cooldown) submit.disabled = false;
+            requestPending = false;
+            updateControls();
+          }
+        });
+
+        const passkeyButton = form.querySelector('#passkey-login');
+        const passkeyBytes = (value) => {
+          const normalized = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+          const binary = window.atob(normalized + '='.repeat((4 - normalized.length % 4) % 4));
+          return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+        };
+        const passkeyBase64 = (value) => {
+          const bytes = value instanceof ArrayBuffer ? new Uint8Array(value) : new Uint8Array(value || []);
+          let binary = '';
+          bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+          return window.btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+        };
+        const passkeyOptions = (payload) => {
+          const options = JSON.parse(JSON.stringify(payload.publicKey || payload));
+          if (options.challenge) options.challenge = passkeyBytes(options.challenge);
+          (options.allowCredentials || []).forEach((item) => { if (item.id) item.id = passkeyBytes(item.id); });
+          return options;
+        };
+        const passkeyResponse = (credential) => {
+          const response = credential.response || {};
+          const result = { id: credential.id, rawId: passkeyBase64(response.rawId), type: credential.type, response: {} };
+          ['clientDataJSON', 'authenticatorData', 'signature', 'userHandle'].forEach((key) => { if (response[key]) result.response[key] = passkeyBase64(response[key]); });
+          return result;
+        };
+        passkeyButton?.addEventListener('click', async () => {
+          if (!window.PublicKeyCredential || !navigator.credentials) {
+            formError.textContent = passkeyUnsupported;
+            return;
+          }
+          const hostname = String(window.location.hostname || '');
+          if (!window.isSecureContext || /^(?:\d{1,3}\.){3}\d{1,3}$/.test(hostname)) {
+            formError.textContent = passkeyOrigin;
+            return;
+          }
+          const username = form.querySelector('[name="username"]').value.trim();
+          if (!username) {
+            formError.textContent = usernamePlaceholder;
+            return;
+          }
+          passkeyButton.disabled = true;
+          try {
+            const optionsResponse = await fetch('/auth/passkey/login/options', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username }), credentials: 'same-origin' });
+            const optionsBody = await optionsResponse.json();
+            if (!optionsResponse.ok) {
+              const raw = String(optionsBody.error || '').toLowerCase();
+              throw new Error(raw.includes('passkey login is unavailable') ? passkeyUnavailable : (raw.includes('passkey is disabled') ? passkeyDisabled : (raw.includes('dns host') || raw.includes('https origin') ? passkeyOrigin : passkeyFailed)));
+            }
+            let credential;
+            try {
+              credential = await navigator.credentials.get({ publicKey: passkeyOptions(optionsBody) });
+            } catch (error) {
+              const name = String(error?.name || '');
+              if (name === 'SecurityError' || name === 'NotSupportedError') throw new Error(passkeyOrigin);
+              throw error;
+            }
+            if (!credential) throw new Error(passkeyFailed);
+            const verifyResponse = await fetch('/auth/passkey/login/verify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(passkeyResponse(credential)), credentials: 'same-origin' });
+            if (!verifyResponse.ok) {
+              const verifyBody = await verifyResponse.json().catch(() => ({}));
+              throw new Error(passkeyFailed);
+            }
+            window.location.assign('/');
+          } catch (error) {
+            const raw = String(error?.message || '').toLowerCase();
+            const localized = error?.message === passkeyUnavailable || error?.message === passkeyOrigin || error?.message === passkeyDisabled || error?.message === passkeyFailed;
+            formError.textContent = raw.includes('passkey login is unavailable') ? passkeyUnavailable : (localized ? error.message : passkeyFailed);
+          } finally {
+            passkeyButton.disabled = false;
           }
         });
       })();
     </script>
   </body>
 </html>`
+
+const loginOTPHTML = `<!DOCTYPE html>
+<html lang="{{.Locale}}"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>{{.Title}}</title><style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:16px;background:linear-gradient(135deg,#111827,#1f2937 55%,#7c2d12);font-family:"IBM Plex Sans",sans-serif;color:#f9fafb}.card{width:min(440px,100%);padding:28px;border-radius:24px;background:rgba(17,24,39,.9);box-shadow:0 24px 60px rgba(0,0,0,.32);border:1px solid rgba(255,255,255,.08)}h1{margin:0 0 12px;font-size:1.7rem}.hint{margin:0 0 18px;color:#cbd5e1;line-height:1.5}.message{min-height:1.4em;margin:0 0 12px;color:#fca5a5;line-height:1.4}input,button{display:block;width:100%;padding:13px 15px;margin:0 0 10px;border-radius:12px;border:none;font:inherit}input{background:#f8fafc;color:#111827}button{background:linear-gradient(90deg,#0f766e,#14b8a6);color:#fff;font-weight:600;cursor:pointer}.back{display:block;margin-top:12px;color:#99f6e4;text-align:center}
+</style></head><body><main class="card"><h1>{{.Title}}</h1><p class="hint">{{.Hint}}</p><p class="message" role="alert">{{.Error}}</p><form id="login-otp-form" method="post" action="/login/otp"><input type="hidden" name="locale" value="{{.Locale}}"/><input name="otp_code" inputmode="numeric" autocomplete="one-time-code" placeholder="{{.Code}}" autofocus required/><button type="submit">{{.Submit}}</button></form><a class="back" href="/login?lang={{.Locale}}">{{.Back}}</a></main></body></html>`

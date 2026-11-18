@@ -4,9 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
+
+	"nodewall/internal/securestore"
 )
 
 const (
@@ -16,13 +17,35 @@ const (
 )
 
 type UserRecord struct {
-	Username  string         `json:"username"`
-	Role      string         `json:"role"`
-	Enabled   bool           `json:"enabled"`
-	Password  PasswordRecord `json:"password"`
-	CreatedAt time.Time      `json:"created_at"`
-	UpdatedAt time.Time      `json:"updated_at"`
-	LastLogin *time.Time     `json:"last_login,omitempty"`
+	Username      string         `json:"username"`
+	Role          string         `json:"role"`
+	Enabled       bool           `json:"enabled"`
+	Email         string         `json:"email,omitempty"`
+	EmailVerified bool           `json:"email_verified,omitempty"`
+	MFA           MFAMethods     `json:"mfa,omitempty"`
+	Password      PasswordRecord `json:"password"`
+	CreatedAt     time.Time      `json:"created_at"`
+	UpdatedAt     time.Time      `json:"updated_at"`
+	LastLogin     *time.Time     `json:"last_login,omitempty"`
+}
+
+// MFAMethods is kept inside the encrypted user store. OTP secrets are never
+// returned by API responses; passkey records contain only public credential
+// material and ceremony metadata, never an authenticator private key.
+type MFAMethods struct {
+	OTPSecret          string              `json:"otp_secret,omitempty"`
+	OTPEnabled         bool                `json:"otp_enabled,omitempty"`
+	OTPVerifiedAt      *time.Time          `json:"otp_verified_at,omitempty"`
+	RecoveryCodeHashes []string            `json:"recovery_code_hashes,omitempty"`
+	Passkeys           []PasskeyCredential `json:"passkeys,omitempty"`
+}
+
+type PasskeyCredential struct {
+	ID             string     `json:"id"`
+	Name           string     `json:"name,omitempty"`
+	CredentialJSON string     `json:"credential_json"`
+	CreatedAt      time.Time  `json:"created_at"`
+	LastUsedAt     *time.Time `json:"last_used_at,omitempty"`
 }
 
 type UserStore struct {
@@ -51,7 +74,7 @@ func (s *UserStore) Find(username string) (*UserRecord, int) {
 }
 
 func LoadUserStore(path string) (UserStore, error) {
-	data, err := os.ReadFile(path)
+	data, encrypted, recovered, err := securestore.ReadValid(path, validateUserPayload)
 	if err != nil {
 		return UserStore{}, err
 	}
@@ -64,6 +87,11 @@ func LoadUserStore(path string) (UserStore, error) {
 				store.Users[i].Username = "admin"
 			}
 		}
+		if encrypted || recovered {
+			if err := SaveUserStore(path, store); err != nil {
+				return UserStore{}, err
+			}
+		}
 		return store, nil
 	}
 
@@ -71,7 +99,7 @@ func LoadUserStore(path string) (UserStore, error) {
 	var legacy PasswordRecord
 	if err := json.Unmarshal(data, &legacy); err == nil && legacy.Hash != "" {
 		now := time.Now().UTC()
-		return UserStore{
+		store := UserStore{
 			Users: []UserRecord{{
 				Username:  "admin",
 				Role:      RoleAdmin,
@@ -80,21 +108,36 @@ func LoadUserStore(path string) (UserStore, error) {
 				CreatedAt: now,
 				UpdatedAt: now,
 			}},
-		}, nil
+		}
+		if encrypted || recovered {
+			if err := SaveUserStore(path, store); err != nil {
+				return UserStore{}, err
+			}
+		}
+		return store, nil
 	}
 
 	return UserStore{}, errors.New("invalid user store format")
 }
 
 func SaveUserStore(path string, store UserStore) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(store, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	return securestore.Write(path, data, 0o600)
+}
+
+func validateUserPayload(data []byte) error {
+	var store UserStore
+	if err := json.Unmarshal(data, &store); err == nil && len(store.Users) > 0 {
+		return nil
+	}
+	var legacy PasswordRecord
+	if err := json.Unmarshal(data, &legacy); err == nil && strings.TrimSpace(legacy.Hash) != "" {
+		return nil
+	}
+	return errors.New("invalid user store format")
 }
 
 func EnsureAdminUser(path, username, password string) error {

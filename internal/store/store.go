@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"nodewall/internal/models"
+	"nodewall/internal/securestore"
 )
 
 var errPolicyNotFound = errors.New("policy not found")
@@ -23,6 +23,7 @@ type Store struct {
 	policies   map[string]models.InterfacePolicy
 	recoveries map[string]PolicyRecovery
 	history    map[string][]models.PublishRecord
+	events     map[string]models.EventDisposition
 	path       string
 }
 
@@ -32,6 +33,7 @@ func New() *Store {
 		policies:   make(map[string]models.InterfacePolicy),
 		recoveries: make(map[string]PolicyRecovery),
 		history:    make(map[string][]models.PublishRecord),
+		events:     make(map[string]models.EventDisposition),
 	}
 }
 
@@ -39,7 +41,10 @@ func NewPersistent(path string) (*Store, error) {
 	st := New()
 	st.path = path
 	if err := st.load(); err != nil {
-		return nil, err
+		// Keep the path on the empty store so the next successful mutation can
+		// replace a damaged primary with a durable snapshot. Callers may choose
+		// to surface the load error while still keeping the control plane alive.
+		return st, err
 	}
 	return st, nil
 }
@@ -72,6 +77,12 @@ func (s *Store) UpsertNodeChecked(_ context.Context, node models.Node) error {
 		}
 		if strings.TrimSpace(node.AgentHTTPAddr) == "" {
 			node.AgentHTTPAddr = existing.AgentHTTPAddr
+		}
+		if strings.TrimSpace(node.ServerHTTPAddr) == "" {
+			node.ServerHTTPAddr = existing.ServerHTTPAddr
+		}
+		if strings.TrimSpace(node.PackageVersion) == "" {
+			node.PackageVersion = existing.PackageVersion
 		}
 		if node.SSH == nil {
 			node.SSH = existing.SSH
@@ -142,8 +153,78 @@ func (s *Store) DeleteNode(_ context.Context, nodeID string) bool {
 			delete(s.history, key)
 		}
 	}
+	for key, event := range s.events {
+		if event.NodeID == nodeID {
+			delete(s.events, key)
+		}
+	}
 	_ = s.saveLocked()
 	return true
+}
+
+func eventDispositionKey(nodeID, eventID string) string {
+	return strings.TrimSpace(nodeID) + "\x00" + strings.TrimSpace(eventID)
+}
+
+// ListEventDispositions returns a stable snapshot so an SSE request or API
+// response never holds the store lock while encoding a potentially large list.
+func (s *Store) ListEventDispositions(_ context.Context, nodeID string) []models.EventDisposition {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	result := make([]models.EventDisposition, 0, len(s.events))
+	for _, event := range s.events {
+		if strings.TrimSpace(nodeID) != "" && event.NodeID != strings.TrimSpace(nodeID) {
+			continue
+		}
+		result = append(result, event)
+	}
+	sort.SliceStable(result, func(i, j int) bool {
+		if result[i].UpdatedAt.Equal(result[j].UpdatedAt) {
+			return eventDispositionKey(result[i].NodeID, result[i].EventID) < eventDispositionKey(result[j].NodeID, result[j].EventID)
+		}
+		return result[i].UpdatedAt.Before(result[j].UpdatedAt)
+	})
+	return result
+}
+
+// UpsertEventDisposition is idempotent for repeated browser retries. The
+// latest server timestamp wins, while the previous value is restored if the
+// durable snapshot cannot be written.
+func (s *Store) UpsertEventDisposition(_ context.Context, event models.EventDisposition) (models.EventDisposition, error) {
+	event.NodeID = strings.TrimSpace(event.NodeID)
+	event.EventID = strings.TrimSpace(event.EventID)
+	event.Source = strings.TrimSpace(event.Source)
+	if event.UpdatedAt.IsZero() {
+		event.UpdatedAt = time.Now().UTC()
+	} else {
+		event.UpdatedAt = event.UpdatedAt.UTC()
+	}
+	if event.Status == "" {
+		event.Status = models.EventDispositionOpen
+	}
+	key := eventDispositionKey(event.NodeID, event.EventID)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous, existed := s.events[key]
+	if event.Status == models.EventDispositionOpen {
+		delete(s.events, key)
+	} else {
+		s.events[key] = event
+	}
+	if err := s.saveLocked(); err != nil {
+		if existed {
+			s.events[key] = previous
+		} else {
+			delete(s.events, key)
+		}
+		return models.EventDisposition{}, err
+	}
+	if event.Status == models.EventDispositionOpen {
+		return event, nil
+	}
+	return event, nil
 }
 
 func (s *Store) ListNodes(_ context.Context) []models.Node {
@@ -307,17 +388,71 @@ func (s *Store) ListPolicyInterfaces(_ context.Context, nodeID string) []string 
 }
 
 type persistedState struct {
-	Recoveries map[string]PolicyRecovery         `json:"policy_recoveries,omitempty"`
-	Nodes      map[string]models.Node            `json:"nodes"`
-	Policies   map[string]models.InterfacePolicy `json:"policies"`
-	History    map[string][]models.PublishRecord `json:"history"`
+	Recoveries map[string]PolicyRecovery          `json:"policy_recoveries,omitempty"`
+	Nodes      map[string]models.Node             `json:"nodes"`
+	Policies   map[string]models.InterfacePolicy  `json:"policies"`
+	History    map[string][]models.PublishRecord  `json:"history"`
+	Events     map[string]models.EventDisposition `json:"event_dispositions,omitempty"`
+}
+
+// ExportJSON returns the complete manager state for a trusted standby
+// manager. The caller is responsible for transporting it over the enrolled
+// node's authenticated TLS channel.
+func (s *Store) ExportJSON() ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return json.MarshalIndent(persistedState{
+		Recoveries: s.recoveries,
+		Nodes:      s.nodes,
+		Policies:   s.policies,
+		History:    s.history,
+		Events:     s.events,
+	}, "", "  ")
+}
+
+// ReplaceJSON atomically installs a state snapshot received from the active
+// manager. It is used by standby managers while the active manager is online;
+// a failed or malformed snapshot leaves the local durable state untouched.
+func (s *Store) ReplaceJSON(data []byte) error {
+	var state persistedState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return err
+	}
+	if state.Nodes == nil {
+		state.Nodes = make(map[string]models.Node)
+	}
+	if state.Policies == nil {
+		state.Policies = make(map[string]models.InterfacePolicy)
+	}
+	if state.Recoveries == nil {
+		state.Recoveries = make(map[string]PolicyRecovery)
+	}
+	if state.Events == nil {
+		state.Events = make(map[string]models.EventDisposition)
+	}
+	if state.History == nil {
+		state.History = make(map[string][]models.PublishRecord)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := persistedState{Recoveries: s.recoveries, Nodes: s.nodes, Policies: s.policies, History: s.history, Events: s.events}
+	s.recoveries, s.nodes, s.policies, s.history, s.events = state.Recoveries, state.Nodes, state.Policies, state.History, state.Events
+	if err := s.saveLocked(); err != nil {
+		s.recoveries, s.nodes, s.policies, s.history, s.events = previous.Recoveries, previous.Nodes, previous.Policies, previous.History, previous.Events
+		return err
+	}
+	return nil
 }
 
 func (s *Store) load() error {
 	if s.path == "" {
 		return nil
 	}
-	data, err := os.ReadFile(s.path)
+	data, encrypted, recovered, err := securestore.ReadValid(s.path, func(payload []byte) error {
+		var candidate persistedState
+		return json.Unmarshal(payload, &candidate)
+	})
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -340,6 +475,16 @@ func (s *Store) load() error {
 	if state.Recoveries != nil {
 		s.recoveries = state.Recoveries
 	}
+	if state.Events != nil {
+		s.events = state.Events
+	}
+	// A legacy plaintext file is migrated after a successful read. A backup
+	// recovery is also rewritten so the next restart uses the primary copy.
+	if encrypted || recovered {
+		if err := securestore.Write(s.path, data, 0o600); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -347,45 +492,15 @@ func (s *Store) saveLocked() error {
 	if s.path == "" {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(persistedState{
 		Recoveries: s.recoveries,
 		Nodes:      s.nodes,
 		Policies:   s.policies,
 		History:    s.history,
+		Events:     s.events,
 	}, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(s.path), filepath.Base(s.path)+".tmp.*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	cleanup := true
-	defer func() {
-		_ = tmp.Close()
-		if cleanup {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-	if _, err := tmp.Write(data); err != nil {
-		return err
-	}
-	if err := tmp.Chmod(0o644); err != nil {
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, s.path); err != nil {
-		return err
-	}
-	cleanup = false
-	return nil
+	return securestore.Write(s.path, data, 0o600)
 }

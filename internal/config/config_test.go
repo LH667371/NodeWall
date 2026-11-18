@@ -49,7 +49,7 @@ func TestLoadServerConfigSecurity(t *testing.T) {
 func TestLoadServerConfigDefaultsToExternalManagementListener(t *testing.T) {
 	t.Setenv("NODEWALL_SERVER_ADDR", "")
 	cfg := LoadServerConfig()
-	if cfg.ListenAddr != "0.0.0.0:8080" {
+	if cfg.ListenAddr != "0.0.0.0:8086" {
 		t.Fatalf("expected external management listener by default, got %q", cfg.ListenAddr)
 	}
 }

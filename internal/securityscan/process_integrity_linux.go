@@ -97,6 +97,11 @@ func collectProcessIntegrityFindings(ctx context.Context, limit int) ([]Finding,
 			continue
 		}
 		finding := processIntegrityFinding(evidence.rule, evidence.severity, evidence.exe, pid, evidence.detail)
+		// The first inspection and enrichment must describe the same process
+		// and executable; otherwise retain the finding as evidence only.
+		if finding.ProcessStartTime != evidence.startTime || (evidence.sha256 != "" && finding.SHA256 != evidence.sha256) {
+			finding.ProcessStartTime = ""
+		}
 		finding.SHA256 = evidence.sha256
 		finding.Size = evidence.size
 		finding.Mode = evidence.mode
@@ -110,13 +115,14 @@ func collectProcessIntegrityFindings(ctx context.Context, limit int) ([]Finding,
 }
 
 type processEvidence struct {
-	exe      string
-	detail   string
-	rule     string
-	severity string
-	sha256   string
-	size     int64
-	mode     string
+	exe       string
+	startTime string
+	detail    string
+	rule      string
+	severity  string
+	sha256    string
+	size      int64
+	mode      string
 }
 
 // ProcessTrace describes the executable that belongs to a live PID. The
@@ -171,19 +177,40 @@ func deletedExecutableEvidence(pid int) (processEvidence, bool) {
 	if isKernelHelper(comm, command, exe) {
 		return processEvidence{}, false
 	}
-	if threat, ok := inspectProcessExecutable(pid, exe); ok {
+	displayExe, _ := normalizeDeletedExecutablePath(exe)
+	// Most processes have a normal executable. Only hash after the inexpensive
+	// deleted-file filter to keep a host-wide quick scan bounded.
+	before, beforeErr := captureProcessIdentity(pid)
+	if beforeErr == nil && (!before.deleted || before.executable != displayExe) {
+		beforeErr = fmt.Errorf("PID %d executable changed during inspection", pid)
+	}
+	if threat, ok := inspectProcessExecutable(pid, displayExe); ok {
+		after, captureErr := captureProcessIdentity(pid)
+		startTime := ""
+		if beforeErr == nil && captureErr == nil && before.deleted && before == after && threat.sha256 == before.sha256 && threat.size == before.size {
+			startTime = before.start
+		}
 		return processEvidence{
-			exe:      exe,
-			detail:   fmt.Sprintf("PID %d 的已删除可执行文件匹配 %s 特征（%s）", pid, threat.detail, exe),
-			rule:     threat.rule,
-			severity: threat.severity,
-			sha256:   threat.sha256,
-			size:     threat.size,
-			mode:     threat.mode,
+			exe:       displayExe,
+			startTime: startTime,
+			detail:    fmt.Sprintf("PID %d 的已删除可执行文件匹配 %s 特征（%s）；请人工核查并从可信软件包重启", pid, threat.detail, displayExe),
+			rule:      threat.rule,
+			severity:  threat.severity,
+			sha256:    threat.sha256,
+			size:      threat.size,
+			mode:      threat.mode,
 		}, true
 	}
-	detail := fmt.Sprintf("PID %d is still executing a deleted file (%s); verify the process origin and restart it from a trusted package", pid, exe)
-	return processEvidence{exe: exe, detail: detail, rule: "deleted-executable", severity: SeverityMedium}, true
+	after, captureErr := captureProcessIdentity(pid)
+	startTime := ""
+	sum, mode := "", ""
+	var size int64
+	if beforeErr == nil && captureErr == nil && before.deleted && before == after {
+		startTime = before.start
+		sum, size, mode = before.sha256, before.size, before.mode
+	}
+	detail := fmt.Sprintf("PID %d is still executing a deleted file (%s); verify the process origin and restart it from a trusted package", pid, displayExe)
+	return processEvidence{exe: displayExe, startTime: startTime, detail: detail, rule: "deleted-executable", severity: SeverityMedium, sha256: sum, size: size, mode: mode}, true
 }
 
 type executableThreat struct {
@@ -251,23 +278,43 @@ func inspectExecutableFile(file *os.File, displayPath string, info os.FileInfo) 
 }
 
 func isKernelHelper(comm, command, exe string) bool {
-	if exe != "/ (deleted)" || command != "" {
+	if exe != "/ (deleted)" {
 		return false
 	}
+	if kernelHelperName(comm) {
+		return command == "" || singleKernelHelperCommand(command)
+	}
+	return singleKernelHelperCommand(command)
+}
+
+func kernelHelperName(value string) bool {
+	value = strings.TrimSpace(value)
 	for _, prefix := range []string{"bpfilter", "kworker", "ksoftirqd", "migration", "rcu", "watchdog", "cpuhp"} {
-		if strings.HasPrefix(comm, prefix) {
+		if strings.HasPrefix(value, prefix) {
+			return true
+		}
+	}
+	base := filepath.Base(value)
+	for _, prefix := range []string{"bpfilter", "kworker", "ksoftirqd", "migration", "rcu", "watchdog", "cpuhp"} {
+		if strings.HasPrefix(base, prefix) {
 			return true
 		}
 	}
 	return false
 }
 
+func singleKernelHelperCommand(command string) bool {
+	fields := strings.Fields(command)
+	return len(fields) == 1 && kernelHelperName(fields[0])
+}
+
 func processIntegrityFinding(rule, severity, path string, pid int, detail string) Finding {
+	displayPath, deleted := normalizeDeletedExecutablePath(path)
 	seed := fmt.Sprintf("process-integrity|%s|%d|%s", rule, pid, path)
 	idBytes := sha256.Sum256([]byte(seed))
 	finding := Finding{
 		ID:            "p-" + hex.EncodeToString(idBytes[:8]),
-		Path:          path,
+		Path:          displayPath,
 		Rule:          rule,
 		Severity:      severity,
 		Detail:        detail,
@@ -275,7 +322,9 @@ func processIntegrityFinding(rule, severity, path string, pid int, detail string
 		Source:        "process",
 		Quarantinable: false,
 		PID:           pid,
-		Executable:    path,
+		Executable:    displayPath,
+		Deleted:       deleted,
+		SystemFile:    isSystemPackageFile(displayPath),
 	}
 	return EnrichProcessFinding(finding)
 }
@@ -284,31 +333,57 @@ func processIntegrityFinding(rule, severity, path string, pid int, detail string
 // inode evidence for quarantine before process termination. A cgroup-only path
 // is replaced with the actual executable when the kernel/proc lookup allows
 // it, while an inaccessible process remains evidence-only.
-func EnrichProcessFinding(finding Finding) Finding {
+func EnrichProcessFinding(finding Finding) (result Finding) {
 	if finding.Source != "process" || finding.PID <= 1 {
 		return finding
 	}
+	before, beforeErr := captureProcessIdentity(finding.PID)
+	defer func() {
+		// Hashing and rule evaluation span several reads. Never attach an
+		// actionable identity if exec, PID reuse, or executable content changed.
+		if beforeErr != nil {
+			return
+		}
+		after, err := captureProcessIdentity(finding.PID)
+		if err == nil && before == after && result.SHA256 == before.sha256 && result.Size == before.size && result.Executable == before.executable && result.Deleted == before.deleted {
+			result.ProcessStartTime = before.start
+		}
+	}()
 	trace, err := TraceProcess(finding.PID)
 	if err != nil || trace.Executable == "" {
 		return finding
 	}
-	finding.Executable = trace.Executable
+	displayExecutable, deleted := normalizeDeletedExecutablePath(trace.Executable)
+	finding.Executable = displayExecutable
+	finding.Deleted = finding.Deleted || deleted
 	finding.Command = trace.Command
 	finding.ContainerID = containerID(trace.Cgroup)
+	finding.SystemFile = isSystemPackageFile(displayExecutable)
+	if deleted && trace.Executable != displayExecutable {
+		finding.Detail = strings.ReplaceAll(finding.Detail, trace.Executable, displayExecutable)
+	}
 	if isNodeWallTrustedPath(trace.Executable) {
 		return finding
 	}
 	if strings.Contains(finding.Path, "cgroup.procs") || strings.HasPrefix(finding.Path, "/proc/") {
-		finding.Path = trace.Executable
+		finding.Path = displayExecutable
 	}
-	if strings.HasSuffix(trace.Executable, " (deleted)") {
-		if threat, ok := inspectProcessExecutable(finding.PID, trace.Executable); ok {
+	if deleted {
+		if beforeErr == nil && before.deleted && before.executable == displayExecutable {
+			finding.SHA256 = before.sha256
+			finding.Size = before.size
+			finding.Mode = before.mode
+		}
+		if threat, ok := inspectProcessExecutable(finding.PID, displayExecutable); ok {
 			finding.Rule = threat.rule
 			finding.Severity = threat.severity
-			finding.Detail = fmt.Sprintf("PID %d 的已删除可执行文件匹配 %s 特征（%s）", finding.PID, threat.detail, trace.Executable)
+			finding.Detail = fmt.Sprintf("PID %d 的已删除可执行文件匹配 %s 特征（%s）；请人工核查并从可信软件包重启", finding.PID, threat.detail, displayExecutable)
 			finding.SHA256 = threat.sha256
 			finding.Size = threat.size
 			finding.Mode = threat.mode
+		}
+		if finding.Detail == "" {
+			finding.Detail = fmt.Sprintf("PID %d 仍在执行已删除文件：%s；请人工核查进程来源并从可信软件包重启", finding.PID, displayExecutable)
 		}
 		return finding
 	}
@@ -324,6 +399,11 @@ func EnrichProcessFinding(finding Finding) Finding {
 	finding.Size = size
 	finding.Mode = mode
 	finding.Quarantinable = processQuarantineEligible(trace.Executable, info)
+	if threat, ok := inspectProcessExecutable(finding.PID, displayExecutable); ok && threat.sha256 == sum && threat.size == size {
+		finding.Rule = threat.rule
+		finding.Severity = threat.severity
+		finding.Detail = fmt.Sprintf("PID %d 的可执行文件匹配 %s 特征（%s）", finding.PID, threat.detail, displayExecutable)
+	}
 	return finding
 }
 

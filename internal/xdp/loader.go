@@ -38,6 +38,8 @@ type interfaceState struct {
 	collection       *ebpf.Collection
 	link             xdpAttachment
 	tcLink           tcCloser
+	bridgeLink       tcCloser
+	bridgeIndex      int
 	programLoaded    bool
 }
 
@@ -76,54 +78,46 @@ func (m *Manager) Attach(ifaceName string, mode AttachMode) error {
 	if state != nil && state.link != nil {
 		return nil
 	}
+	if state != nil {
+		if err := closeInterfaceLinks(state); err != nil {
+			return fmt.Errorf("finish previous detach on %s: %w", ifaceName, err)
+		}
+	}
+	mode = attachModeForInterface("/sys/class/net", ifaceName, mode)
 
 	state, err = m.loadState(ifaceName, iface.Index, mode)
 	if err != nil {
 		return err
 	}
-
-	flags := xdpAttachFlags(mode)
-	var lnk xdpAttachment
-	lnk, err = link.AttachXDP(link.XDPOptions{
-		Program:   state.collection.Programs["xdp_acl"],
-		Interface: iface.Index,
-		Flags:     flags,
-	})
-	if err != nil && shouldFallbackToGenericXDP(err) {
-		// Kernels before 5.7 do not support bpf_link. Try the legacy netlink
-		// attach path before falling back from native to generic XDP; it keeps
-		// NodeWall on its XDP dataplane without requiring iptables.
-		lnk, err = attachLegacyXDP(state.collection.Programs["xdp_acl"], iface.Index, flags)
-		if err == nil {
-			state.mode = mode
-		} else if mode == AttachModeNative {
-			// Driver mode is unavailable on some virtual or older NIC drivers.
-			// Retry the generic mode through both APIs before returning the
-			// original failure to the caller.
-			genericFlags := link.XDPGenericMode
-			lnk, err = link.AttachXDP(link.XDPOptions{
-				Program:   state.collection.Programs["xdp_acl"],
-				Interface: iface.Index,
-				Flags:     genericFlags,
-			})
-			if err != nil && shouldFallbackToGenericXDP(err) {
-				lnk, err = attachLegacyXDP(state.collection.Programs["xdp_acl"], iface.Index, genericFlags)
-			}
-			if err == nil {
-				state.mode = AttachModeGeneric
-			}
+	// Retain the collection and any remaining links if a partial attach cannot
+	// be fully undone, so Detach can retry rather than lose their ownership.
+	m.states[ifaceName] = state
+	if state.bridgeIndex != 0 {
+		state.bridgeLink, err = attachTCBridgeHostFilter(state.bridgeIndex, iface.Index, state.collection.Programs["tc_bridge_host"])
+		if err != nil {
+			return errors.Join(fmt.Errorf("attach bridge host filter for %s: %w", ifaceName, err), closeInterfaceLinks(state))
 		}
 	}
+
+	lnk, actualMode, err := attachXDPWithFallback(mode,
+		func(flags link.XDPAttachFlags) (xdpAttachment, error) {
+			return link.AttachXDP(link.XDPOptions{
+				Program: state.collection.Programs["xdp_acl"], Interface: iface.Index, Flags: flags,
+			})
+		},
+		func(flags link.XDPAttachFlags) (xdpAttachment, error) {
+			return attachLegacyXDP(state.collection.Programs["xdp_acl"], iface.Index, flags)
+		},
+	)
 	if err != nil {
-		state.collection.Close()
-		return fmt.Errorf("attach xdp on %s: %w", ifaceName, err)
+		return errors.Join(fmt.Errorf("attach xdp on %s: %w", ifaceName, err), closeInterfaceLinks(state))
 	}
+	state.link = lnk
+	state.mode = actualMode
 
 	tcLink, err := attachTCEgressTracker(iface.Index, state.collection.Programs["tc_egress_track"])
 	if err != nil {
-		_ = lnk.Close()
-		state.collection.Close()
-		return fmt.Errorf("attach tc egress tracker on %s: %w", ifaceName, err)
+		return errors.Join(fmt.Errorf("attach tc egress tracker on %s: %w", ifaceName, err), closeInterfaceLinks(state))
 	}
 
 	state.link = lnk
@@ -141,14 +135,49 @@ func xdpAttachFlags(mode AttachMode) link.XDPAttachFlags {
 }
 
 func shouldFallbackToGenericXDP(err error) bool {
-	return errors.Is(err, link.ErrNotSupported) ||
-		errors.Is(err, ebpf.ErrNotSupported) ||
-		errors.Is(err, syscall.EOPNOTSUPP) ||
-		errors.Is(err, syscall.EINVAL)
+	return unsupportedAttachAPI(err) || errors.Is(err, syscall.EINVAL)
 }
 
 func shouldIgnoreTCXAttachError(err error) bool {
-	return errors.Is(err, link.ErrNotSupported) || errors.Is(err, ebpf.ErrNotSupported)
+	return unsupportedAttachAPI(err)
+}
+
+func unsupportedAttachAPI(err error) bool {
+	return errors.Is(err, link.ErrNotSupported) || errors.Is(err, ebpf.ErrNotSupported) ||
+		errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.ENOSYS)
+}
+
+type xdpAttachFunc func(link.XDPAttachFlags) (xdpAttachment, error)
+
+// attachXDPWithFallback negotiates kernel API and driver mode independently.
+// Missing bpf_link does not imply missing native XDP: old kernels may attach
+// it through netlink. Permission, ownership and device errors must stop this
+// sequence rather than be hidden by a later attempt in another mode.
+func attachXDPWithFallback(mode AttachMode, modern, legacy xdpAttachFunc) (xdpAttachment, AttachMode, error) {
+	if mode != AttachModeNative && mode != AttachModeGeneric {
+		return nil, mode, fmt.Errorf("unsupported XDP attach mode %q; use native or generic", mode)
+	}
+	modes := []AttachMode{mode}
+	if mode == AttachModeNative {
+		modes = append(modes, AttachModeGeneric)
+	}
+	var failures []error
+	for _, candidate := range modes {
+		for _, api := range []struct {
+			name string
+			call xdpAttachFunc
+		}{{"bpf_link", modern}, {"netlink", legacy}} {
+			lnk, err := api.call(xdpAttachFlags(candidate))
+			if err == nil {
+				return lnk, candidate, nil
+			}
+			failures = append(failures, fmt.Errorf("%s XDP via %s: %w", candidate, api.name, err))
+			if !shouldFallbackToGenericXDP(err) {
+				return nil, mode, errors.Join(failures...)
+			}
+		}
+	}
+	return nil, mode, errors.Join(failures...)
 }
 
 type tcCloser interface {
@@ -175,28 +204,43 @@ func (m *Manager) Detach(ifaceName string) error {
 	defer m.mu.Unlock()
 
 	state, ok := m.states[ifaceName]
-	if !ok || state.link == nil {
+	if !ok {
 		return nil
 	}
+	return closeInterfaceLinks(state)
+}
 
-	if err := state.link.Close(); err != nil {
-		return fmt.Errorf("detach xdp from %s: %w", ifaceName, err)
+// Keep failed links available for retry, while releasing every independent
+// successful link. A bridge filter must never be stranded by an egress error.
+func closeInterfaceLinks(state *interfaceState) error {
+	var errs []error
+	if state.link != nil {
+		if err := state.link.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("detach xdp from %s: %w", state.ifaceName, err))
+		} else {
+			state.link = nil
+			state.programLoaded = false
+		}
 	}
 	if state.tcLink != nil {
 		if err := state.tcLink.Close(); err != nil {
-			return fmt.Errorf("detach tc egress tracker from %s: %w", ifaceName, err)
+			errs = append(errs, fmt.Errorf("detach tc egress tracker from %s: %w", state.ifaceName, err))
+		} else {
+			state.tcLink = nil
 		}
 	}
-
-	state.link = nil
-	state.tcLink = nil
-	state.programLoaded = false
-	if state.collection != nil {
+	if state.bridgeLink != nil {
+		if err := state.bridgeLink.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("detach bridge host filter for %s: %w", state.ifaceName, err))
+		} else {
+			state.bridgeLink = nil
+		}
+	}
+	if len(errs) == 0 && state.collection != nil {
 		state.collection.Close()
 		state.collection = nil
 	}
-
-	return nil
+	return errors.Join(errs...)
 }
 
 func (m *Manager) UpsertCIDR(ifaceName, cidr string) error {
@@ -1201,14 +1245,7 @@ func (m *Manager) ReadDropLogs(ifaceName string, limit int) ([]models.InterceptL
 		if value.Drops == 0 {
 			continue
 		}
-		out = append(out, models.InterceptLogEntry{
-			Direction: models.DirectionIngress,
-			SourceIP:  sourceIPFromUint32(key.SourceIP),
-			Port:      key.DestPort,
-			Reason:    dropReasonLabel(key.Reason),
-			Count:     value.Drops,
-			Drops:     value.Drops,
-		})
+		out = append(out, interceptLogFromMap(key, value, models.DirectionIngress))
 	}
 	if err := iter.Err(); err != nil {
 		return nil, err
@@ -1325,6 +1362,16 @@ func (m *Manager) loadState(ifaceName string, ifaceIndex int, mode AttachMode) (
 		coll.Close()
 		return nil, fmt.Errorf("initialize config map: %w", err)
 	}
+	scope, err := discoverBridgeScope(ifaceName, ifaceIndex)
+	if err != nil {
+		coll.Close()
+		return nil, err
+	}
+	if err := coll.Maps["bridge_scope"].Update(configKey, scope, ebpf.UpdateAny); err != nil {
+		coll.Close()
+		return nil, fmt.Errorf("initialize bridge scope: %w", err)
+	}
+	state.bridgeIndex = int(scope.BridgeIndex)
 
 	return state, nil
 }

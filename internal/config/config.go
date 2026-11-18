@@ -4,6 +4,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -33,12 +34,17 @@ type AgentConfig struct {
 	ManagerGRPCAddr        string
 	ManagerURL             string
 	AgentHTTPAddr          string
+	// ServerHTTPAddr is the address other cluster members can use to open this
+	// node's local management console. It is kept separate from ListenAddr,
+	// which may bind to 0.0.0.0 and therefore is not a usable browser address.
+	ServerHTTPAddr         string
 	AutoUpdate             bool
 	AutoUpdateEvery        time.Duration
 	SSHProtectionStateFile string
 	SSHAuthLogPath         string
 	SSHActivityLogPath     string
 	SSHProtectionPoll      time.Duration
+	SSHKeyPath             string
 	TLSEnabled             bool
 	TLSCertFile            string
 	TLSKeyFile             string
@@ -60,7 +66,11 @@ type ServerConfig struct {
 	AgentURL               string
 	WebDir                 string
 	StateFile              string
+	ClusterKeyFile         string
 	AuthSettingsFile       string
+	SMTPSettingsFile       string
+	WebAuthnRPID           string
+	WebAuthnOrigins        []string
 	DevMode                string
 	DefaultInterface       string
 	DefaultXDPMode         string
@@ -72,12 +82,18 @@ type ServerConfig struct {
 	GRPCListenAddr         string
 	QUICListenAddr         string
 	WebAccessMode          string
-	SSHKeyPath             string
-	TLSEnabled             bool
-	TLSCertFile            string
-	TLSKeyFile             string
-	TLSCAFile              string
-	TLSInsecureSkipVerify  bool
+	// TrustProxyHeaders enables X-Forwarded-Proto handling for a deployment
+	// behind a TLS-terminating reverse proxy. It must remain false when the
+	// management listener is directly exposed, because clients can forge that
+	// header on a plain HTTP connection.
+	TrustProxyHeaders     bool
+	SSHKeyPath            string
+	TLSEnabled            bool
+	TLSCertFile           string
+	TLSKeyFile            string
+	TLSCAFile             string
+	TLSInsecureSkipVerify bool
+	ManagerURL            string
 }
 
 func LoadAgentConfig() AgentConfig {
@@ -107,18 +123,23 @@ func LoadAgentConfig() AgentConfig {
 		ManagerGRPCAddr:        getenv("NODEWALL_MANAGER_GRPC_ADDR", ""),
 		ManagerURL:             getenv("NODEWALL_MANAGER_URL", ""),
 		AgentHTTPAddr:          getenv("NODEWALL_AGENT_HTTP_ADDR", ""),
+		ServerHTTPAddr:         getenv("NODEWALL_SERVER_HTTP_ADDR", ""),
 		AutoUpdate:             getBool("NODEWALL_AUTO_UPDATE", true),
 		AutoUpdateEvery:        getDuration("NODEWALL_AUTO_UPDATE_INTERVAL", 10*time.Minute),
 		SSHProtectionStateFile: getenv("NODEWALL_SSH_PROTECTION_STATE", "/etc/nodewall/ssh-protection.json"),
 		SSHAuthLogPath:         getenv("NODEWALL_SSH_AUTH_LOG", ""),
 		SSHActivityLogPath:     getenv("NODEWALL_SSH_ACTIVITY_LOG", "/var/log/nodewall/ssh-activity.log"),
 		SSHProtectionPoll:      getDuration("NODEWALL_SSH_PROTECTION_POLL", time.Second),
+		SSHKeyPath:             getenv("NODEWALL_SSH_KEY", "/etc/nodewall/ssh/id_ed25519"),
 		TLSEnabled:             getBool("NODEWALL_TLS_ENABLED", tlsDefault),
 		TLSCertFile:            getenv("NODEWALL_TLS_CERT", "/etc/nodewall/tls/agent.crt"),
 		TLSKeyFile:             getenv("NODEWALL_TLS_KEY", "/etc/nodewall/tls/agent.key"),
 		TLSCAFile:              getenv("NODEWALL_TLS_CA", ""),
-		TLSInsecureSkipVerify:  getBool("NODEWALL_TLS_INSECURE_SKIP_VERIFY", true),
-		ManagerQUICAddr:        getenv("NODEWALL_MANAGER_QUIC_ADDR", ""),
+		// Certificate verification is strict by default. Development or legacy
+		// self-signed deployments must opt out explicitly instead of silently
+		// making manager traffic vulnerable to a TLS MITM.
+		TLSInsecureSkipVerify: getBool("NODEWALL_TLS_INSECURE_SKIP_VERIFY", false),
+		ManagerQUICAddr:       getenv("NODEWALL_MANAGER_QUIC_ADDR", ""),
 	}
 }
 
@@ -137,6 +158,8 @@ func LoadServerConfig() ServerConfig {
 		endpoint.Host = net.JoinHostPort("127.0.0.1", endpoint.Port())
 		agentURL = endpoint.String()
 	}
+	stateFile := getenv("NODEWALL_SERVER_STATE", "/etc/nodewall/server-state.json")
+	clusterKeyFile := getenv("NODEWALL_CLUSTER_KEY_FILE", filepath.Join(filepath.Dir(stateFile), "cluster.key"))
 	return ServerConfig{
 		MonitoringHistoryDir:   getenv("NODEWALL_MONITORING_HISTORY_DIR", "/var/lib/nodewall/monitoring"),
 		MonitoringHistoryBytes: int64(getInt("NODEWALL_MONITORING_HISTORY_MIB", 512)) << 20,
@@ -148,12 +171,16 @@ func LoadServerConfig() ServerConfig {
 		// The authenticated server is the management entry point. Keep it
 		// reachable on the host's interfaces by default; deployments that need a
 		// loopback-only listener can still set NODEWALL_SERVER_ADDR explicitly.
-		ListenAddr:            getenv("NODEWALL_SERVER_ADDR", "0.0.0.0:8080"),
+		ListenAddr:            getenv("NODEWALL_SERVER_ADDR", "0.0.0.0:8086"),
 		NodeID:                getenv("NODEWALL_NODE_ID", "node-01"),
 		AgentURL:              agentURL,
 		WebDir:                getenv("NODEWALL_WEB_DIR", "web/dist"),
-		StateFile:             getenv("NODEWALL_SERVER_STATE", "/etc/nodewall/server-state.json"),
+		StateFile:             stateFile,
+		ClusterKeyFile:        clusterKeyFile,
 		AuthSettingsFile:      getenv("NODEWALL_AUTH_SETTINGS_FILE", "/etc/nodewall/auth-settings.json"),
+		SMTPSettingsFile:      getenv("NODEWALL_SMTP_SETTINGS_FILE", "/etc/nodewall/smtp-settings.json"),
+		WebAuthnRPID:          getenv("NODEWALL_WEBAUTHN_RP_ID", ""),
+		WebAuthnOrigins:       getCSV("NODEWALL_WEBAUTHN_ORIGINS"),
 		DevMode:               devMode,
 		DefaultInterface:      getenv("NODEWALL_DEFAULT_INTERFACE", ""),
 		DefaultXDPMode:        getenv("NODEWALL_XDP_MODE", "native"),
@@ -165,12 +192,14 @@ func LoadServerConfig() ServerConfig {
 		GRPCListenAddr:        getenv("NODEWALL_SERVER_GRPC_ADDR", ""),
 		QUICListenAddr:        getenv("NODEWALL_SERVER_QUIC_ADDR", ""),
 		WebAccessMode:         strings.ToLower(strings.TrimSpace(getenv("NODEWALL_WEB_ACCESS", "public"))),
+		TrustProxyHeaders:     getBool("NODEWALL_TRUST_PROXY", false),
 		SSHKeyPath:            getenv("NODEWALL_SSH_KEY", "/etc/nodewall/ssh/id_ed25519"),
 		TLSEnabled:            getBool("NODEWALL_TLS_ENABLED", tlsDefault),
 		TLSCertFile:           getenv("NODEWALL_TLS_CERT", "/etc/nodewall/tls/server.crt"),
 		TLSKeyFile:            getenv("NODEWALL_TLS_KEY", "/etc/nodewall/tls/server.key"),
 		TLSCAFile:             getenv("NODEWALL_TLS_CA", ""),
-		TLSInsecureSkipVerify: getBool("NODEWALL_TLS_INSECURE_SKIP_VERIFY", true),
+		TLSInsecureSkipVerify: getBool("NODEWALL_TLS_INSECURE_SKIP_VERIFY", false),
+		ManagerURL:            getenv("NODEWALL_MANAGER_URL", ""),
 	}
 }
 

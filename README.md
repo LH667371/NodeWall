@@ -11,8 +11,8 @@ NodeWall is a host-level firewall system for Kubernetes nodes.
 - Agent guidelines (EN): [`AGENTS.md`](AGENTS.md)
 - Agent 指南 (ZH-CN): [`AGENTS.zh-CN.md`](AGENTS.zh-CN.md)
 
-It protects host NICs with XDP/eBPF while leaving Kubernetes-managed
-networking rules untouched.
+It protects host NICs with XDP/eBPF at ingress and TC/eBPF at egress while
+leaving Kubernetes-managed networking rules untouched.
 
 ## Goals
 
@@ -106,8 +106,9 @@ the default for macOS, non-Linux hosts, and general UI/API iteration. The
 server continues to serve the built-in static UI from `web/`.
 
 `make dev-real` runs the real dataplane path and is intended for Linux hosts
-with the generated BPF object available and sufficient privileges for XDP
-attach/detach.
+with the generated BPF object available and sufficient privileges for XDP and
+TC attach/detach. Native XDP handles ingress; the same BPF object attaches a
+TC egress program when outbound enforcement is enabled.
 
 Useful commands:
 
@@ -149,40 +150,66 @@ Default package targets:
 - `linux/amd64`
 - `linux/arm64`
 
-Build packages:
+Choose a package for the intended use:
 
 ```sh
+# Only needed if the BPF object has not been generated yet.
 make generate
-make package-archive
+
+# Offline installation, including the ClamAV engine and full databases.
+make package-offline
+
+# Routine update, without ClamAV assets.
+make package-update
 ```
 
-`make package-archive` builds the web assets automatically, then compiles the
-current Go sources and writes the archives. If the locked web dependencies are
-not installed, the packaging script runs `npm ci` first.
+Both commands build the web assets and compile the current Go sources. If the
+locked web dependencies are missing, the script runs `npm ci` first.
+`make package-offline` uses Docker and network access to check the `main`,
+`daily`, and `bytecode` databases on every run. It downloads available updates,
+verifies all three CVD signatures, and reuses the verified engine and source
+cache. If the database refresh or verification fails, packaging stops and the
+previous database cache is preserved.
+`make package-archive` remains an alias for `make package-offline`;
+`make package` still produces standalone binaries without ClamAV assets.
 
 Build one target only:
 
 ```sh
-make package-one TARGET=linux/amd64
+NODEWALL_PACKAGE_TARGETS=linux/amd64 make package-update
 ```
 
-Artifacts are written under `dist/` as `.tar.gz` archives. Each archive
-contains:
+Archives are written under `dist/`, with `_offline_linux_amd64.tar.gz` or
+`_update_linux_amd64.tar.gz` in the filename (and corresponding names for
+other architectures). Both include the prebuilt binary and operations notes;
+the offline archive also includes the ClamAV engines, databases, and source.
 
-- prebuilt `nodewall`
-- README and operations notes
+An update archive preserves any ClamAV engine and databases already installed
+on the target. Use the offline archive to provision a standalone manager for
+the first time. Any enrolled node with an offline bundle can supply the other
+nodes, including an original manager that has no assets. Nodes check at startup
+and every two minutes, synchronizing missing or newer engines and databases in
+the background after enrollment. Follow progress with
+`journalctl -u nodewall-agent -f`; scan reports also expose engine/update status.
+Engine releases and individual database versions never downgrade; an engine
+upgrade restarts the private clamd. Transfers use enrolled credentials and pinned
+TLS, followed by SHA-256, CVD signature, and full database loading checks. Failed
+updates retain the working version. An update archive alone cannot provision
+these assets on an isolated host without another source.
 
 On the target Linux host:
 
 ```sh
-tar -xzf nodewall_<version>_linux_amd64.tar.gz
-cd nodewall_<version>_linux_amd64
+tar -xzf nodewall_<version>_offline_linux_amd64.tar.gz
+cd nodewall_<version>_offline_linux_amd64
 sudo ./bin/nodewall install --password 'change-me'
-sudo ./bin/nodewall cleanup
 ```
 
-If `0.0.0.0:8080` or `127.0.0.1:9080` is already in use, install with custom
-ports:
+To update an existing node, extract the update archive for its architecture
+and run `sudo ./bin/nodewall update` from the extracted directory.
+
+If the default web port `8086` or agent port `9080` is already in use, install
+with custom ports:
 
 ```sh
 sudo ./bin/nodewall install \
@@ -196,11 +223,18 @@ Notes:
 
 - `nodewall install` extracts the embedded runtime assets and does not require
   the source repo
+- A new secure all-in-one installation listens on `0.0.0.0:9080` and advertises
+  its usable IPv4 address when one is detected. Explicit bind settings, disabled
+  TLS, and installations without a usable address retain their configured
+  behavior. An explicit loopback bind prevents other managers from reaching the agent.
 - Installation deploys services and the UI without automatically attaching the
   default interface; enable protection explicitly from the console
-- `nodewall cleanup` removes installed services and files
+- `nodewall cleanup` must run as root. It stops NodeWall processes, restores the SSH configuration, SFTP subsystem, and root console key before removing runtime files. If SSH validation or reload fails, cleanup stops with the recovery files intact so it can be retried from a local console.
 - install performs a port availability check before writing
-  `/etc/nodewall/nodewall.env`
+  `/etc/nodewall/nodewall.env`; all NodeWall management services use the 8086+
+  port range. Upgrades and re-enrollment migrate legacy values from 8080
+  through 8085 before reporting the selected management address in node
+  heartbeats
 - after installation, adjust `/etc/nodewall/nodewall.env` and restart the
   services if you need to move ports later
 - packaging requires `bpf/gen/xdpacl_bpfel.o`, so run `make generate` first
@@ -258,7 +292,7 @@ NodeWall now includes Linux-oriented operational helpers:
 
 The systemd units live under `deployments/systemd/` and use
 `/etc/nodewall/nodewall.env` as an optional environment file for user
-overrides. If the default `0.0.0.0:8080` or `127.0.0.1:9080` ports are busy,
+overrides. If the default `0.0.0.0:8086` or `127.0.0.1:9080` ports are busy,
 set `NODEWALL_SERVER_ADDR`, `NODEWALL_AGENT_ADDR`, and `NODEWALL_AGENT_URL`
 there before restarting the services.
 
@@ -284,6 +318,14 @@ baseline permanently or run it for `1` to `120` seconds first; without an
 explicit confirmation, the agent restores the state from before the trial when
 the timer expires. This keeps ZStack management paths recoverable during a
 connectivity check.
+
+Node management now exposes a per-node “Update Agent” action. It uses the
+node credential to ask the selected agent to download and install the current
+manager package immediately, then restart its services; regular heartbeats
+still check for version drift after enrollment. Removing a node sends a forced
+cleanup marker, so a reachable agent is detached and asked to uninstall itself
+even when its last heartbeat is stale, before the manager revokes its credential
+and removes local policy state.
 
 For a single host, you can now write:
 

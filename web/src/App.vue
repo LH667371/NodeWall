@@ -1,67 +1,47 @@
 <script setup>
-import { computed, onMounted, provide } from "vue";
-import { ArrowDown, ArrowUp, RotateCw, X } from "@lucide/vue";
+import { computed, onBeforeUnmount, onMounted, provide } from "vue";
+import { X } from "@lucide/vue";
 import SidebarNav from "@/components/SidebarNav.vue";
 import HeaderBar from "@/components/HeaderBar.vue";
 import ActionModal from "@/components/ActionModal.vue";
 import OverviewPage from "@/pages/OverviewPage.vue";
 import ClusterPage from "@/pages/ClusterPage.vue";
 import PolicyPage from "@/pages/PolicyPage.vue";
-import LogsPage from "@/pages/LogsPage.vue";
 import OperationsPage from "@/pages/OperationsPage.vue";
 import EventsPage from "@/pages/EventsPage.vue";
 import ManagementPage from "@/pages/ManagementPage.vue";
+import UserManagementPage from "@/pages/UserManagementPage.vue";
+import AccountPage from "@/pages/AccountPage.vue";
 import SecurityPage from "@/pages/SecurityPage.vue";
 import SSHConsolePage from "@/pages/SSHConsolePage.vue";
+import SecurityFeatureTabs from "@/components/SecurityFeatureTabs.vue";
 import { useNodewallConsole } from "@/composables/useNodewallConsole";
 import { createI18n, I18N_KEY } from "@/lib/i18n";
+import { initializeTheme } from "@/lib/theme";
 
 const i18n = createI18n("zh-CN");
 provide(I18N_KEY, i18n);
 const store = useNodewallConsole(i18n);
+initializeTheme();
 
-const activePage = computed(() => {
-  if (store.state.section === "policy") return PolicyPage;
-  if (store.state.section === "cluster") return ClusterPage;
-  if (store.state.section === "logs") return LogsPage;
-  if (store.state.section === "monitoring") return OperationsPage;
-  if (store.state.section === "events") return EventsPage;
-  if (store.state.section === "management") return ManagementPage;
-  if (store.state.section === "security") return SecurityPage;
-  if (store.state.section === "ssh-console") return SSHConsolePage;
-  return OverviewPage;
-});
-
-const interfaceOptions = computed(() => {
-  const list = store.state.interfaces || [];
-  const physical = list.filter((item) => item.is_physical);
-  return physical.length ? physical : list;
-});
-
-// Direction and NIC only affect firewall data. Node scope lives in the header
-// so operators always see the selected target before changing a policy.
-const firewallPage = computed(() => store.state.section === "policy" || (store.state.section === "security" && store.state.securityFeature === "firewall"));
-const showDirectionToolbar = computed(() => store.state.section === "overview" || firewallPage.value);
-const showInterfaceToolbar = computed(() => firewallPage.value || (store.state.section === "overview" && store.state.overviewScope === "node"));
-const showToolbar = computed(() => showDirectionToolbar.value || showInterfaceToolbar.value);
-
-function interfaceLabel(item) {
-  const addresses = Array.isArray(item?.addresses) ? item.addresses : [];
-  const ipv4 = addresses.find((value) => String(value).includes(".")) || "";
-  const ipv6 = addresses.find((value) => String(value).includes(":")) || "";
-  const suffix = ipv4 || ipv6 || "-";
-  const kind = item?.is_physical ? i18n.t("interfaceTypePhysical") : i18n.t("interfaceTypeVirtual");
-  return `${item.name} · ${kind} · ${suffix}`;
-}
+const showSecurityFeatureTabs = computed(() => store.state.section === "security");
 
 onMounted(() => {
   store.bootstrap().catch(store.handleError);
 });
+
+onBeforeUnmount(() => store.dispose());
 </script>
 
 <template>
   <div class="shell">
-    <SidebarNav :section="store.state.section" @change="store.setSection" />
+    <SidebarNav
+      :section="store.state.section"
+      :security-feature="store.state.securityFeature"
+      :version="store.state.version"
+      :alert-count="store.pendingEventCount"
+      @change="store.setSection"
+    />
 
     <div class="workspace">
       <HeaderBar
@@ -69,41 +49,23 @@ onMounted(() => {
         :current-interface="store.currentInterface"
         :node-id="store.state.nodeId"
         :nodes="store.state.nodes"
+        :is-node-online="store.isNodeOnline"
         :overview-scope="store.state.overviewScope"
         :cluster-aggregate="store.state.clusterAggregate"
         :security-feature="store.state.securityFeature"
+        :management-scope="store.state.managementScope"
+        :auth-username="store.state.authUsername"
+        :auth-role="store.state.authRole"
+        :alert-count="store.pendingEventCount"
         @change-node="store.setNode"
         @change-security-feature="store.setSecurityFeature"
         @change-overview-scope="store.setOverviewScope"
+        @change-section="store.setSection"
+        @logout="store.logout"
+        @account="store.setSection('account')"
       />
 
-      <div v-if="showToolbar" class="toolbar console-context-bar">
-        <div v-if="showDirectionToolbar" class="toolbar-group">
-          <label>{{ i18n.t("toolbarDirection") }}</label>
-          <div class="segmented">
-            <button :class="{ active: store.state.direction === 'ingress' }" @click="store.setDirection('ingress')">
-              <ArrowDown :size="14" stroke-width="2" aria-hidden="true" />
-              {{ i18n.t("toolbarIngress") }}
-            </button>
-            <button :class="{ active: store.state.direction === 'egress' }" @click="store.setDirection('egress')">
-              <ArrowUp :size="14" stroke-width="2" aria-hidden="true" />
-              {{ i18n.t("toolbarEgress") }}
-            </button>
-          </div>
-        </div>
-
-        <div v-if="showInterfaceToolbar" class="toolbar-group toolbar-grow">
-          <label>{{ i18n.t("toolbarInterface") }}</label>
-          <select :value="store.currentInterface" @change="store.setInterface($event.target.value)">
-            <option v-for="item in interfaceOptions" :key="item.name" :value="item.name">{{ interfaceLabel(item) }}</option>
-          </select>
-        </div>
-
-      <button class="ghost-button context-refresh-button" :disabled="store.state.actionBusy.refresh" @click="store.refreshData().catch(store.handleError)">
-          <RotateCw :size="15" stroke-width="1.9" :class="{ 'is-spinning': store.state.actionBusy.refresh }" aria-hidden="true" />
-          {{ store.state.actionBusy.refresh ? i18n.t("toolbarRefreshing") : i18n.t("toolbarRefresh") }}
-      </button>
-      </div>
+      <SecurityFeatureTabs v-if="showSecurityFeatureTabs" :store="store" />
 
       <div class="toast-stack" aria-live="polite" aria-atomic="true">
         <div
@@ -119,8 +81,22 @@ onMounted(() => {
         </div>
       </div>
 
-      <div v-if="store.state.loading" class="loading-panel">{{ i18n.t("loading") }}</div>
-      <component :is="activePage" v-else :store="store" />
+      <main class="workspace-content">
+        <div v-if="store.state.loading" class="loading-panel">{{ i18n.t("loading") }}</div>
+        <!-- Explicit route components keep a running scan from reusing the
+             previous security view after a navigation. -->
+        <OverviewPage v-else-if="store.state.section === 'overview'" :key="`overview:${store.state.overviewScope}`" :store="store" />
+        <ClusterPage v-else-if="store.state.section === 'cluster'" :store="store" />
+        <PolicyPage v-else-if="store.state.section === 'policy'" :key="`policy:${store.state.nodeId}:${store.state.securityFeature}`" :store="store" />
+        <EventsPage v-else-if="store.state.section === 'events' || store.state.section === 'logs'" :store="store" />
+        <OperationsPage v-else-if="store.state.section === 'monitoring'" :store="store" />
+        <ManagementPage v-else-if="store.state.section === 'management'" :store="store" />
+        <UserManagementPage v-else-if="store.state.section === 'users' && store.state.authRole === 'admin'" :store="store" />
+        <AccountPage v-else-if="store.state.section === 'account'" :key="`account:${store.state.authUsername}`" :store="store" />
+        <SecurityPage v-else-if="store.state.section === 'security'" :key="`security:${store.state.securityFeature}:${store.state.nodeId}`" :store="store" />
+        <SSHConsolePage v-else-if="store.state.section === 'ssh-console'" :key="`ssh-console:${store.state.sshConsole.nodeId}`" :store="store" />
+        <OverviewPage v-else :key="`fallback-overview:${store.state.overviewScope}`" :store="store" />
+      </main>
     </div>
 
     <ActionModal
@@ -128,6 +104,8 @@ onMounted(() => {
       :title="store.state.modal.title"
       :copy="store.state.modal.copy"
       :fields="store.state.modal.fields"
+      :busy="store.state.modal.busy"
+      :error="store.state.modal.error"
       @close="store.closeModal"
       @confirm="store.confirmModal"
     />

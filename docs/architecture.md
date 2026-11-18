@@ -4,8 +4,8 @@
 
 NodeWall is a host-level firewall system for Kubernetes nodes.
 
-It filters packets at host NIC ingress with XDP/eBPF and avoids changes to
-Kubernetes-managed netfilter state.
+It filters packets at host NIC ingress with XDP/eBPF and at NIC egress with
+TC/eBPF, avoiding changes to Kubernetes-managed netfilter state.
 
 ## Main Components
 
@@ -13,15 +13,18 @@ Kubernetes-managed netfilter state.
 - Go API Server
 - Go Node Agent
 - XDP program on the target interface
-- BPF maps for allowlist, counters, and config
+- TC eBPF program on the target interface's egress hook
+- Direction-specific BPF maps for allowlists, counters, and config
 
 ## Packet Flow
 
 ```text
-NIC -> XDP -> kernel networking stack -> kube-proxy / CNI / netfilter
+Ingress: NIC -> XDP -> kernel networking stack -> kube-proxy / CNI / netfilter
+Egress: kernel networking stack -> TC eBPF -> NIC
 ```
 
-NodeWall only acts at the XDP layer.
+NodeWall acts at the XDP and TC eBPF layers and does not write Kubernetes-managed
+netfilter rules.
 
 ## Data Plane Logic
 

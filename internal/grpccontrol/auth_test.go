@@ -3,7 +3,9 @@ package grpccontrol
 import (
 	"context"
 	"net"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,6 +53,54 @@ func TestReportsRequireEnrollmentAndCannotReplaceAgentEndpoint(t *testing.T) {
 	}
 	if _, err := server.Report(ctx, report); status.Code(err) != codes.Unauthenticated {
 		t.Fatal("removed node continued reporting with a revoked credential")
+	}
+}
+
+func TestAuthenticatedReportRefreshesAgentEndpointAndCertificate(t *testing.T) {
+	dir := t.TempDir()
+	oldCertFile, oldKeyFile := filepath.Join(dir, "old.crt"), filepath.Join(dir, "old.key")
+	newCertFile, newKeyFile := filepath.Join(dir, "new.crt"), filepath.Join(dir, "new.key")
+	if err := transporttls.EnsureCertificate(oldCertFile, oldKeyFile, "192.0.2.10:9080"); err != nil {
+		t.Fatal(err)
+	}
+	if err := transporttls.EnsureCertificate(newCertFile, newKeyFile, "198.51.100.20:9080"); err != nil {
+		t.Fatal(err)
+	}
+	oldCertificate, err := os.ReadFile(oldCertFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newCertificate, err := os.ReadFile(newCertFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := nodeauth.NewToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, _ := nodeauth.Open("")
+	if err := registry.Put(nodeauth.Credential{
+		NodeID:      "node-a",
+		AgentURL:    "https://192.0.2.10:9080",
+		Token:       token,
+		Certificate: string(oldCertificate),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(store.New(), "https://127.0.0.1:9080", "")
+	server.RequireNodeAuth(registry)
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer "+token))
+	if _, err := server.Report(ctx, &ReportRequest{
+		NodeID:           "node-a",
+		AgentURL:         "https://198.51.100.20:9080",
+		AgentHTTPAddr:    "198.51.100.20:9080",
+		AgentCertificate: string(newCertificate),
+	}); err != nil {
+		t.Fatalf("report with refreshed credential: %v", err)
+	}
+	updated, ok := registry.Get("node-a")
+	if !ok || updated.AgentURL != "https://198.51.100.20:9080" || strings.TrimSpace(updated.Certificate) != strings.TrimSpace(string(newCertificate)) {
+		t.Fatalf("credential was not refreshed: %#v", updated)
 	}
 }
 

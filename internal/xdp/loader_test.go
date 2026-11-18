@@ -27,6 +27,28 @@ func TestShouldIgnoreTCXAttachError(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "kernel syscall unavailable",
+			err:  fmt.Errorf("attach failed: %w", syscall.ENOSYS),
+			want: true,
+		},
+		{
+			name: "hook unavailable",
+			err:  fmt.Errorf("attach failed: %w", syscall.EOPNOTSUPP),
+			want: true,
+		},
+		{
+			name: "permission denied",
+			err:  syscall.EPERM,
+		},
+		{
+			name: "existing hook conflict",
+			err:  syscall.EBUSY,
+		},
+		{
+			name: "invalid TCX configuration",
+			err:  syscall.EINVAL,
+		},
+		{
 			name: "other error",
 			err:  errors.New("permission denied"),
 			want: false,

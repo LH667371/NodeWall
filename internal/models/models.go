@@ -136,16 +136,34 @@ type SSHIntegrityStatus struct {
 
 // SSHProtectionSettings controls the agent-side SSH failure guard. The guard
 // consumes authentication failure events and applies temporary source blocks
-// through the existing XDP dataplane. TransferPolicy is kept alongside it so
-// the console can manage both SSH-layer controls from one security page.
+// through the existing XDP dataplane. SSH authentication and transfer policy
+// fields are kept alongside it so the console can manage all SSH controls from
+// one security page.
 type SSHProtectionSettings struct {
-	Enabled            bool              `json:"enabled"`
-	MaxFailures        int               `json:"max_failures"`
-	WindowSeconds      int               `json:"window_seconds"`
-	BanDurationSeconds int               `json:"ban_duration_seconds"`
-	TrustedCIDRs       []string          `json:"trusted_cidrs,omitempty"`
-	LogPath            string            `json:"log_path,omitempty"`
+	Enabled            bool     `json:"enabled"`
+	MaxFailures        int      `json:"max_failures"`
+	WindowSeconds      int      `json:"window_seconds"`
+	BanDurationSeconds int      `json:"ban_duration_seconds"`
+	TrustedCIDRs       []string `json:"trusted_cidrs,omitempty"`
+	LogPath            string   `json:"log_path,omitempty"`
+	// AllowPasswordLogin is nil until the operator explicitly manages the
+	// sshd authentication method. Keeping the unset state avoids changing an
+	// existing host's password policy during an upgrade.
+	AllowPasswordLogin *bool             `json:"allow_password_login,omitempty"`
 	Transfer           SSHTransferPolicy `json:"transfer"`
+}
+
+// SSHAuthorizedKey is a normalized public key entry from the node's
+// authorized_keys file. Private key material is never accepted or returned.
+type SSHAuthorizedKey struct {
+	Fingerprint         string   `json:"fingerprint"`
+	Type                string   `json:"type"`
+	Comment             string   `json:"comment,omitempty"`
+	PublicKey           string   `json:"public_key"`
+	Options             []string `json:"options,omitempty"`
+	NodeWallManaged     bool     `json:"nodewall_managed,omitempty"`
+	NodeWallActive      bool     `json:"nodewall_active,omitempty"`
+	NodeWallActiveKnown bool     `json:"nodewall_active_known,omitempty"`
 }
 
 type SSHProtectionStatus struct {
@@ -213,6 +231,27 @@ type LogDisposition struct {
 	UpdatedAt time.Time         `json:"updated_at"`
 }
 
+// EventDisposition is the operator triage state for a normalized event row.
+// It is deliberately separate from LogDisposition: a firewall action changes
+// dataplane policy, while handled/deferred is an auditable console decision
+// that must work for SSH and malware events as well.
+type EventDispositionStatus string
+
+const (
+	EventDispositionOpen     EventDispositionStatus = "open"
+	EventDispositionHandled  EventDispositionStatus = "handled"
+	EventDispositionDeferred EventDispositionStatus = "deferred"
+)
+
+type EventDisposition struct {
+	EventID   string                 `json:"event_id"`
+	NodeID    string                 `json:"node_id"`
+	Source    string                 `json:"source"`
+	Status    EventDispositionStatus `json:"status"`
+	UpdatedAt time.Time              `json:"updated_at"`
+	UpdatedBy string                 `json:"updated_by,omitempty"`
+}
+
 type PublishStatus string
 
 const (
@@ -237,6 +276,7 @@ type PublishRecord struct {
 
 type InterfaceHealth struct {
 	Interface            string    `json:"interface"`
+	DataplaneMode        string    `json:"dataplane_mode,omitempty"`
 	XDPAttached          bool      `json:"xdp_attached"`
 	MapOK                bool      `json:"map_ok"`
 	StatsOK              bool      `json:"stats_ok"`
@@ -264,6 +304,8 @@ type Node struct {
 	AgentURL       string                `json:"agent_url"`
 	AdvertiseIP    string                `json:"advertise_ip,omitempty"`
 	AgentHTTPAddr  string                `json:"agent_http_addr,omitempty"`
+	ServerHTTPAddr string                `json:"server_http_addr,omitempty"`
+	PackageVersion string                `json:"package_version,omitempty"`
 	SSH            *SSHConnectionProfile `json:"ssh,omitempty"`
 	LastSeenAt     time.Time             `json:"last_seen_at,omitempty"`
 }
@@ -289,15 +331,28 @@ type SystemMetrics struct {
 }
 
 type CPUMetrics struct {
+	LogicalCPUs   []LogicalCPUMetric `json:"logical_cpus,omitempty"`
+	UsagePercent  float64            `json:"usage_percent"`
+	UserPercent   float64            `json:"user_percent"`
+	SystemPercent float64            `json:"system_percent"`
+	IowaitPercent float64            `json:"iowait_percent"`
+	StealPercent  float64            `json:"steal_percent"`
+	Cores         int                `json:"cores"`
+	Load1         float64            `json:"load1"`
+	Load5         float64            `json:"load5"`
+	Load15        float64            `json:"load15"`
+}
+
+// LogicalCPUMetric uses the kernel's stable cpuN identity. A new/hot-plugged
+// core needs a second counter sample before a utilization can be calculated.
+type LogicalCPUMetric struct {
+	Name          string  `json:"name"`
 	UsagePercent  float64 `json:"usage_percent"`
 	UserPercent   float64 `json:"user_percent"`
 	SystemPercent float64 `json:"system_percent"`
 	IowaitPercent float64 `json:"iowait_percent"`
 	StealPercent  float64 `json:"steal_percent"`
-	Cores         int     `json:"cores"`
-	Load1         float64 `json:"load1"`
-	Load5         float64 `json:"load5"`
-	Load15        float64 `json:"load15"`
+	SampleReady   bool    `json:"sample_ready"`
 }
 
 type MemoryMetrics struct {
@@ -333,6 +388,7 @@ type NetworkMetrics struct {
 
 type NetworkInterfaceMetric struct {
 	Name               string  `json:"name"`
+	SampleReady        *bool   `json:"sample_ready,omitempty"`
 	OperationalState   string  `json:"operational_state,omitempty"`
 	RxBytes            uint64  `json:"rx_bytes"`
 	TxBytes            uint64  `json:"tx_bytes"`
@@ -372,6 +428,7 @@ type DiskMetrics struct {
 
 type DiskDeviceMetric struct {
 	Name                   string  `json:"name"`
+	SampleReady            *bool   `json:"sample_ready,omitempty"`
 	ReadBytes              uint64  `json:"read_bytes"`
 	WriteBytes             uint64  `json:"write_bytes"`
 	ReadOps                uint64  `json:"read_ops"`
@@ -446,102 +503,140 @@ type FilesystemMetric struct {
 // counters so the browser can render a useful chart without knowing how the
 // Linux proc counters are calculated.
 type SystemMetricPoint struct {
-	CPUCores                   int       `json:"cpu_cores"`
-	MemoryTotalBytes           float64   `json:"memory_total_bytes"`
-	Timestamp                  time.Time `json:"timestamp"`
-	NodeID                     string    `json:"node_id,omitempty"`
-	UptimeSeconds              float64   `json:"uptime_seconds"`
-	CPUPercent                 float64   `json:"cpu_percent"`
-	CPUUserPercent             float64   `json:"cpu_user_percent"`
-	CPUSystemPercent           float64   `json:"cpu_system_percent"`
-	CPUIowaitPercent           float64   `json:"cpu_iowait_percent"`
-	CPUStealPercent            float64   `json:"cpu_steal_percent"`
-	Load1                      float64   `json:"load_1"`
-	Load5                      float64   `json:"load_5"`
-	Load15                     float64   `json:"load_15"`
-	MemoryPercent              float64   `json:"memory_percent"`
-	MemoryUsedBytes            float64   `json:"memory_used_bytes"`
-	MemoryAvailableBytes       float64   `json:"memory_available_bytes"`
-	SwapUsedBytes              float64   `json:"swap_used_bytes"`
-	SwapUsedPercent            float64   `json:"swap_used_percent"`
-	RxBytesPerSecond           float64   `json:"rx_bytes_per_second"`
-	TxBytesPerSecond           float64   `json:"tx_bytes_per_second"`
-	RxPacketsPerSecond         float64   `json:"rx_packets_per_second"`
-	TxPacketsPerSecond         float64   `json:"tx_packets_per_second"`
-	RxErrorsPerSecond          float64   `json:"rx_errors_per_second"`
-	TxErrorsPerSecond          float64   `json:"tx_errors_per_second"`
-	RxDroppedPerSecond         float64   `json:"rx_dropped_per_second"`
-	TxDroppedPerSecond         float64   `json:"tx_dropped_per_second"`
-	DiskReadBytesPerSecond     float64   `json:"disk_read_bytes_per_second"`
-	DiskWriteBytesPerSecond    float64   `json:"disk_write_bytes_per_second"`
-	DiskReadOpsPerSecond       float64   `json:"disk_read_ops_per_second"`
-	DiskWriteOpsPerSecond      float64   `json:"disk_write_ops_per_second"`
-	DiskIOUtilizationPercent   float64   `json:"disk_io_utilization_percent"`
-	DiskReadAwaitMilliseconds  float64   `json:"disk_read_await_milliseconds"`
-	DiskWriteAwaitMilliseconds float64   `json:"disk_write_await_milliseconds"`
-	FilesystemUsedPercent      float64   `json:"filesystem_used_percent"`
-	FilesystemAvailableBytes   float64   `json:"filesystem_available_bytes"`
-	ContextSwitchesPerSecond   float64   `json:"context_switches_per_second"`
-	InterruptsPerSecond        float64   `json:"interrupts_per_second"`
-	ForksPerSecond             float64   `json:"forks_per_second"`
-	ProcessesTotal             float64   `json:"processes_total"`
-	ProcessesRunning           float64   `json:"processes_running"`
-	ProcessesBlocked           float64   `json:"processes_blocked"`
-	TCPInUse                   float64   `json:"tcp_in_use"`
-	TCPTimeWait                float64   `json:"tcp_time_wait"`
-	UDPInUse                   float64   `json:"udp_in_use"`
-	FileDescriptorsAllocated   float64   `json:"file_descriptors_allocated"`
-	FileDescriptorsMaximum     float64   `json:"file_descriptors_maximum"`
-	FileDescriptorsUsedPercent float64   `json:"file_descriptors_used_percent"`
+	LogicalCPUs                []LogicalCPUMetric `json:"logical_cpus,omitempty"`
+	CPUCores                   int                `json:"cpu_cores"`
+	MemoryTotalBytes           float64            `json:"memory_total_bytes"`
+	Timestamp                  time.Time          `json:"timestamp"`
+	NodeID                     string             `json:"node_id,omitempty"`
+	UptimeSeconds              float64            `json:"uptime_seconds"`
+	CPUPercent                 float64            `json:"cpu_percent"`
+	CPUUserPercent             float64            `json:"cpu_user_percent"`
+	CPUSystemPercent           float64            `json:"cpu_system_percent"`
+	CPUIowaitPercent           float64            `json:"cpu_iowait_percent"`
+	CPUStealPercent            float64            `json:"cpu_steal_percent"`
+	Load1                      float64            `json:"load_1"`
+	Load5                      float64            `json:"load_5"`
+	Load15                     float64            `json:"load_15"`
+	MemoryPercent              float64            `json:"memory_percent"`
+	MemoryUsedBytes            float64            `json:"memory_used_bytes"`
+	MemoryAvailableBytes       float64            `json:"memory_available_bytes"`
+	SwapUsedBytes              float64            `json:"swap_used_bytes"`
+	SwapUsedPercent            float64            `json:"swap_used_percent"`
+	RxBytesPerSecond           float64            `json:"rx_bytes_per_second"`
+	TxBytesPerSecond           float64            `json:"tx_bytes_per_second"`
+	RxPacketsPerSecond         float64            `json:"rx_packets_per_second"`
+	TxPacketsPerSecond         float64            `json:"tx_packets_per_second"`
+	RxErrorsPerSecond          float64            `json:"rx_errors_per_second"`
+	TxErrorsPerSecond          float64            `json:"tx_errors_per_second"`
+	RxDroppedPerSecond         float64            `json:"rx_dropped_per_second"`
+	TxDroppedPerSecond         float64            `json:"tx_dropped_per_second"`
+	DiskReadBytesPerSecond     float64            `json:"disk_read_bytes_per_second"`
+	DiskWriteBytesPerSecond    float64            `json:"disk_write_bytes_per_second"`
+	DiskReadOpsPerSecond       float64            `json:"disk_read_ops_per_second"`
+	DiskWriteOpsPerSecond      float64            `json:"disk_write_ops_per_second"`
+	DiskIOUtilizationPercent   float64            `json:"disk_io_utilization_percent"`
+	DiskReadAwaitMilliseconds  float64            `json:"disk_read_await_milliseconds"`
+	DiskWriteAwaitMilliseconds float64            `json:"disk_write_await_milliseconds"`
+	// Keep per-device samples in node history so disk, interface, and filesystem
+	// details remain available after the management server restarts.
+	DiskDevices                []DiskDeviceMetric       `json:"disk_devices,omitempty"`
+	NetworkInterfaces          []NetworkInterfaceMetric `json:"network_interfaces,omitempty"`
+	Filesystems                []FilesystemMetric       `json:"filesystems,omitempty"`
+	Accelerators               []AcceleratorMetrics     `json:"accelerators,omitempty"`
+	FilesystemUsedPercent      float64                  `json:"filesystem_used_percent"`
+	FilesystemAvailableBytes   float64                  `json:"filesystem_available_bytes"`
+	ContextSwitchesPerSecond   float64                  `json:"context_switches_per_second"`
+	InterruptsPerSecond        float64                  `json:"interrupts_per_second"`
+	ForksPerSecond             float64                  `json:"forks_per_second"`
+	ProcessesTotal             float64                  `json:"processes_total"`
+	ProcessesRunning           float64                  `json:"processes_running"`
+	ProcessesBlocked           float64                  `json:"processes_blocked"`
+	TCPInUse                   float64                  `json:"tcp_in_use"`
+	TCPTimeWait                float64                  `json:"tcp_time_wait"`
+	UDPInUse                   float64                  `json:"udp_in_use"`
+	FileDescriptorsAllocated   float64                  `json:"file_descriptors_allocated"`
+	FileDescriptorsMaximum     float64                  `json:"file_descriptors_maximum"`
+	FileDescriptorsUsedPercent float64                  `json:"file_descriptors_used_percent"`
 }
 
 type SystemMetricNodeSummary struct {
-	NodeID           string                `json:"node_id"`
-	Name             string                `json:"name"`
-	Status           string                `json:"status"`
-	Timestamp        time.Time             `json:"timestamp,omitempty"`
-	UptimeSeconds    float64               `json:"uptime_seconds"`
-	CPUCores         int                   `json:"cpu_cores"`
-	CPUPercent       float64               `json:"cpu_percent"`
-	MemoryPercent    float64               `json:"memory_percent"`
-	MemoryTotalBytes uint64                `json:"memory_total_bytes"`
-	MemoryUsedBytes  uint64                `json:"memory_used_bytes"`
-	SwapUsedBytes    uint64                `json:"swap_used_bytes"`
-	Sockets          SocketMetrics         `json:"sockets"`
-	FileDescriptors  FileDescriptorMetrics `json:"file_descriptors"`
-	RxBytesPerSecond float64               `json:"rx_bytes_per_second"`
-	TxBytesPerSecond float64               `json:"tx_bytes_per_second"`
-	Disk             DiskMetrics           `json:"disk"`
-	Kernel           KernelMetrics         `json:"kernel"`
-	Processes        ProcessMetrics        `json:"processes"`
-	Filesystems      []FilesystemMetric    `json:"filesystems,omitempty"`
+	LogicalCPUs       []LogicalCPUMetric       `json:"logical_cpus,omitempty"`
+	NodeID            string                   `json:"node_id"`
+	Name              string                   `json:"name"`
+	Status            string                   `json:"status"`
+	Timestamp         time.Time                `json:"timestamp,omitempty"`
+	UptimeSeconds     float64                  `json:"uptime_seconds"`
+	CPUCores          int                      `json:"cpu_cores"`
+	CPUPercent        float64                  `json:"cpu_percent"`
+	MemoryPercent     float64                  `json:"memory_percent"`
+	MemoryTotalBytes  uint64                   `json:"memory_total_bytes"`
+	MemoryUsedBytes   uint64                   `json:"memory_used_bytes"`
+	SwapUsedBytes     uint64                   `json:"swap_used_bytes"`
+	Sockets           SocketMetrics            `json:"sockets"`
+	FileDescriptors   FileDescriptorMetrics    `json:"file_descriptors"`
+	RxBytesPerSecond  float64                  `json:"rx_bytes_per_second"`
+	TxBytesPerSecond  float64                  `json:"tx_bytes_per_second"`
+	Disk              DiskMetrics              `json:"disk"`
+	NetworkInterfaces []NetworkInterfaceMetric `json:"network_interfaces,omitempty"`
+	Kernel            KernelMetrics            `json:"kernel"`
+	Processes         ProcessMetrics           `json:"processes"`
+	Filesystems       []FilesystemMetric       `json:"filesystems,omitempty"`
+	Accelerators      []AcceleratorMetrics     `json:"accelerators,omitempty"`
 }
 
 // SystemMetricsHistory is the server-side response for the Grafana-like
 // monitoring view. The control plane persists samples independently of browsers
 // and returns bounded, time-bucketed points for long-range queries.
 type SystemMetricsHistory struct {
-	Scope                 string                    `json:"scope"`
-	NodeID                string                    `json:"node_id,omitempty"`
-	RangeSeconds          int                       `json:"range_seconds"`
-	SampleIntervalSeconds int                       `json:"sample_interval_seconds"`
-	RetentionSeconds      int                       `json:"retention_seconds"`
-	StorageError          string                    `json:"storage_error,omitempty"`
-	Points                []SystemMetricPoint       `json:"points"`
-	Nodes                 []SystemMetricNodeSummary `json:"nodes"`
+	Scope                 string              `json:"scope"`
+	NodeID                string              `json:"node_id,omitempty"`
+	RangeSeconds          int                 `json:"range_seconds"`
+	SampleIntervalSeconds int                 `json:"sample_interval_seconds"`
+	SampledAt             time.Time           `json:"sampled_at"`
+	RetentionSeconds      int                 `json:"retention_seconds"`
+	StorageError          string              `json:"storage_error,omitempty"`
+	Points                []SystemMetricPoint `json:"points"`
+	// NodePoints preserves the per-node time series alongside the cluster
+	// aggregate. The console uses it to draw separate lines instead of hiding
+	// a slow or busy node inside the cluster average.
+	NodePoints map[string][]SystemMetricPoint `json:"node_points,omitempty"`
+	Nodes      []SystemMetricNodeSummary      `json:"nodes"`
 }
 
-// AcceleratorMetrics deliberately has no vendor-specific dependency. An
-// NVIDIA collector can populate this later by reading a supported kernel
-// interface without changing the API shape.
+// AcceleratorMetric is an optional vendor-specific measurement. Keeping the
+// metric key and unit in the payload lets the UI render fields exposed by a
+// particular driver without pretending every GPU has the same sensors.
+type AcceleratorMetric struct {
+	Value float64 `json:"value"`
+	Unit  string  `json:"unit,omitempty"`
+	Label string  `json:"label,omitempty"`
+}
+
+// AcceleratorMetrics is vendor-neutral. The agent populates common fields
+// where possible and retains extra measurements in Metrics for NVIDIA, AMD,
+// Intel, Ascend, Cambricon and other vendor-specific adapters.
 type AcceleratorMetrics struct {
-	Vendor             string  `json:"vendor"`
-	Index              int     `json:"index"`
-	Name               string  `json:"name,omitempty"`
-	MemoryTotalBytes   uint64  `json:"memory_total_bytes,omitempty"`
-	MemoryUsedBytes    uint64  `json:"memory_used_bytes,omitempty"`
-	UtilizationPercent float64 `json:"utilization_percent,omitempty"`
-	TemperatureC       float64 `json:"temperature_c,omitempty"`
+	Vendor             string                       `json:"vendor"`
+	VendorID           string                       `json:"vendor_id,omitempty"`
+	Index              int                          `json:"index"`
+	Name               string                       `json:"name,omitempty"`
+	Architecture       string                       `json:"architecture,omitempty"`
+	Driver             string                       `json:"driver,omitempty"`
+	Backend            string                       `json:"backend,omitempty"`
+	BusID              string                       `json:"bus_id,omitempty"`
+	DeviceID           string                       `json:"device_id,omitempty"`
+	MemoryTotalBytes   uint64                       `json:"memory_total_bytes,omitempty"`
+	MemoryUsedBytes    uint64                       `json:"memory_used_bytes,omitempty"`
+	UtilizationPercent float64                      `json:"utilization_percent,omitempty"`
+	TemperatureC       float64                      `json:"temperature_c,omitempty"`
+	PowerWatts         float64                      `json:"power_watts,omitempty"`
+	PowerLimitWatts    float64                      `json:"power_limit_watts,omitempty"`
+	FanPercent         float64                      `json:"fan_percent,omitempty"`
+	ClockMHz           float64                      `json:"clock_mhz,omitempty"`
+	MemoryClockMHz     float64                      `json:"memory_clock_mhz,omitempty"`
+	ProcessCount       uint64                       `json:"process_count,omitempty"`
+	Capabilities       []string                     `json:"capabilities,omitempty"`
+	Metrics            map[string]AcceleratorMetric `json:"metrics,omitempty"`
 }
 
 // SSHConnectionProfile stores only connection metadata. Authentication
@@ -619,15 +714,16 @@ type InterfaceStats struct {
 }
 
 type SourceStat struct {
-	SourceIP    string       `json:"source_ip"`
-	Passed      uint64       `json:"passed"`
-	Dropped     uint64       `json:"dropped"`
-	Total       uint64       `json:"total"`
-	DropRatio   float64      `json:"drop_ratio"`
-	Risk        string       `json:"risk"`
-	Geo         *GeoLocation `json:"geo,omitempty"`
-	CountryCode string       `json:"country_code,omitempty"`
-	CountryName string       `json:"country_name,omitempty"`
+	SourceIP     string       `json:"source_ip"`
+	SourceDomain string       `json:"source_domain,omitempty"`
+	Passed       uint64       `json:"passed"`
+	Dropped      uint64       `json:"dropped"`
+	Total        uint64       `json:"total"`
+	DropRatio    float64      `json:"drop_ratio"`
+	Risk         string       `json:"risk"`
+	Geo          *GeoLocation `json:"geo,omitempty"`
+	CountryCode  string       `json:"country_code,omitempty"`
+	CountryName  string       `json:"country_name,omitempty"`
 }
 
 type GeoLocation struct {
@@ -667,6 +763,7 @@ type TrafficPoint struct {
 
 type BlockSuggestion struct {
 	SourceIP      string `json:"source_ip"`
+	SourceDomain  string `json:"source_domain,omitempty"`
 	SuggestedCIDR string `json:"suggested_cidr"`
 	Risk          string `json:"risk"`
 	Reason        string `json:"reason"`
@@ -681,8 +778,14 @@ type PortStat struct {
 }
 
 type InterceptLogEntry struct {
-	Direction   PolicyDirection `json:"direction,omitempty"`
-	SourceIP    string          `json:"source_ip"`
+	Direction    PolicyDirection `json:"direction,omitempty"`
+	SourceIP     string          `json:"source_ip"`
+	SourceDomain string          `json:"source_domain,omitempty"`
+	// SourceCIDR identifies a rule-counter aggregate without an observed packet
+	// source. SourceIP stays empty; never substitute the unspecified address.
+	SourceCIDR string `json:"source_cidr,omitempty"`
+	// Port is always the packet destination port. For ingress records this is
+	// the local target port; it is never the remote source port.
 	Port        uint16          `json:"port,omitempty"`
 	Reason      string          `json:"reason"`
 	Count       uint64          `json:"count,omitempty"`
@@ -692,11 +795,15 @@ type InterceptLogEntry struct {
 }
 
 type DropLogRecord struct {
-	Timestamp   time.Time       `json:"timestamp"`
-	NodeID      string          `json:"node_id,omitempty"`
-	Interface   string          `json:"interface"`
-	Direction   PolicyDirection `json:"direction,omitempty"`
-	SourceIP    string          `json:"source_ip"`
+	Timestamp    time.Time       `json:"timestamp"`
+	NodeID       string          `json:"node_id,omitempty"`
+	Interface    string          `json:"interface"`
+	Direction    PolicyDirection `json:"direction,omitempty"`
+	SourceIP     string          `json:"source_ip"`
+	SourceDomain string          `json:"source_domain,omitempty"`
+	SourceCIDR   string          `json:"source_cidr,omitempty"`
+	// Port keeps the packet destination-port semantics of InterceptLogEntry so
+	// older persisted JSON and action APIs remain compatible.
 	Port        uint16          `json:"port,omitempty"`
 	Reason      string          `json:"reason"`
 	Count       uint64          `json:"count,omitempty"`
@@ -714,10 +821,36 @@ type DropLogSettings struct {
 }
 
 type AuthSecuritySettings struct {
-	MaxFailures         int `json:"max_failures"`
-	WindowSeconds       int `json:"window_seconds"`
-	LockDurationSeconds int `json:"lock_duration_seconds"`
-	ActiveLocks         int `json:"active_locks,omitempty"`
+	MaxFailures         int      `json:"max_failures"`
+	WindowSeconds       int      `json:"window_seconds"`
+	LockDurationSeconds int      `json:"lock_duration_seconds"`
+	ActiveLocks         int      `json:"active_locks,omitempty"`
+	MFARequired         bool     `json:"mfa_required"`
+	RequireMFAForAdmin  bool     `json:"require_mfa_for_admin"`
+	AllowedMFAMethods   []string `json:"allowed_mfa_methods,omitempty"`
+	PasskeyEnabled      bool     `json:"passkey_enabled"`
+	PasskeyRPID         string   `json:"passkey_rp_id,omitempty"`
+	PasskeyOrigins      []string `json:"passkey_origins,omitempty"`
+	PasskeyTLSMode      string   `json:"passkey_tls_mode,omitempty"` // local or proxy
+}
+
+// SMTPSettings contains administrator-managed mail transport settings. The
+// password is stored in the encrypted settings file and is never returned by
+// the API; API responses expose only HasPassword.
+type SMTPSettings struct {
+	Enabled        bool   `json:"enabled"`
+	Host           string `json:"host"`
+	Port           int    `json:"port"`
+	Security       string `json:"security"` // starttls, smtps, or plain
+	Username       string `json:"username,omitempty"`
+	Password       string `json:"password,omitempty"`
+	FromEmail      string `json:"from_email"`
+	FromName       string `json:"from_name,omitempty"`
+	SubjectPrefix  string `json:"subject_prefix,omitempty"`
+	ResetSubject   string `json:"reset_subject,omitempty"`
+	ResetTemplate  string `json:"reset_template,omitempty"`
+	VerifySubject  string `json:"verify_subject,omitempty"`
+	VerifyTemplate string `json:"verify_template,omitempty"`
 }
 
 type ChallengeAdvice struct {
@@ -728,27 +861,31 @@ type ChallengeAdvice struct {
 }
 
 type DetectedInterface struct {
-	Name           string             `json:"name"`
-	MTU            int                `json:"mtu"`
-	Flags          []string           `json:"flags"`
-	HardwareAddr   string             `json:"hardware_addr,omitempty"`
-	Addresses      []string           `json:"addresses,omitempty"`
-	IsUp           bool               `json:"is_up"`
-	IsLoopback     bool               `json:"is_loopback"`
-	IsPhysical     bool               `json:"is_physical"`
-	IsRecommended  bool               `json:"is_recommended"`
-	Attached       bool               `json:"attached,omitempty"`
-	BypassCIDRs    int                `json:"bypass_cidrs,omitempty"`
-	BlockedCIDRs   int                `json:"blocked_cidrs,omitempty"`
-	AllowCIDRs     int                `json:"allow_cidrs,omitempty"`
-	PublicPorts    int                `json:"public_ports,omitempty"`
-	DeniedPorts    int                `json:"denied_ports,omitempty"`
-	AllowPorts     int                `json:"allow_ports,omitempty"`
-	AttachMode     string             `json:"attach_mode,omitempty"`
-	LastPassed     uint64             `json:"last_passed,omitempty"`
-	LastDropped    uint64             `json:"last_dropped,omitempty"`
-	PendingPublish *PublishRecord     `json:"pending_publish,omitempty"`
-	Egress         DirectionInventory `json:"egress,omitempty"`
+	Name         string   `json:"name"`
+	MTU          int      `json:"mtu"`
+	Flags        []string `json:"flags"`
+	HardwareAddr string   `json:"hardware_addr,omitempty"`
+	Addresses    []string `json:"addresses,omitempty"`
+	// AddressInterface identifies the bridge/bond that owns RelatedAddresses;
+	// Addresses always remains this NIC's own addresses and policy target.
+	AddressInterface string             `json:"address_interface,omitempty"`
+	RelatedAddresses []string           `json:"related_addresses,omitempty"`
+	IsUp             bool               `json:"is_up"`
+	IsLoopback       bool               `json:"is_loopback"`
+	IsPhysical       bool               `json:"is_physical"`
+	IsRecommended    bool               `json:"is_recommended"`
+	Attached         bool               `json:"attached,omitempty"`
+	BypassCIDRs      int                `json:"bypass_cidrs,omitempty"`
+	BlockedCIDRs     int                `json:"blocked_cidrs,omitempty"`
+	AllowCIDRs       int                `json:"allow_cidrs,omitempty"`
+	PublicPorts      int                `json:"public_ports,omitempty"`
+	DeniedPorts      int                `json:"denied_ports,omitempty"`
+	AllowPorts       int                `json:"allow_ports,omitempty"`
+	AttachMode       string             `json:"attach_mode,omitempty"`
+	LastPassed       uint64             `json:"last_passed,omitempty"`
+	LastDropped      uint64             `json:"last_dropped,omitempty"`
+	PendingPublish   *PublishRecord     `json:"pending_publish,omitempty"`
+	Egress           DirectionInventory `json:"egress,omitempty"`
 }
 
 type InterfaceInventory struct {
@@ -787,6 +924,12 @@ func DefaultDirectionPolicy(direction PolicyDirection) DirectionPolicy {
 		},
 	}
 	if direction == DirectionEgress {
+		// Keep the initial outbound baseline useful for node updates, package
+		// downloads, DNS, time sync, SSH maintenance, and ICMP diagnostics. It
+		// remains observe-only until the operator explicitly enables egress
+		// enforcement, so adding these defaults cannot interrupt a new node.
+		policy.AllowedPortRules = defaultEgressPortRules()
+		policy.AllowedPorts = collapsePortRules(policy.AllowedPortRules)
 		policy.ObserveOnly = true
 	}
 	return policy
@@ -832,6 +975,14 @@ func NormalizeInterfacePolicy(policy InterfacePolicy) InterfacePolicy {
 	}
 	if strings.EqualFold(strings.TrimSpace(policy.Egress.Mode), "observe") {
 		policy.Egress.ObserveOnly = true
+	}
+	// Policies written before the outbound baseline existed can already have
+	// mode=observe (or whitelist+observe_only) but no rule data. Seed those
+	// policies during normalization so an existing node receives the same
+	// safe defaults as a newly enrolled node.
+	if policy.Egress.Enabled && policy.Egress.ObserveOnly && directionPolicyHasNoRules(policy.Egress) {
+		policy.Egress.AllowedPortRules = defaultEgressPortRules()
+		policy.Egress.AllowedPorts = collapsePortRules(policy.Egress.AllowedPortRules)
 	}
 	if policy.Egress.NonIPv4Action == "" {
 		policy.Egress.NonIPv4Action = NonIPv4Drop
@@ -882,6 +1033,25 @@ func NormalizeInterfacePolicy(policy InterfacePolicy) InterfacePolicy {
 		policy.PendingPublish = nil
 	}
 	return policy
+}
+
+func defaultEgressPortRules() []PortRule {
+	return []PortRule{
+		{Protocol: PortProtocolTCP, Port: 22},
+		{Protocol: PortProtocolTCP, Port: 53},
+		{Protocol: PortProtocolTCP, Port: 80},
+		{Protocol: PortProtocolTCP, Port: 443},
+		{Protocol: PortProtocolUDP, Port: 53},
+		{Protocol: PortProtocolUDP, Port: 123},
+		{Protocol: PortProtocolICMP},
+	}
+}
+
+func directionPolicyHasNoRules(policy DirectionPolicy) bool {
+	return len(policy.Rules) == 0 && len(policy.BypassCIDRs) == 0 && len(policy.BlockedCIDRs) == 0 &&
+		len(policy.ICMPAllowCIDRs) == 0 && len(policy.ICMPBlockedCIDRs) == 0 &&
+		len(policy.PublicPorts) == 0 && len(policy.DeniedPorts) == 0 && len(policy.AllowedPorts) == 0 &&
+		len(policy.PublicPortRules) == 0 && len(policy.DeniedPortRules) == 0 && len(policy.AllowedPortRules) == 0
 }
 
 func normalizeRuleDescriptions(descriptions []RuleDescription, legacyRules []ACLRule) []RuleDescription {

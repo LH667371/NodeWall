@@ -1,10 +1,29 @@
 package xdp
 
 import (
+	"encoding/binary"
 	"testing"
 
 	"nodewall/internal/models"
 )
+
+func TestDropMapAuditCompatibility(t *testing.T) {
+	if binary.Size(dropLogKey{}) != 8 || binary.Size(dropLogValue{}) != 16 {
+		t.Fatal("drop-log map ABI changed")
+	}
+	for _, direction := range []models.PolicyDirection{models.DirectionIngress, models.DirectionEgress} {
+		for _, observed := range []uint8{0, 1} {
+			entry := interceptLogFromMap(dropLogKey{SourceIP: 0x010200c0, DestPort: 67, Reason: dropReasonDHCPBroadcast, Reserved: observed}, dropLogValue{Drops: 3}, direction)
+			wantDrops := uint64(3)
+			if observed == 1 {
+				wantDrops = 0
+			}
+			if entry.Count != 3 || entry.Drops != wantDrops || entry.Direction != direction || entry.Reason != "dhcp_broadcast" || entry.SourceIP != "192.0.2.1" {
+				t.Fatalf("incorrect map audit conversion: %+v", entry)
+			}
+		}
+	}
+}
 
 func TestCIDRToKey(t *testing.T) {
 	key, normalized, err := CIDRToKey("10.1.2.3/24")
@@ -41,11 +60,16 @@ func TestCIDRToKeyAcceptsSingleIPv4Address(t *testing.T) {
 
 func TestConfigConversion(t *testing.T) {
 	value, err := configToValue(Config{
-		NonIPv4Action:        models.NonIPv4Drop,
-		PortPolicyEnabled:    true,
-		PolicyEnforced:       true,
-		EgressPolicyEnforced: true,
-		ObserveOnly:          true,
+		NonIPv4Action:           models.NonIPv4Drop,
+		PortPolicyEnabled:       true,
+		PolicyEnforced:          true,
+		EgressPolicyEnforced:    true,
+		ObserveOnly:             true,
+		EgressObserveOnly:       true,
+		EgressNonIPv4Action:     models.NonIPv4Drop,
+		EgressPortPolicyEnabled: true,
+		EgressRateLimitEnabled:  true,
+		EgressDefaultDeny:       true,
 	})
 	if err != nil {
 		t.Fatalf("configToValue returned error: %v", err)
@@ -66,6 +90,10 @@ func TestConfigConversion(t *testing.T) {
 	}
 	if !got.ObserveOnly {
 		t.Fatalf("expected observe-only mode to round-trip")
+	}
+	if !got.EgressObserveOnly || got.EgressNonIPv4Action != models.NonIPv4Drop ||
+		!got.EgressPortPolicyEnabled || !got.EgressRateLimitEnabled || !got.EgressDefaultDeny {
+		t.Fatalf("expected egress config flags to round-trip: %#v", got)
 	}
 }
 

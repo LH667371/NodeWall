@@ -100,10 +100,141 @@ func TestProtectionBaselineAppliesRecoveryAccessBeforeEnforcement(t *testing.T) 
 	}
 }
 
+func TestProtectionBaselineCanEnableEgressDirection(t *testing.T) {
+	var mu sync.Mutex
+	published := map[models.PolicyDirection]map[string]any{}
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/interfaces/ens3/attach":
+			writeJSON(w, http.StatusOK, map[string]any{})
+		case r.Method == http.MethodPost && r.URL.Path == "/interfaces/ens3/apply":
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode apply payload: %v", err)
+			}
+			direction, _ := payload["direction"].(string)
+			mu.Lock()
+			published[models.PolicyDirection(direction)] = payload
+			mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{})
+		case r.Method == http.MethodPost && r.URL.Path == "/interfaces/ens3/confirm":
+			writeJSON(w, http.StatusOK, map[string]any{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer agent.Close()
+
+	ctx := context.Background()
+	state := store.New()
+	state.UpsertNode(ctx, models.Node{ID: "node-a", Name: "node-a", AgentURL: agent.URL})
+	state.PutPolicy(ctx, models.InterfacePolicy{
+		NodeID: "node-a", Interface: "ens3", Enabled: true, Mode: "observe", DefaultAction: "pass",
+		Ingress: models.DirectionPolicy{Enabled: true, Mode: "observe", DefaultAction: "pass", ObserveOnly: true},
+		Egress: models.DirectionPolicy{
+			Enabled: true, Mode: "whitelist", DefaultAction: "drop", ObserveOnly: true,
+			PublicPortRules: []models.PortRule{{Protocol: models.PortProtocolTCP, Port: 443}},
+		},
+	})
+	handler := &ServerHandler{
+		service:     service.NewPolicyService(state),
+		store:       state,
+		reverseHTTP: agent.Client(),
+	}
+	req := httptest.NewRequest(http.MethodPost, "/nodes/node-a/interfaces/ens3/protection-baseline", strings.NewReader(`{"direction":"egress"}`))
+	req.SetPathValue("node", "node-a")
+	req.SetPathValue("iface", "ens3")
+	rec := httptest.NewRecorder()
+	handler.handleEnableProtectionBaseline(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d: %s", rec.Code, rec.Body.String())
+	}
+
+	mu.Lock()
+	egress := published[models.DirectionEgress]
+	ingress := published[models.DirectionIngress]
+	mu.Unlock()
+	if egress == nil || ingress == nil {
+		t.Fatalf("expected both direction payloads, got %#v", published)
+	}
+	if observeOnly, _ := egress["observe_only"].(bool); observeOnly {
+		t.Fatalf("egress baseline remained observe-only: %#v", egress)
+	}
+	if !hasPortRule(egress["public_port_rules"], models.PortProtocolTCP, 443) {
+		t.Fatalf("egress rules were not preserved: %#v", egress["public_port_rules"])
+	}
+	if observeOnly, _ := ingress["observe_only"].(bool); !observeOnly {
+		t.Fatalf("egress baseline unexpectedly changed ingress enforcement: %#v", ingress)
+	}
+}
+
+func TestProtectionBaselineDisableKeepsRulesAndMakesDirectionObserveOnly(t *testing.T) {
+	var published = map[models.PolicyDirection]map[string]any{}
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/interfaces/ens3/attach" {
+			writeJSON(w, http.StatusOK, map[string]any{})
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/interfaces/ens3/apply" {
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode apply payload: %v", err)
+			}
+			published[models.PolicyDirection(payload["direction"].(string))] = payload
+			writeJSON(w, http.StatusOK, map[string]any{})
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/interfaces/ens3/confirm" {
+			writeJSON(w, http.StatusOK, map[string]any{})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer agent.Close()
+
+	ctx := context.Background()
+	state := store.New()
+	state.UpsertNode(ctx, models.Node{ID: "node-a", Name: "node-a", AgentURL: agent.URL})
+	state.PutPolicy(ctx, models.InterfacePolicy{
+		NodeID: "node-a", Interface: "ens3", Enabled: true,
+		Ingress: models.DirectionPolicy{
+			Enabled: true, Mode: "whitelist", DefaultAction: "drop", ObserveOnly: false,
+			PublicPortRules: []models.PortRule{{Protocol: models.PortProtocolTCP, Port: 8082}},
+		},
+		Egress: models.DirectionPolicy{Enabled: true, Mode: "observe", DefaultAction: "pass", ObserveOnly: true},
+	})
+	h := &ServerHandler{service: service.NewPolicyService(state), store: state, reverseHTTP: agent.Client()}
+	req := httptest.NewRequest(http.MethodPost, "/nodes/node-a/interfaces/ens3/protection-baseline/disable", strings.NewReader(`{"direction":"ingress"}`))
+	req.SetPathValue("node", "node-a")
+	req.SetPathValue("iface", "ens3")
+	rec := httptest.NewRecorder()
+	h.handleDisableProtectionBaseline(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d: %s", rec.Code, rec.Body.String())
+	}
+	ingress := published[models.DirectionIngress]
+	if ingress == nil {
+		t.Fatalf("expected ingress apply payload, got %#v", published)
+	}
+	if observe, _ := ingress["observe_only"].(bool); !observe {
+		t.Fatalf("disable must publish observe-only state: %#v", ingress)
+	}
+	if !hasPortRule(ingress["public_port_rules"], models.PortProtocolTCP, 8082) {
+		t.Fatalf("disable must retain existing rules: %#v", ingress["public_port_rules"])
+	}
+	stored, err := state.GetPolicy(ctx, "node-a", "ens3")
+	if err != nil || stored.Ingress.DefaultAction != "pass" || stored.Ingress.Mode != "observe" {
+		t.Fatalf("disable must persist observe/pass state, got %#v (err=%v)", stored.Ingress, err)
+	}
+}
+
 func TestControlPlanePortRulesAlwaysIncludeZStackHTTPSPort(t *testing.T) {
-	rules := controlPlanePortRules(config.ServerConfig{ListenAddr: "0.0.0.0:8080"})
+	rules := controlPlanePortRules(config.ServerConfig{ListenAddr: "0.0.0.0:8080", AgentURL: "https://192.168.201.17:9080"})
 	if !containsPortRule(rules, models.PortRule{Protocol: models.PortProtocolTCP, Port: 8082}) {
 		t.Fatalf("manager control rules omitted the default ZStack HTTPS port: %#v", rules)
+	}
+	if !containsPortRule(rules, models.PortRule{Protocol: models.PortProtocolTCP, Port: 9080}) {
+		t.Fatalf("manager control rules omitted the remote Agent port: %#v", rules)
 	}
 }
 
@@ -142,7 +273,7 @@ func TestProtectionStatusForInterface(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := protectionStatusForInterface(tc.health, "ens3"); got != tc.want {
+			if got := protectionStatusForInterface(tc.health, "ens3", false); got != tc.want {
 				t.Fatalf("expected %q, got %q", tc.want, got)
 			}
 		})
@@ -227,7 +358,7 @@ func TestProtectionBaselineTrialRestoresAnUnattachedInterface(t *testing.T) {
 		}
 		if _, ok := state.PendingPolicyUpdate("node-a", "ens3"); !ok {
 			runtime, err := dataplane.Runtime("ens3")
-			if err == nil && runtime.Config.ObserveOnly {
+			if err == nil && !runtime.Attached {
 				policy, policyErr := state.GetPolicy(ctx, "node-a", "ens3")
 				if policyErr != nil {
 					t.Fatal(policyErr)

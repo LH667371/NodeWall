@@ -23,7 +23,11 @@ function maxValue() {
   <div v-if="items.length" class="trend-list">
     <div v-for="item in items" :key="item.timestamp || item.source_ip || item.port" class="trend-row">
       <div class="trend-row-head">
-        <span>{{ item.label || item.country_name || item.source_ip || `:${item.port}` }}</span>
+        <span v-if="item.source_domain" class="trend-source-name">
+          <strong>{{ item.source_domain }}</strong>
+          <small>{{ item.source_ip }}</small>
+        </span>
+        <span v-else>{{ item.label || item.country_name || item.source_ip || `:${item.port}` }}</span>
         <strong>{{ item.total || item.dropped || item.passed || 0 }}</strong>
       </div>
       <div class="trend-track">

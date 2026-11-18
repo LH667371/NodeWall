@@ -82,13 +82,14 @@ func (r *Recorder) Flush(dp xdp.Dataplane) error {
 			}
 			delta := current - prev
 			record := models.DropLogRecord{
-				Timestamp: now,
-				Interface: iface,
-				Direction: models.DirectionIngress,
-				SourceIP:  item.SourceIP,
-				Port:      item.Port,
-				Reason:    item.Reason,
-				Count:     delta,
+				Timestamp:  now,
+				Interface:  iface,
+				Direction:  models.DirectionIngress,
+				SourceIP:   item.SourceIP,
+				SourceCIDR: item.SourceCIDR,
+				Port:       item.Port,
+				Reason:     item.Reason,
+				Count:      delta,
 			}
 			if item.Drops > 0 {
 				record.Drops = delta
@@ -266,7 +267,11 @@ func normalizeSettings(settings models.DropLogSettings) models.DropLogSettings {
 }
 
 func counterKey(iface string, item models.InterceptLogEntry) string {
-	return fmt.Sprintf("%s|%s|%d|%s", iface, item.SourceIP, item.Port, item.Reason)
+	key := fmt.Sprintf("%s|%s|%d|%s", iface, item.SourceIP+item.SourceCIDR, item.Port, item.Reason)
+	if item.Drops == 0 && item.Count > 0 {
+		key += "|observed"
+	}
+	return key
 }
 
 func itemCount(item models.InterceptLogEntry) uint64 {

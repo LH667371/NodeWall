@@ -2,6 +2,6 @@
 
 package securityscan
 
-func scanMountPoints(string) map[string]struct{} {
-	return map[string]struct{}{}
+func scanMountPoints(string) (map[string]string, error) {
+	return map[string]string{}, nil
 }

@@ -7,20 +7,24 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"nodewall/internal/api"
 	"nodewall/internal/autoupdate"
+	"nodewall/internal/clamav"
 	"nodewall/internal/config"
 	"nodewall/internal/droplog"
 	"nodewall/internal/geoip"
 	"nodewall/internal/grpccontrol"
 	"nodewall/internal/models"
 	"nodewall/internal/nodeauth"
+	"nodewall/internal/securestore"
 	"nodewall/internal/service"
 	"nodewall/internal/sshactivity"
 	"nodewall/internal/store"
@@ -38,6 +42,25 @@ func RunServer() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	cfg := config.LoadServerConfig()
+	if cfg.AuthEnabled && !cfg.TLSEnabled {
+		log.Printf("warning: management authentication is exposed over plain HTTP; enable NODEWALL_TLS_ENABLED or terminate TLS at a trusted proxy")
+	}
+	if cfg.AuthEnabled && cfg.TLSInsecureSkipVerify {
+		log.Printf("warning: outbound NodeWall TLS certificate verification is disabled; configure NODEWALL_TLS_CA and set NODEWALL_TLS_INSECURE_SKIP_VERIFY=false")
+	}
+	if strings.TrimSpace(cfg.ClusterKeyFile) != "" {
+		if err := os.Setenv("NODEWALL_CLUSTER_KEY_FILE", cfg.ClusterKeyFile); err != nil {
+			return err
+		}
+		if cfg.DevMode == "" || cfg.DevMode == "real" {
+			if _, err := securestore.EnsureKey(cfg.ClusterKeyFile); err != nil {
+				// A standby can replace a damaged local key from the active
+				// manager during its first snapshot. Keep the service reachable
+				// while that recovery is attempted instead of failing startup.
+				log.Printf("warning: initialize cluster encryption key failed: %v; standby recovery may replace it", err)
+			}
+		}
+	}
 	if cfg.TLSEnabled {
 		if err := transporttls.EnsureCertificate(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.ListenAddr); err != nil {
 			return err
@@ -45,13 +68,27 @@ func RunServer() error {
 	}
 	st, err := store.NewPersistent(cfg.StateFile)
 	if err != nil {
-		return err
+		// A damaged state file must not take the local management console down.
+		// NewPersistent returns a path-backed empty store here; a later policy or
+		// bootstrap write repairs the primary while the other cluster members
+		// remain available for snapshot recovery.
+		log.Printf("warning: load persistent server state failed: %v; starting with an empty recoverable store", err)
 	}
 	if cfg.InstallMode != "server-only" {
+		advertiseIP := detectManagerAdvertiseIP(cfg.AgentURL)
+		agentHTTPAddr := ""
+		if _, port, splitErr := net.SplitHostPort(agentHostPort(cfg.AgentURL)); splitErr == nil && advertiseIP != "" {
+			agentHTTPAddr = net.JoinHostPort(advertiseIP, port)
+		}
 		st.UpsertNode(context.Background(), models.Node{
-			ID:       cfg.NodeID,
-			Name:     nodeDisplayName(cfg.NodeID),
-			AgentURL: cfg.AgentURL,
+			ID:             cfg.NodeID,
+			Name:           nodeDisplayName(cfg.NodeID),
+			AgentURL:       cfg.AgentURL,
+			AdvertiseIP:    advertiseIP,
+			AgentHTTPAddr:  agentHTTPAddr,
+			ServerHTTPAddr: serverHTTPAddrForListener(cfg.ListenAddr, advertiseIP),
+			PackageVersion: version.Current().PackageVersion,
+			LastSeenAt:     time.Now().UTC(),
 		})
 	}
 
@@ -64,7 +101,11 @@ func RunServer() error {
 	if cfg.DevMode == "" || cfg.DevMode == "real" {
 		credentials, err = nodeauth.Open(cfg.NodeCredentialsFile)
 		if err != nil {
-			return err
+			log.Printf("warning: load node credential registry failed: %v; starting with an empty recoverable registry", err)
+			credentials, err = nodeauth.Open("")
+			if err != nil {
+				return err
+			}
 		}
 		if cfg.InstallMode != "server-only" {
 			token, tokenErr := nodeauth.LoadOrCreateToken(cfg.TokenFile)
@@ -86,6 +127,9 @@ func RunServer() error {
 			}
 		}
 		handler.ConfigureNodeAuth(credentials)
+		if strings.TrimSpace(cfg.ManagerURL) != "" && cfg.InstallMode != "server-only" {
+			go runStandbySync(ctx, cfg, st, credentials)
+		}
 		// Repair policies created before the current control-plane ports or the
 		// newest enrolled node existed. Reconciliation only touches policies that
 		// are already enforced, so a protected baseline remains an explicit user
@@ -98,6 +142,13 @@ func RunServer() error {
 		}
 	}
 	go policyService.RunPolicyRecovery(ctx)
+	if cfg.InstallMode == "server-only" {
+		options := clamav.Options{NodeID: cfg.NodeID}
+		if credentials != nil {
+			options.Peers = clamAVPeers(cfg.NodeCredentialsFile)
+		}
+		go clamav.Run(ctx, options)
+	}
 	go handler.RunMonitoring(ctx)
 	routes := handler.Routes()
 	if strings.TrimSpace(cfg.GRPCListenAddr) != "" {
@@ -108,11 +159,12 @@ func RunServer() error {
 				return
 			}
 			defer lis.Close()
-			control, err := grpccontrol.NewServerWithTLS(st, cfg.AgentURL, cfg.DefaultInterface, cfg.TLSCAFile, cfg.TLSInsecureSkipVerify)
+			control, err := grpccontrol.NewServerWithTLS(st, cfg.AgentURL, cfg.DefaultInterface, controlAgentCAFile(cfg), cfg.TLSInsecureSkipVerify)
 			if err != nil {
 				log.Printf("warning: grpc control TLS client setup failed: %v", err)
 				return
 			}
+			control.SetManagerURL(managerHTTPURL(cfg))
 			control.RequireNodeAuth(credentials)
 			var serverOptions []grpc.ServerOption
 			if cfg.TLSEnabled {
@@ -137,11 +189,12 @@ func RunServer() error {
 	}
 	if strings.TrimSpace(cfg.QUICListenAddr) != "" {
 		go func() {
-			control, err := grpccontrol.NewServerWithTLS(st, cfg.AgentURL, cfg.DefaultInterface, cfg.TLSCAFile, cfg.TLSInsecureSkipVerify)
+			control, err := grpccontrol.NewServerWithTLS(st, cfg.AgentURL, cfg.DefaultInterface, controlAgentCAFile(cfg), cfg.TLSInsecureSkipVerify)
 			if err != nil {
 				log.Printf("warning: QUIC control TLS client setup failed: %v", err)
 				return
 			}
+			control.SetManagerURL(managerHTTPURL(cfg))
 			control.RequireNodeAuth(credentials)
 			if err := grpccontrol.ServeHTTP3WithWebTransport(ctx, cfg.QUICListenAddr, cfg.TLSCertFile, cfg.TLSKeyFile, func(transport *webtransport.Server) http.Handler {
 				quicMux := http.NewServeMux()
@@ -158,11 +211,91 @@ func RunServer() error {
 	return serveHTTPContext(ctx, cfg.ListenAddr, cfg.TLSEnabled, cfg.TLSCertFile, cfg.TLSKeyFile, routes)
 }
 
+// controlAgentCAFile is separate from TLSCAFile. TLSCAFile trusts the active
+// manager for outbound heartbeats, while the local control server's helper
+// client talks to the node agent and must trust that agent certificate. On an
+// all-in-one/standby manager both services share the host, so using the manager
+// CA here makes local reconciliation fail with "unknown authority" whenever
+// the two self-signed certificates differ.
+func controlAgentCAFile(cfg config.ServerConfig) string {
+	if strings.TrimSpace(cfg.InstallMode) != "server-only" && strings.TrimSpace(cfg.AgentTLSCertFile) != "" {
+		return cfg.AgentTLSCertFile
+	}
+	return cfg.TLSCAFile
+}
+
+func agentHostPort(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed == nil || parsed.Host == "" {
+		return strings.TrimSpace(raw)
+	}
+	return parsed.Host
+}
+
+func managerHTTPURL(cfg config.ServerConfig) string {
+	listenHost, listenPort, err := net.SplitHostPort(strings.TrimSpace(cfg.ListenAddr))
+	if err != nil || strings.TrimSpace(listenPort) == "" {
+		return ""
+	}
+	host := strings.TrimSpace(listenHost)
+	if host == "" || host == "0.0.0.0" || host == "::" || strings.EqualFold(host, "localhost") || net.ParseIP(host).IsLoopback() || net.ParseIP(host).IsUnspecified() {
+		host = detectManagerAdvertiseIP(cfg.AgentURL)
+	}
+	if strings.TrimSpace(host) == "" {
+		return ""
+	}
+	scheme := "http"
+	if cfg.TLSEnabled {
+		scheme = "https"
+	}
+	return scheme + "://" + net.JoinHostPort(host, listenPort)
+}
+
+func detectManagerAdvertiseIP(agentURL string) string {
+	if host := strings.TrimSpace(agentHostPort(agentURL)); host != "" {
+		if parsed, _, err := net.SplitHostPort(host); err == nil {
+			if ip := net.ParseIP(parsed); ip != nil && !ip.IsLoopback() && !ip.IsUnspecified() && !ip.IsLinkLocalUnicast() {
+				return ip.String()
+			}
+		} else if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() && !ip.IsUnspecified() && !ip.IsLinkLocalUnicast() {
+			return ip.String()
+		}
+	}
+	// A UDP dial discovers the route-selected local address without sending a
+	// packet. It is preferable to picking a Docker or bridge address by name.
+	if conn, err := net.Dial("udp", "192.0.2.1:80"); err == nil {
+		local := conn.LocalAddr().String()
+		_ = conn.Close()
+		if host, _, splitErr := net.SplitHostPort(local); splitErr == nil {
+			if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() {
+				return ip.String()
+			}
+		}
+	}
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addresses, _ := iface.Addrs()
+		for _, address := range addresses {
+			parsed, _, err := net.ParseCIDR(address.String())
+			if err == nil && parsed.To4() != nil && !parsed.IsLinkLocalUnicast() {
+				return parsed.String()
+			}
+		}
+	}
+	return ""
+}
+
 func RunAgent() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	cfg := config.LoadAgentConfig()
+	if cfg.TLSEnabled && cfg.TLSInsecureSkipVerify {
+		log.Printf("warning: agent outbound TLS certificate verification is disabled; configure NODEWALL_TLS_CA and set NODEWALL_TLS_INSECURE_SKIP_VERIFY=false")
+	}
 	var token string
 	if cfg.DevMode == "" || cfg.DevMode == "real" {
 		var err error
@@ -175,6 +308,14 @@ func RunAgent() error {
 		if err := transporttls.EnsureCertificate(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.ListenAddr); err != nil {
 			return err
 		}
+	}
+	agentCertificate := ""
+	if cfg.TLSEnabled {
+		certificate, err := os.ReadFile(cfg.TLSCertFile)
+		if err != nil {
+			return fmt.Errorf("read agent TLS certificate: %w", err)
+		}
+		agentCertificate = string(certificate)
 	}
 	if token != "" && cfg.TLSCAFile == "" && cfg.ManagerURL == "" {
 		cfg.TLSCAFile = cfg.TLSCertFile
@@ -208,10 +349,11 @@ func RunAgent() error {
 		log.Printf("warning: failed to load GeoIP database: %v", err)
 	}
 	handler := api.NewAgentHandler(cfg.NodeID, xdpManager, stateStore, cfg.ConfirmTimeout, recorder, geoDB, api.SSHProtectionOptions{
-		StateStore:      store.NewSSHProtectionStore(cfg.SSHProtectionStateFile),
-		LogPath:         cfg.SSHAuthLogPath,
-		PollInterval:    cfg.SSHProtectionPoll,
-		ActivityLogPath: cfg.SSHActivityLogPath,
+		StateStore:            store.NewSSHProtectionStore(cfg.SSHProtectionStateFile),
+		LogPath:               cfg.SSHAuthLogPath,
+		PollInterval:          cfg.SSHProtectionPoll,
+		ActivityLogPath:       cfg.SSHActivityLogPath,
+		ManagedConsoleKeyPath: cfg.SSHKeyPath,
 	})
 	go func() {
 		if err := sshactivity.ServeJournal(ctx, cfg.SSHActivityLogPath); err != nil {
@@ -233,6 +375,9 @@ func RunAgent() error {
 		if err := handler.ReconcileSSHTransferPolicy(ctx); err != nil {
 			log.Printf("warning: existing SSH transfer policy could not be verified: %v", err)
 		}
+		if err := handler.ReconcileSSHAuthenticationPolicy(ctx); err != nil {
+			log.Printf("warning: existing SSH password-login policy could not be verified: %v", err)
+		}
 	}
 
 	go recorder.Run(ctx, xdpManager)
@@ -250,6 +395,45 @@ func RunAgent() error {
 		default:
 		}
 	}
+	var managerURLMu sync.RWMutex
+	currentManagerURL := strings.TrimRight(strings.TrimSpace(cfg.ManagerURL), "/")
+	managerURLSource := func() string {
+		managerURLMu.RLock()
+		defer managerURLMu.RUnlock()
+		return currentManagerURL
+	}
+	setManagerURL := func(managerURL string) {
+		managerURL = strings.TrimRight(strings.TrimSpace(managerURL), "/")
+		parsed, err := url.Parse(managerURL)
+		if err != nil || parsed == nil || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return
+		}
+		managerURLMu.Lock()
+		currentManagerURL = managerURL
+		managerURLMu.Unlock()
+		// Keep child updater processes in sync immediately. The updater persists
+		// this value to nodewall.env when it replaces the installed runtime.
+		_ = os.Setenv("NODEWALL_MANAGER_URL", managerURL)
+	}
+	// Expose the same authenticated updater used by the periodic loop through
+	// node management. The target-aware callback lets the active manager pass
+	// its current web URL during a 8080 -> 8086 migration, even when this node
+	// still has the legacy manager URL in nodewall.env.
+	forceUpdate := func(updateCtx context.Context, managerURL string) error {
+		return autoupdate.ForceUpdate(updateCtx, autoupdate.AgentOptions{
+			ManagerURL:            managerURL,
+			TLSCAFile:             cfg.TLSCAFile,
+			TLSInsecureSkipVerify: cfg.TLSInsecureSkipVerify,
+			Token:                 token,
+			NodeID:                cfg.NodeID,
+		})
+	}
+	handler.SetMaintenanceUpdateTargetFunc(forceUpdate)
+	if strings.TrimSpace(cfg.ManagerURL) != "" {
+		handler.SetMaintenanceUpdateFunc(func(updateCtx context.Context) error {
+			return forceUpdate(updateCtx, managerURLSource())
+		})
+	}
 	packageVersion := version.Current().PackageVersion
 	if strings.TrimSpace(cfg.ManagerGRPCAddr) != "" {
 		go func() {
@@ -258,12 +442,15 @@ func RunAgent() error {
 				agentHTTPAddr = strings.TrimSpace(cfg.ListenAddr)
 			}
 			if err := grpccontrol.ReportLoop(ctx, cfg.ManagerGRPCAddr, grpccontrol.ReportRequest{
-				NodeID:         cfg.NodeID,
-				NodeName:       nodeDisplayName(cfg.NodeID),
-				AgentHTTPAddr:  agentHTTPAddr,
-				AgentURL:       agentURLForReport(cfg),
-				PackageVersion: packageVersion,
-				OnUpdate:       triggerUpdate,
+				NodeID:           cfg.NodeID,
+				NodeName:         nodeDisplayName(cfg.NodeID),
+				AgentHTTPAddr:    agentHTTPAddr,
+				AgentURL:         agentURLForReport(cfg),
+				AgentCertificate: agentCertificate,
+				ServerHTTPAddr:   cfg.ServerHTTPAddr,
+				PackageVersion:   packageVersion,
+				OnUpdate:         triggerUpdate,
+				OnManagerURL:     setManagerURL,
 			}, 10*time.Second, grpccontrol.ClientSecurity{Token: token, CAFile: cfg.TLSCAFile, CertFile: cfg.TLSCertFile, InsecureSkipVerify: cfg.TLSInsecureSkipVerify}); err != nil {
 				log.Printf("warning: grpc report loop failed: %v", err)
 			}
@@ -272,12 +459,15 @@ func RunAgent() error {
 	if strings.TrimSpace(cfg.ManagerURL) != "" {
 		go func() {
 			if err := grpccontrol.ReportLoopHTTP(ctx, cfg.ManagerURL, grpccontrol.ReportRequest{
-				NodeID:         cfg.NodeID,
-				NodeName:       nodeDisplayName(cfg.NodeID),
-				AgentHTTPAddr:  agentHTTPAddrForReport(cfg),
-				AgentURL:       agentURLForReport(cfg),
-				PackageVersion: packageVersion,
-				OnUpdate:       triggerUpdate,
+				NodeID:           cfg.NodeID,
+				NodeName:         nodeDisplayName(cfg.NodeID),
+				AgentHTTPAddr:    agentHTTPAddrForReport(cfg),
+				AgentURL:         agentURLForReport(cfg),
+				AgentCertificate: agentCertificate,
+				ServerHTTPAddr:   cfg.ServerHTTPAddr,
+				PackageVersion:   packageVersion,
+				OnUpdate:         triggerUpdate,
+				OnManagerURL:     setManagerURL,
 			}, 10*time.Second, grpccontrol.ClientSecurity{Token: token, CAFile: cfg.TLSCAFile, CertFile: cfg.TLSCertFile, InsecureSkipVerify: cfg.TLSInsecureSkipVerify}); err != nil {
 				log.Printf("warning: HTTPS heartbeat loop failed: %v", err)
 			}
@@ -286,12 +476,15 @@ func RunAgent() error {
 	if strings.TrimSpace(cfg.ManagerQUICAddr) != "" {
 		go func() {
 			if err := grpccontrol.ReportLoopQUIC(ctx, cfg.ManagerURL, cfg.ManagerQUICAddr, grpccontrol.ReportRequest{
-				NodeID:         cfg.NodeID,
-				NodeName:       nodeDisplayName(cfg.NodeID),
-				AgentHTTPAddr:  agentHTTPAddrForReport(cfg),
-				AgentURL:       agentURLForReport(cfg),
-				PackageVersion: packageVersion,
-				OnUpdate:       triggerUpdate,
+				NodeID:           cfg.NodeID,
+				NodeName:         nodeDisplayName(cfg.NodeID),
+				AgentHTTPAddr:    agentHTTPAddrForReport(cfg),
+				AgentURL:         agentURLForReport(cfg),
+				AgentCertificate: agentCertificate,
+				ServerHTTPAddr:   cfg.ServerHTTPAddr,
+				PackageVersion:   packageVersion,
+				OnUpdate:         triggerUpdate,
+				OnManagerURL:     setManagerURL,
 			}, 10*time.Second, cfg.TLSCAFile, cfg.TLSInsecureSkipVerify, token); err != nil {
 				log.Printf("warning: QUIC report loop failed: %v", err)
 			}
@@ -300,6 +493,7 @@ func RunAgent() error {
 	if cfg.AutoUpdate {
 		go autoupdate.RunLoop(ctx, autoupdate.AgentOptions{
 			ManagerURL:            cfg.ManagerURL,
+			ManagerURLSource:      managerURLSource,
 			Interval:              cfg.AutoUpdateEvery,
 			TLSCAFile:             cfg.TLSCAFile,
 			TLSInsecureSkipVerify: cfg.TLSInsecureSkipVerify,
@@ -308,6 +502,17 @@ func RunAgent() error {
 			Trigger:               updateTrigger,
 		})
 	}
+	clamAVOptions := clamav.Options{
+		ManagerURL:            managerURLSource,
+		NodeID:                cfg.NodeID,
+		Token:                 token,
+		TLSCAFile:             cfg.TLSCAFile,
+		TLSInsecureSkipVerify: cfg.TLSInsecureSkipVerify,
+	}
+	if cfg.DevMode == "" || cfg.DevMode == "real" {
+		clamAVOptions.Peers = clamAVPeers(config.LoadServerConfig().NodeCredentialsFile)
+	}
+	go clamav.Run(ctx, clamAVOptions)
 	log.Printf("nodewall agent listening on %s", cfg.ListenAddr)
 	defer detachDataplane(xdpManager)
 	var routes http.Handler = handler.Routes()
@@ -339,7 +544,7 @@ func serveHTTP(addr string, enabled bool, certFile, keyFile string, handler http
 	}
 	tlsConfig.NextProtos = []string{"h2", "http/1.1"}
 	server := &http.Server{Addr: addr, Handler: handler, TLSConfig: tlsConfig, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second}
-	return server.ListenAndServeTLS(certFile, keyFile)
+	return server.ListenAndServeTLS("", "")
 }
 
 func serveHTTPContext(ctx context.Context, addr string, enabled bool, certFile, keyFile string, handler http.Handler) error {
@@ -361,7 +566,7 @@ func serveHTTPContext(ctx context.Context, addr string, enabled bool, certFile, 
 		}
 		tlsConfig.NextProtos = []string{"h2", "http/1.1"}
 		server.TLSConfig = tlsConfig
-		err = server.ListenAndServeTLS(certFile, keyFile)
+		err = server.ListenAndServeTLS("", "")
 	}
 	if errors.Is(err, http.ErrServerClosed) && ctx.Err() != nil {
 		return nil
@@ -388,6 +593,24 @@ func agentURLForReport(cfg config.AgentConfig) string {
 		}
 	}
 	return scheme + "://" + address
+}
+
+func serverHTTPAddrForListener(listener, fallbackHost string) string {
+	listener = strings.TrimSpace(listener)
+	host, port, err := net.SplitHostPort(listener)
+	if err != nil || strings.TrimSpace(port) == "" {
+		return listener
+	}
+	if fallbackHost != "" {
+		ip := net.ParseIP(host)
+		if host == "" || host == "0.0.0.0" || host == "::" || (ip != nil && (ip.IsLoopback() || ip.IsUnspecified())) || strings.EqualFold(host, "localhost") {
+			host = fallbackHost
+		}
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(strings.Trim(host, "[]"), port)
 }
 
 func maxDuration(value, fallback time.Duration) time.Duration {

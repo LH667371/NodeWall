@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,6 +35,63 @@ func TestHealthEndpoint(t *testing.T) {
 	handler.Routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected status code: %d", rec.Code)
+	}
+}
+
+func TestMaintenanceUpdateStartsConfiguredCallback(t *testing.T) {
+	handler := NewAgentHandler("node-01", xdp.NewMockManager(), memoryStateStore{}, time.Second, nil, nil)
+	var calls atomic.Int32
+	done := make(chan struct{})
+	handler.SetMaintenanceUpdateFunc(func(context.Context) error {
+		calls.Add(1)
+		close(done)
+		return nil
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/maintenance/update", strings.NewReader(`{}`))
+	rec := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("maintenance update callback was not started")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("expected one update callback, got %d", calls.Load())
+	}
+}
+
+func TestMaintenanceUpdateUsesRequestManagerURLDuringPortMigration(t *testing.T) {
+	handler := NewAgentHandler("node-01", xdp.NewMockManager(), memoryStateStore{}, time.Second, nil, nil)
+	managerURL := make(chan string, 1)
+	done := make(chan struct{})
+	handler.SetMaintenanceUpdateTargetFunc(func(_ context.Context, target string) error {
+		managerURL <- target
+		close(done)
+		return nil
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/maintenance/update", strings.NewReader(`{"manager_url":"https://192.168.201.17:8086"}`))
+	rec := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("target update callback was not started")
+	}
+	select {
+	case got := <-managerURL:
+		if got != "https://192.168.201.17:8086" {
+			t.Fatalf("manager URL = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("target manager URL was not received")
 	}
 }
 

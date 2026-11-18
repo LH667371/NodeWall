@@ -67,6 +67,70 @@ func TestApplyTransferPolicyIsReversible(t *testing.T) {
 	}
 }
 
+func TestRestoreWithoutNodeWallArtifactsIsNoOp(t *testing.T) {
+	dir := t.TempDir()
+	config := filepath.Join(dir, "sshd_config")
+	if err := os.WriteFile(config, []byte("Port 22\nSubsystem sftp internal-sftp\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	a := NewWithPaths(config, filepath.Join(dir, "drop-in"), filepath.Join(dir, "wrapper"), filepath.Join(dir, "sftp"), filepath.Join(dir, "state"), func(context.Context, string, ...string) ([]byte, error) {
+		calls++
+		return nil, nil
+	})
+	if err := a.Restore(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("no-op SSH restore invoked external commands: %d", calls)
+	}
+}
+
+func TestRestoreRefusesToDeleteHelpersWhenSSHDConfigIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	wrapper := filepath.Join(dir, "wrapper")
+	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\nNODEWALL_SSH_SESSION_ID=\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a := NewWithPaths(filepath.Join(dir, "missing-sshd_config"), filepath.Join(dir, "drop-in"), wrapper, filepath.Join(dir, "sftp"), filepath.Join(dir, "state"), func(context.Context, string, ...string) ([]byte, error) {
+		t.Fatal("restore should not invoke sshd commands with a missing config")
+		return nil, nil
+	})
+	if err := a.Restore(context.Background()); err == nil {
+		t.Fatal("missing sshd config was silently accepted")
+	}
+	if _, err := os.Stat(wrapper); err != nil {
+		t.Fatalf("helper was deleted after an incomplete recovery: %v", err)
+	}
+}
+
+func TestApplyRestoresConfigWithoutTrailingNewlineExactly(t *testing.T) {
+	dir := t.TempDir()
+	config := filepath.Join(dir, "sshd_config")
+	original := []byte("Port 22\nSubsystem sftp internal-sftp")
+	if err := os.WriteFile(config, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wrapper := filepath.Join(dir, "wrapper")
+	runner := func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if name == "sshd" && len(args) > 0 && args[0] == "-T" {
+			return []byte("forcecommand " + wrapper + "\nsubsystem sftp internal-sftp\n"), nil
+		}
+		return nil, nil
+	}
+	a := NewWithPaths(config, filepath.Join(dir, "drop-in"), wrapper, filepath.Join(dir, "sftp"), filepath.Join(dir, "state"), runner)
+	if err := a.Apply(context.Background(), models.SSHTransferPolicy{BlockSFTP: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Apply(context.Background(), models.SSHTransferPolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(config)
+	if err != nil || string(restored) != string(original) {
+		t.Fatalf("configuration trailing newline changed: %q (%v)", restored, err)
+	}
+}
+
 func TestWrapperScriptHasValidShellSyntax(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "wrapper")
 	script := wrapperScript(path, models.SSHTransferPolicy{
@@ -108,6 +172,21 @@ func TestWrapperRecordsExecCommand(t *testing.T) {
 	data, err := os.ReadFile(marker)
 	if err != nil || !strings.Contains(string(data), "--event=command") || !strings.Contains(string(data), "printf hello") || !strings.Contains(string(data), "--exit-code=0") {
 		t.Fatalf("exec command was not submitted to the journal: %s %v", data, err)
+	}
+}
+
+func TestWrapperFailsOpenWhenInstalledBinaryWasRemoved(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wrapper")
+	script := wrapperScript(path, models.SSHTransferPolicy{AuditCommands: true}, filepath.Join(dir, "activity"), filepath.Join(dir, "missing-nodewall"))
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sh", path)
+	cmd.Env = append(os.Environ(), "SSH_ORIGINAL_COMMAND=printf recovered")
+	output, err := cmd.CombinedOutput()
+	if err != nil || string(output) != "recovered" {
+		t.Fatalf("wrapper did not preserve SSH command after binary removal: %q (%v)", output, err)
 	}
 }
 
@@ -228,3 +307,50 @@ func TestApplyRestoresFilesWhenSSHDValidationFails(t *testing.T) {
 		t.Fatalf("expected config rollback, got %q", data)
 	}
 }
+
+func TestPasswordAuthenticationPolicyIsReversible(t *testing.T) {
+	dir := t.TempDir()
+	config := filepath.Join(dir, "sshd_config")
+	original := []byte("Port 22\nPasswordAuthentication yes\n")
+	if err := os.WriteFile(config, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if name == "sshd" && len(args) > 0 && args[0] == "-T" {
+			value := "no"
+			data, _ := os.ReadFile(config)
+			for _, line := range strings.Split(string(data), "\n") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 && strings.EqualFold(fields[0], "PasswordAuthentication") {
+					value = strings.ToLower(fields[1])
+					break
+				}
+			}
+			return []byte("passwordauthentication " + value + "\nkbdinteractiveauthentication " + value + "\nchallengeresponseauthentication " + value + "\n"), nil
+		}
+		return nil, nil
+	}
+	a := NewWithPaths(config, filepath.Join(dir, "drop-in"), filepath.Join(dir, "wrapper"), filepath.Join(dir, "sftp"), filepath.Join(dir, "state"), runner)
+	if err := a.ApplyPasswordAuthentication(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := os.ReadFile(config)
+	if err != nil || !strings.Contains(string(changed), "PasswordAuthentication no") {
+		t.Fatalf("password policy was not written: %q (%v)", changed, err)
+	}
+	if err := a.ClearPasswordAuthentication(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(config)
+	if err != nil || string(restored) != string(original) {
+		t.Fatalf("password policy did not restore original config: %q (%v)", restored, err)
+	}
+}
+
+func TestPasswordAuthenticationPolicyRejectsIncompleteMarkers(t *testing.T) {
+	if _, err := managedPasswordAuthentication([]byte(passwordBegin), boolPtr(true)); err == nil {
+		t.Fatal("expected incomplete password policy markers to be rejected")
+	}
+}
+
+func boolPtr(value bool) *bool { return &value }

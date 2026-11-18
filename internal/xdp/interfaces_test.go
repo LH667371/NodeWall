@@ -42,3 +42,21 @@ func TestPhysicalFromSysfsRejectsVirtualLayers(t *testing.T) {
 		}
 	}
 }
+
+func TestInterfaceIPv4AssociationFollowsOnlyActualMasterLinks(t *testing.T) {
+	items := []models.DetectedInterface{
+		{Name: "em1", Addresses: []string{"fe80::1/64"}},
+		{Name: "em2"},
+		{Name: "bond0", Addresses: []string{"fe80::2/64"}},
+		{Name: "bridge-business", Addresses: []string{"fe80::3/64", "192.168.2.168/24"}},
+		{Name: "direct0", Addresses: []string{"10.0.0.2/24"}},
+	}
+	associateInterfaceAddresses(items, map[string]string{"em1": "bond0", "bond0": "bridge-business", "direct0": "bridge-business"})
+	if items[0].AddressInterface != "bridge-business" || len(items[0].RelatedAddresses) != 2 || len(items[0].Addresses) != 1 {
+		t.Fatal("bridge IPv4 must remain an explicit association", items[0])
+	}
+	if items[1].AddressInterface != "" || len(items[1].RelatedAddresses) != 0 || items[4].AddressInterface != "" {
+		t.Fatal("unrelated or directly addressed interfaces inherited another address")
+	}
+	associateInterfaceAddresses(items, map[string]string{"em2": "missing", "em1": "bond0", "bond0": "em1"})
+}

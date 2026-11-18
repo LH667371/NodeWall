@@ -12,6 +12,9 @@ func syntheticProcStat(user, system uint64) []byte {
 	// After the command name, field 1 is state; utime and stime are fields 14
 	// and 15 in the full /proc/[pid]/stat record, indexes 11 and 12 here.
 	fields := make([]string, 13)
+	for i := range fields {
+		fields[i] = "0"
+	}
 	fields[0] = "S"
 	fields[11] = fmt.Sprint(user)
 	fields[12] = fmt.Sprint(system)

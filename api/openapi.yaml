@@ -1,8 +1,402 @@
 openapi: 3.0.3
 info:
   title: NodeWall API
-  version: 0.1.0
+  # API contract version. The product release version comes from VERSION.
+  version: v1
 paths:
+  /clamav/manifest:
+    get:
+      summary: Read an enrolled Agent's ClamAV distribution manifest
+      description: Requires HTTPS and the target Agent's bearer token. Also available on management listeners at /join/clamav/manifest with enrolled node credentials. Publishes complete offline bundles before local daemon initialization; recipients must verify downloads before use.
+      parameters:
+        - name: arch
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [amd64, arm64]
+      responses:
+        '200':
+          description: Engine and three databases; clients compare engine releases and each database version independently, retaining newer local versions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClamAVManifest'
+        '400':
+          description: HTTPS required
+        '401':
+          description: Agent token required
+        '503':
+          description: Complete resources are not available on this node
+  /clamav/{kind}/{name}:
+    get:
+      summary: Download an enrolled Agent's pinned ClamAV artifact
+      description: Requires HTTPS and the target Agent's bearer token. Also available at /join/clamav/{kind}/{name} on management listeners. Only fixed engine architectures and main/daily/bytecode CVD or CLD files are served. Redirects are not followed by synchronization clients.
+      parameters:
+        - name: kind
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [engine, database]
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+          description: amd64 or arm64 for engines; main.cvd, daily.cvd, bytecode.cvd, or the corresponding .cld name for databases.
+        - name: sha256
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Exact SHA-256 from a recent manifest; stale generations require another manifest request.
+      responses:
+        '200':
+          description: Artifact bytes. Receivers check size, digest, engine inventory release, CVD signatures, and full database loading before activation.
+        '400':
+          description: HTTPS required
+        '401':
+          description: Agent token required
+        '409':
+          description: Invalid artifact or manifest generation changed
+  /settings/{kind}:
+    parameters:
+      - name: kind
+        in: path
+        required: true
+        schema:
+          type: string
+          enum: [auth, passkey, smtp, logging]
+    get:
+      summary: Read manager-scoped configuration and its compare-and-save tag
+      description: Logging always targets the manager Agent, independent of the console's selected node. Secret values are never returned.
+      responses:
+        '200':
+          description: Configuration view
+          headers:
+            ETag:
+              schema:
+                type: string
+              description: Send this tag in If-Match when saving a form.
+            X-NodeWall-Revision:
+              schema:
+                type: integer
+                format: int64
+              description: Console revision for this manager process.
+    put:
+      summary: Save configuration without overwriting a newer Web session
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Latest GET or settings SSE tag. Optional for compatibility with older clients.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Saved configuration view with a new ETag and X-NodeWall-Revision; active Web subscriptions are notified.
+        '409':
+          description: CONFIG_CHANGED. No write was made; load the latest configuration before retrying.
+  /events/cluster:
+    get:
+      summary: Subscribe to page-scoped console snapshots
+      description: >-
+        Overview and firewall frames include an independently collected health
+        status and resolved interface. Their current summary uses the same
+        manager-side collector and cache as the HTTP interface summary; Agents
+        are queried only through their registered individual resource routes.
+      parameters:
+        - name: section
+          in: query
+          schema:
+            type: string
+            enum: [overview, cluster, security, monitoring, events, management]
+        - name: node
+          in: query
+          schema:
+            type: string
+        - name: settings_scope
+          in: query
+          schema:
+            type: string
+            enum: [global, node]
+          description: Include cluster protection status only for the node policy settings view.
+      responses:
+        '200':
+          description: SSE stream. Event frames always cover the cluster, independently of the security workspace node, interface and direction. They contain scope=cluster, logs, nodes[].ssh_activity and nodes[].scans (bounded scan summaries including findings_count). Event page filters apply to this common feed. Settings frames include revision, settings_etags and logging_node_id. Security SSH frames include sshKeys and ssh_settings_etag. Reconnect when the page or its own collection scope changes.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+  /events/snapshot:
+    get:
+      summary: Read the cluster event snapshot used by the event-center SSE stream
+      responses:
+        '200':
+          description: Cluster firewall logs, SSH activity and scan history. Per-node errors retain available history and never hide healthy peers. No node selection from the security page is used.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [scope, nodes, logs]
+                properties:
+                  scope:
+                    type: string
+                    enum: [cluster]
+                  revision:
+                    type: integer
+                  nodes:
+                    type: array
+                    items:
+                      type: object
+                  logs:
+                    type: array
+                    items:
+                      type: object
+                      description: Packet drops or explicitly identified legacy rule-counter aggregates. count is the number of policy matches; drops is zero for observe-only matches. dhcp_broadcast identifies a validated DHCP client broadcast denied by host policy, not a forwarding verdict.
+                      properties:
+                        source_ip:
+                          type: string
+                          description: Observed remote IPv4 address, or empty when only a CIDR rule counter is available. A DHCP client without an address can legitimately use 0.0.0.0.
+                        source_cidr:
+                          type: string
+                          description: CIDR scope of a legacy iptables counter; not an observed individual source and not eligible for per-IP actions.
+                        count:
+                          type: integer
+                        drops:
+                          type: integer
+  /events/dispositions:
+    get:
+      summary: List persisted operator decisions for normalized security events
+      parameters:
+        - name: node_id
+          in: query
+          schema:
+            type: string
+          description: Optional node filter. Omit to return the cluster-wide set.
+      responses:
+        '200':
+          description: Event disposition records shared by all console browsers
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [dispositions]
+                properties:
+                  revision:
+                    type: integer
+                    format: int64
+                    description: Monotonic server revision used to ignore delayed browser snapshots
+                  dispositions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/EventDisposition'
+  /events/dispositions/{event}:
+    put:
+      summary: Set or clear the operator decision for one normalized event
+      parameters:
+        - name: event
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventDispositionUpdate'
+      responses:
+        '200':
+          description: Updated disposition (open removes the persisted record)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: updated
+                  revision:
+                    type: integer
+                    format: int64
+                  disposition:
+                    $ref: '#/components/schemas/EventDisposition'
+        '400':
+          description: Invalid event, source, or status
+        '404':
+          description: Node was not found
+  /nodes/{node}/protection-status:
+    get:
+      summary: Read one node's protection status independently of monitoring and scan data
+      parameters:
+        - name: node
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Current protection status, or unavailable with a reason if the node cannot be queried
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [node_id, protection_status]
+                properties:
+                  node_id:
+                    type: string
+                  interface:
+                    type: string
+                  protection_status:
+                    type: string
+                    enum: [enforced, not_enabled, degraded, unavailable]
+                  node_status:
+                    type: string
+                    enum: [online, offline]
+                    description: Authenticated heartbeat or live Agent presence, independent of this Web's connectivity
+                  connection_status:
+                    type: string
+                    enum: [reachable, unreachable]
+                    description: Whether this Web can query the Agent directly or through an authenticated one-hop relay
+                  checked_at:
+                    type: string
+                    format: date-time
+                  reason:
+                    type: string
+        '404':
+          description: Node was not found
+  /nodes/{node}/update:
+    post:
+      summary: Trigger an immediate forced update of one enrolled node Agent
+      parameters:
+        - name: node
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                manager_url:
+                  type: string
+                  format: uri
+                  description: Current manager origin used during a web-port migration.
+      responses:
+        '202':
+          description: Agent accepted the background update
+        '404':
+          description: Node was not found
+        '502':
+          description: Agent endpoint is unavailable or unreachable
+        '503':
+          description: Agent does not have self-update support configured
+  /policy/copy:
+    post:
+      summary: Merge one direction's rules into multiple nodes with deduplication
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source_node_id, interface, target_node_ids]
+              properties:
+                source_node_id:
+                  type: string
+                interface:
+                  type: string
+                direction:
+                  type: string
+                  enum: [ingress, egress]
+                  default: ingress
+                target_node_ids:
+                  type: array
+                  items:
+                    type: string
+                target_interfaces:
+                  type: object
+                  additionalProperties:
+                    type: string
+      responses:
+        '200':
+          description: All target policies were updated
+        '207':
+          description: Some target policies failed and per-node results are returned
+  /join/relay:
+    post:
+      summary: Forward one Agent API request through an enrolled cluster Web
+      description: Requires TLS and an enrolled node bearer token. Enrollment tickets and browser cookies are rejected. The target is resolved from the local registry; absolute URLs, path traversal, nested relays, and browser authentication headers are never forwarded. Mutations are retried only after a failed TCP dial proves they were not delivered.
+      parameters:
+        - name: X-Nodewall-Node-ID
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: Authorization
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [node_id, method, path]
+              properties:
+                node_id:
+                  type: string
+                method:
+                  type: string
+                  enum: [GET, POST, PUT, DELETE]
+                path:
+                  type: string
+                  description: Relative Agent API path and query
+                content_type:
+                  type: string
+                body:
+                  type: string
+                  format: byte
+                  description: Base64 request body, limited to 2 MiB before encoding
+      responses:
+        '200':
+          description: Agent response with X-Nodewall-Relay header set to 1; other Agent response status codes are preserved
+        '400':
+          description: Invalid method, target path, or oversized request
+        '401':
+          description: TLS and enrolled node authentication required
+        '404':
+          description: Target node is not enrolled
+        '502':
+          description: Target Agent could not be queried; relays never recurse
+  /join/bootstrap/{kind}:
+    get:
+      summary: Download an authenticated standby manager bootstrap resource
+      parameters:
+        - name: kind
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [state, credentials, auth]
+      responses:
+        '200':
+          description: State, enrolled credentials, or authentication store
+        '401':
+          description: Enrolled node authentication required
   /ssh-protection/activity:
     get:
       summary: Recent SSH connection, Bash command and per-file transfer audit records
@@ -66,6 +460,130 @@ paths:
       responses:
         '200':
           description: SSH audit records; requires console authentication
+  /nodes/{node}/ssh-protection/authentication:
+    put:
+      summary: Set whether the selected node permits SSH password authentication
+      parameters:
+        - name: node
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [allow_password_login, current_password]
+              properties:
+                allow_password_login:
+                  type: boolean
+                current_password:
+                  type: string
+                  format: password
+      responses:
+        '200':
+          description: SSH authentication policy was applied and reloaded
+        '401':
+          description: Current management password confirmation failed
+        '502':
+          description: Node agent rejected or could not apply the policy
+  /nodes/{node}/ssh-protection/keys:
+    get:
+      summary: List root SSH authorized keys on a node
+      parameters:
+        - name: node
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Normalized public keys and fingerprints. Each key may include nodewall_managed, nodewall_active, and nodewall_active_known so historical console keys can be distinguished from the current key.
+    post:
+      summary: Add a root SSH public key to a node
+      parameters:
+        - name: node
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [public_key, current_password]
+              properties:
+                public_key:
+                  type: string
+                comment:
+                  type: string
+                current_password:
+                  type: string
+                  format: password
+      responses:
+        '200':
+          description: Public key was added or already existed
+        '401':
+          description: Current management password confirmation failed
+  /nodes/{node}/ssh-protection/keys/{fingerprint}:
+    delete:
+      summary: Remove a root SSH public key from a node
+      parameters:
+        - name: node
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: fingerprint
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                current_password:
+                  type: string
+                  format: password
+      responses:
+        '200':
+          description: Public key was removed
+        '401':
+          description: Current password confirmation is required for the active NodeWall console key or the last key on a password-disabled node. Historical NodeWall keys are removable without a password.
+        '409':
+          description: Removing the last key would leave password-disabled SSH inaccessible
+        '404':
+          description: Fingerprint was not found
+  /nodes/{node}/interfaces/{iface}/summary:
+    get:
+      summary: Manager-composed policy, health, rules, and traffic counters
+      parameters:
+        - name: node
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: iface
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: direction
+          in: query
+          schema:
+            type: string
+            enum: [ingress, egress]
+      responses:
+        '200':
+          description: Durable manager policy and best-effort live Agent measurements, shared with the overview and firewall streams.
   /nodes/{node}/interfaces/{iface}/protection-baseline:
     post:
       summary: Enable the recovery-safe protection baseline or start a timed trial
@@ -87,6 +605,11 @@ paths:
             schema:
               type: object
               properties:
+                direction:
+                  type: string
+                  enum: [ingress, egress]
+                  default: ingress
+                  description: Direction to enable; native Linux uses XDP for ingress and TC eBPF for egress, while iptables remains an explicit compatibility backend.
                 trial_seconds:
                   type: integer
                   minimum: 0
@@ -112,6 +635,24 @@ paths:
       responses:
         '200':
           description: Trial confirmed and retained
+  /nodes/{node}/interfaces/{iface}/protection-baseline/disable:
+    post:
+      summary: Disable enforcement for one direction while retaining policy rules
+      parameters: *protectionBaselinePath
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                direction:
+                  type: string
+                  enum: [ingress, egress]
+                  default: ingress
+      responses:
+        '200':
+          description: Direction is now observe-only and policy rules are retained
   /nodes/{node}/interfaces/{iface}/protection-baseline/rollback:
     post:
       summary: Roll back an active protection trial immediately
@@ -122,6 +663,10 @@ paths:
   /interfaces/{iface}/attach:
     post:
       summary: Attach XDP to an interface
+      description: >-
+        Returns the interface runtime plus previously_attached, the attachment
+        state before this call. Managers use it to preserve a detached baseline
+        when a trial subsequently applies a policy.
   /interfaces/{iface}/detach:
     post:
       summary: Detach XDP from an interface
@@ -139,6 +684,16 @@ paths:
   /interfaces/{iface}/publish:
     post:
       summary: Apply a staged policy with rollback protection
+  /interfaces/{iface}/apply:
+    post:
+      summary: Apply a policy with optional automatic connectivity recovery
+      description: >-
+        safety_timeout (1-120 seconds) and publish_id keep a persisted recovery
+        snapshot until confirmation or successful rollback. restore_unattached
+        is only valid for an ingress safety update whose preceding attach call
+        returned previously_attached=false. It restores the detached baseline
+        on failure or expiry. A live recovery for the same direction returns
+        409; a failed restore returns 500 and retains the snapshot for retry.
   /interfaces/{iface}/confirm:
     post:
       summary: Confirm a pending publish
@@ -151,9 +706,28 @@ paths:
   /system/metrics:
     get:
       summary: Host resource metrics from Linux proc/sys filesystems
+      description: >-
+        cpu.logical_cpus identifies each logical CPU by its kernel cpuN name.
+        Per-CPU, disk.devices, and network.interfaces entries include sample_ready;
+        false means a first sample or reset needs a new baseline, not measured zero.
+        Accelerator telemetry is refreshed in a shared bounded background probe
+        independently of CPU and network collection. Sensor values in
+        accelerators[].metrics retain measured zeros; absent sensor keys mean
+        unsupported or unavailable readings. PCI-only inventory does not invent
+        utilization or memory measurements for unbound/passed-through GPUs.
   /monitoring/history:
     get:
       summary: Persistent host time-series for the cluster or one node (up to seven days)
+      description: >-
+        Cluster responses include both aggregate points and node_points keyed by
+        node ID. Device details remain nested under each node summary so equal
+        disk names, filesystem mounts, and network interface names from
+        different nodes are not merged.
+        Each per-node history point retains logical_cpus, disk_devices,
+        network_interfaces, filesystems, and accelerators, including after a restart.
+        HTTP and streaming responses share sample_interval_seconds and keep
+        approximately 1200 time buckets per node for long ranges. Each bucket
+        contains its latest real sample; missing samples are not zero-filled.
       parameters:
         - name: range
           in: query
@@ -182,9 +756,59 @@ paths:
   /security/scan:
     get:
       summary: Get the current built-in file scan
+      parameters:
+        - name: summary
+          in: query
+          schema:
+            type: integer
+            enum: [1]
+          description: Return scan metadata and findings_count without cloning or transmitting finding evidence. Used by cluster event collection.
     post:
-      summary: Start a read-only built-in file scan
-      description: A global scan may set auto_terminate_processes to immediately contain confirmed hidden or miner processes and isolate a verified executable after termination.
+      summary: Start a built-in malware and process scan
+      description: >-
+        Quick scans check process and kernel-module visibility, critical command
+        integrity, and bounded startup persistence locations. A readable regular
+        descriptor script matching the observed kernel-module and host-tampering
+        indicators is saved as a sample before its verified shell process is
+        stopped; a linked user-controlled file is isolated separately when it
+        passes the normal identity and recovery checks. Pipes are never consumed
+        by the scanner. Live kernel modules hidden from /proc/modules are
+        reported with their virtual sysfs path and any verified disk module
+        source. A located external module is isolated before the live module is
+        unloaded; when no disk source exists, the finding remains explicit
+        evidence that must be recovered from a trusted environment. Detection
+        only findings remain in reports without being presented as quarantined
+        files. Kernel-module payloads retain their metadata in quarantine and
+        can be explicitly loaded from there for a reversible rollback, without
+        restoring them into a boot or module search path. Startup persistence is handled by the actual loader, unit, cron,
+        or modules-load file; new modprobe or systemd mask patches are never
+        written by a scan. Actual quarantined files and samples are retained.
+  /security/scan/events:
+    get:
+      summary: Stream the current agent scan and subsequent progress snapshots
+      responses:
+        '200':
+          description: Server-sent scan events; the connection remains open during a scan
+          content:
+            text/event-stream:
+              schema:
+                type: string
+  /nodes/{node}/security/scan/events:
+    get:
+      summary: Stream scan progress for a selected node through the manager
+      parameters:
+        - name: node
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Server-sent scan events from the selected agent
+          content:
+            text/event-stream:
+              schema:
+                type: string
   /security/scan/{finding}/quarantine:
     post:
       summary: Manually isolate a finding after confirmation
@@ -199,10 +823,10 @@ paths:
             type: string
   /security/quarantine:
     get:
-      summary: List files in the NodeWall quarantine directory
+      summary: List quarantined files and samples, including any legacy evidence awaiting safe cleanup
   /security/quarantine/{entry}:
     delete:
-      summary: Permanently delete a quarantined file after confirmation
+      summary: Permanently delete a quarantined file or evidence artifact after confirmation
       parameters:
         - name: entry
           in: path
@@ -212,6 +836,24 @@ paths:
   /security/quarantine/{entry}/restore:
     post:
       summary: Restore a quarantined file to its recorded original path
+      parameters:
+        - name: entry
+          in: path
+          required: true
+          schema:
+            type: string
+  /security/quarantine/{entry}/load:
+    post:
+      summary: Load a quarantined kernel module without restoring it to the original path
+      parameters:
+        - name: entry
+          in: path
+          required: true
+          schema:
+            type: string
+  /security/quarantine/{entry}/unload:
+    post:
+      summary: Unload a kernel module that was explicitly loaded from quarantine
       parameters:
         - name: entry
           in: path
@@ -229,7 +871,8 @@ paths:
             enum: [html, json]
   /security/scan/reports:
     get:
-      summary: List up to 500 durable scan reports, newest first
+      summary: List durable scan reports, newest first
+      description: Reports containing unresolved startup evidence may be retained beyond the normal 500-report limit.
   /security/scan/reports/{scan}:
     get:
       summary: Download an individual durable scan report
@@ -286,3 +929,66 @@ paths:
           schema:
             type: string
             enum: [html, json]
+components:
+  schemas:
+    ClamAVArtifact:
+      type: object
+      required: [name, sha256, size]
+      properties:
+        name:
+          type: string
+        sha256:
+          type: string
+        size:
+          type: integer
+          format: int64
+        version:
+          type: integer
+          format: int64
+          description: Database version; absent for engines.
+        release:
+          type: string
+          description: Engine version and optional Alpine revision, derived from PACKAGES.txt; absent in legacy manifests.
+    ClamAVManifest:
+      type: object
+      required: [engine, database]
+      properties:
+        engine:
+          $ref: '#/components/schemas/ClamAVArtifact'
+        database:
+          type: array
+          minItems: 3
+          maxItems: 3
+          items:
+            $ref: '#/components/schemas/ClamAVArtifact'
+    EventDisposition:
+      type: object
+      required: [event_id, node_id, source, status, updated_at]
+      properties:
+        event_id:
+          type: string
+        node_id:
+          type: string
+        source:
+          type: string
+          enum: [firewall, ssh, malware, scan]
+        status:
+          type: string
+          enum: [open, handled, deferred]
+        updated_at:
+          type: string
+          format: date-time
+        updated_by:
+          type: string
+    EventDispositionUpdate:
+      type: object
+      required: [node_id, source, status]
+      properties:
+        node_id:
+          type: string
+        source:
+          type: string
+          enum: [firewall, ssh, malware, scan]
+        status:
+          type: string
+          enum: [open, handled, deferred]

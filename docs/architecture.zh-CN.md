@@ -4,7 +4,8 @@
 
 NodeWall 是一个面向 Kubernetes 节点的主机级防火墙系统。
 
-它在宿主机网卡入口使用 XDP/eBPF 进行流量过滤，同时避免修改 Kubernetes 已管理的 netfilter 状态。
+它在宿主机网卡入口使用 XDP/eBPF、出口使用 TC/eBPF 进行流量过滤，同时避免修改 Kubernetes
+已管理的 netfilter 状态。
 
 ## 核心组件
 
@@ -12,15 +13,17 @@ NodeWall 是一个面向 Kubernetes 节点的主机级防火墙系统。
 - Go API Server
 - Go Node Agent
 - 挂载到目标网卡上的 XDP 程序
-- 用于 allowlist、计数器和配置的 BPF maps
+- 挂载到目标网卡出口的 TC eBPF 程序
+- 分方向的 allowlist、计数器和配置 BPF maps
 
 ## 报文路径
 
 ```text
-NIC -> XDP -> kernel networking stack -> kube-proxy / CNI / netfilter
+入方向：NIC -> XDP -> kernel networking stack -> kube-proxy / CNI / netfilter
+出方向：kernel networking stack -> TC eBPF -> NIC
 ```
 
-NodeWall 只在 XDP 层工作。
+NodeWall 在 XDP 和 TC eBPF 层工作，不写入 Kubernetes 管理的 netfilter 规则。
 
 ## 数据面逻辑
 

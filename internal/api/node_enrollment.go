@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
@@ -8,7 +9,9 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -63,18 +66,21 @@ func joinBinarySHA256() string {
 }
 
 type nodeHeartbeatRequest struct {
-	NodeID         string `json:"node_id"`
-	NodeName       string `json:"node_name"`
-	AgentHTTPAddr  string `json:"agent_http_addr"`
-	AgentURL       string `json:"agent_url"`
-	PackageVersion string `json:"package_version,omitempty"`
+	NodeID           string `json:"node_id"`
+	NodeName         string `json:"node_name"`
+	AgentHTTPAddr    string `json:"agent_http_addr"`
+	AgentURL         string `json:"agent_url"`
+	AgentCertificate string `json:"agent_certificate,omitempty"`
+	ServerHTTPAddr   string `json:"server_http_addr,omitempty"`
+	PackageVersion   string `json:"package_version,omitempty"`
 }
 
 // ConfigureNodeAuth is called before listeners start. Unregistered agents
 // never receive browser cookies or a manager credential as a fallback.
 func (h *ServerHandler) ConfigureNodeAuth(registry *nodeauth.Registry) {
 	h.nodeCredentials = registry
-	h.reverseHTTP = &http.Client{Timeout: 10 * time.Second, Transport: &nodeauth.Transport{Registry: registry}, CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+	direct := &nodeauth.Transport{Registry: registry, DialTimeout: nodeDialTimeout}
+	h.reverseHTTP = &http.Client{Timeout: 10 * time.Second, Transport: &nodeRelayTransport{handler: h, direct: direct}, CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 		return errors.New("node API redirects are not allowed")
 	}}
 	h.service.SetHTTPClient(h.reverseHTTP)
@@ -116,7 +122,7 @@ func (h *ServerHandler) handleEnrollmentTicket(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	scriptURL := requestBaseURL(r) + "/join/script?token=" + url.QueryEscape(token)
+	scriptURL := requestBaseURL(r, h.auth.trustProxyHeaders) + "/join/script?token=" + url.QueryEscape(token)
 	scriptRequest := r.Clone(r.Context())
 	scriptRequest.Method = http.MethodGet
 	scriptRequest.URL = &url.URL{Path: "/join/script", RawQuery: "token=" + url.QueryEscape(token)}
@@ -260,7 +266,11 @@ func (h *ServerHandler) handleNodeEnrollment(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if c.NodeID == h.nodeID {
-		writeError(w, http.StatusConflict, errors.New("node ID is reserved by the manager; configure a unique NODEWALL_NODE_ID"))
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":             "node ID is reserved by the manager",
+			"code":              "NODE_ID_CONFLICT",
+			"suggested_node_id": h.suggestEnrollmentNodeID(c),
+		})
 		return
 	}
 	if err := h.nodeCredentials.Put(c); err != nil {
@@ -276,6 +286,47 @@ func (h *ServerHandler) handleNodeEnrollment(w http.ResponseWriter, r *http.Requ
 	go h.reconcileEnrollmentPolicies()
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusCreated, map[string]string{"status": "enrolled"})
+}
+
+// suggestEnrollmentNodeID gives an old enrollment command a safe recovery
+// path when it carried the manager's default node ID. The suggestion is based
+// on the authenticated agent endpoint and includes a short hash only when the
+// hostname itself is empty or already occupied, so retrying a registration
+// does not require opening the web console again.
+func (h *ServerHandler) suggestEnrollmentNodeID(credential nodeauth.Credential) string {
+	host := ""
+	if endpoint, err := url.Parse(strings.TrimSpace(credential.AgentURL)); err == nil && endpoint != nil {
+		host = endpoint.Hostname()
+	}
+	base := sanitizeEnrollmentNodeID(host)
+	if base == "" {
+		base = "node"
+	}
+	occupied := map[string]struct{}{strings.TrimSpace(h.nodeID): {}}
+	if h.store != nil {
+		for _, node := range h.store.ListNodes(context.Background()) {
+			occupied[strings.TrimSpace(node.ID)] = struct{}{}
+		}
+	}
+	if _, exists := occupied[base]; !exists {
+		return base
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(credential.AgentURL)))
+	return base + "-" + hex.EncodeToString(sum[:])[:8]
+}
+
+func sanitizeEnrollmentNodeID(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	var builder strings.Builder
+	for _, character := range value {
+		switch {
+		case character >= 'a' && character <= 'z', character >= '0' && character <= '9', character == '-', character == '_':
+			builder.WriteRune(character)
+		case builder.Len() > 0:
+			builder.WriteByte('-')
+		}
+	}
+	return strings.Trim(builder.String(), "-_")
 }
 
 // handleJoinHeartbeat is an HTTPS fallback for node presence reporting. The
@@ -310,11 +361,12 @@ func (h *ServerHandler) handleJoinHeartbeat(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusForbidden, errors.New("node ID does not match enrolled credential"))
 		return
 	}
-	origin, err := nodeauth.Origin(heartbeat.AgentURL)
-	if err != nil || origin != credential.AgentURL {
-		writeError(w, http.StatusForbidden, errors.New("agent endpoint changed; enroll this node again"))
+	refreshed, err := refreshHeartbeatCredential(h.nodeCredentials, credential, heartbeat.AgentURL, heartbeat.AgentCertificate)
+	if err != nil {
+		writeError(w, http.StatusForbidden, err)
 		return
 	}
+	credential = refreshed
 	endpoint, _ := url.Parse(credential.AgentURL)
 	agentHTTPAddr := strings.TrimSpace(heartbeat.AgentHTTPAddr)
 	if agentHTTPAddr == "" {
@@ -325,12 +377,14 @@ func (h *ServerHandler) handleJoinHeartbeat(w http.ResponseWriter, r *http.Reque
 		name = credential.NodeID
 	}
 	node := models.Node{
-		ID:            credential.NodeID,
-		Name:          name,
-		AgentURL:      credential.AgentURL,
-		AdvertiseIP:   endpoint.Hostname(),
-		AgentHTTPAddr: agentHTTPAddr,
-		LastSeenAt:    time.Now().UTC(),
+		ID:             credential.NodeID,
+		Name:           name,
+		AgentURL:       credential.AgentURL,
+		AdvertiseIP:    endpoint.Hostname(),
+		AgentHTTPAddr:  agentHTTPAddr,
+		ServerHTTPAddr: normalizeNodeHTTPAddr(heartbeat.ServerHTTPAddr, endpoint.Hostname()),
+		PackageVersion: strings.TrimSpace(heartbeat.PackageVersion),
+		LastSeenAt:     time.Now().UTC(),
 	}
 	if err := h.store.UpsertNodeChecked(r.Context(), node); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -342,8 +396,60 @@ func (h *ServerHandler) handleJoinHeartbeat(w http.ResponseWriter, r *http.Reque
 		"status":           "online",
 		"server_time":      time.Now().UTC(),
 		"package_version":  remoteVersion,
+		"manager_url":      requestBaseURL(r, h.auth != nil && h.auth.trustProxyHeaders),
 		"update_available": packageUpdateAvailable(heartbeat.PackageVersion, remoteVersion),
 	})
+}
+
+// refreshHeartbeatCredential lets an already authenticated node repair the
+// manager's pinned certificate and advertised address. The node token proves
+// its identity; the certificate is still validated by Registry.Put before it
+// can replace the pin used by reverse proxy requests.
+func refreshHeartbeatCredential(registry *nodeauth.Registry, current nodeauth.Credential, agentURL, certificate string) (nodeauth.Credential, error) {
+	origin, err := nodeauth.Origin(agentURL)
+	if err != nil {
+		return current, fmt.Errorf("invalid agent endpoint: %w", err)
+	}
+	certificate = strings.TrimSpace(certificate)
+	endpointChanged := origin != current.AgentURL
+	certificateChanged := certificate != "" && certificate != strings.TrimSpace(current.Certificate)
+	if !endpointChanged && !certificateChanged {
+		return current, nil
+	}
+	if certificate == "" {
+		return current, errors.New("agent certificate is required when the endpoint or certificate changes; run the registration command again")
+	}
+	next := current
+	next.AgentURL = origin
+	next.Certificate = certificate
+	if err := registry.Put(next); err != nil {
+		return current, fmt.Errorf("refresh agent credential: %w", err)
+	}
+	return next, nil
+}
+
+func normalizeNodeHTTPAddr(raw, fallbackHost string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if strings.Contains(raw, "://") {
+		if parsed, err := url.Parse(raw); err == nil && parsed.Host != "" {
+			raw = parsed.Host
+		}
+	}
+	host, port, err := net.SplitHostPort(raw)
+	if err != nil || strings.TrimSpace(port) == "" {
+		return raw
+	}
+	host = strings.Trim(host, "[]")
+	if fallbackHost != "" {
+		ip := net.ParseIP(host)
+		if host == "" || host == "0.0.0.0" || host == "::" || (ip != nil && ip.IsLoopback()) || strings.EqualFold(host, "localhost") {
+			host = fallbackHost
+		}
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func packageUpdateAvailable(local, remote string) bool {

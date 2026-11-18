@@ -79,7 +79,7 @@ func TestScanArchiveRetentionPreservesUnrelatedFilesAndDamagedReports(t *testing
 		h.securityReports[fmt.Sprintf("scan-%d", i)] = scanReportSummary{ID: fmt.Sprintf("scan-%d", i), StartedAt: time.Unix(int64(i), 0), Status: "completed"}
 	}
 	old := filepath.Join(dir, "scan-0.json")
-	if err := os.WriteFile(old, []byte("oldest"), 0o600); err != nil {
+	if err := h.saveScanReport(securityScanReport{ReportID: "scan-0", NodeID: "a", Status: "completed", StartedAt: time.Unix(0, 0)}); err != nil {
 		t.Fatal(err)
 	}
 	notes := filepath.Join(dir, "operator-notes.txt")
@@ -113,6 +113,10 @@ func TestScanArchiveRetentionPreservesUnrelatedFilesAndDamagedReports(t *testing
 }
 
 func TestScanArchivePreservesSkippedCounts(t *testing.T) {
+	// Another package can create the managed-engine marker in the same test
+	// container; this test exercises report persistence without a live ClamAV.
+	t.Setenv("NODEWALL_CLAMAV_DIR", filepath.Join(t.TempDir(), "clamav"))
+	t.Setenv("NODEWALL_CLAMD_SOCKET", "")
 	dir := t.TempDir()
 	h := NewAgentHandler("a", xdp.NewMockManager(), memoryStateStore{}, time.Second, nil, nil)
 	if err := h.ConfigureSecurityArchive(dir); err != nil {
@@ -125,9 +129,36 @@ func TestScanArchivePreservesSkippedCounts(t *testing.T) {
 	h.securityScanner.MaxFileSize = 10
 	h.securityJob = &securityScanJob{ID: "scan-skipped", Status: "running", Root: path, StartedAt: time.Now().UTC()}
 	h.runSecurityScan("scan-skipped", path)
+	h.securityJob.MountsSkipped = 2
+	h.securityJob.CoverageGapsOmitted = 3
+	if err := h.archiveCurrentScan(); err != nil {
+		t.Fatal(err)
+	}
 	report, err := h.readArchivedScan("scan-skipped")
 	if err != nil || report.FilesScanned != 0 || report.FilesSkipped != 1 || !report.Truncated {
 		t.Fatalf("skipped coverage lost: %#v %v", report, err)
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.CoverageGaps) != 1 || report.CoverageGaps[0].Path != resolved || report.CoverageGaps[0].Reason != "file-size-or-type-limit" || report.SignatureEngine.Status != "not-configured" {
+		t.Fatalf("coverage gap or engine status lost: %#v", report)
+	}
+	exported := buildSecurityScanReport("a", cloneSecurityScanView(h.securityJob))
+	if len(exported.CoverageGaps) != 1 || exported.SignatureEngine.Status != "not-configured" {
+		t.Fatalf("coverage gap or engine status missing from export: %#v", exported)
+	}
+	restarted := NewAgentHandler("a", xdp.NewMockManager(), memoryStateStore{}, time.Second, nil, nil)
+	if err := restarted.ConfigureSecurityArchive(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.archiveCurrentScan(); err != nil {
+		t.Fatal(err)
+	}
+	storedAgain, err := restarted.readArchivedScan("scan-skipped")
+	if err != nil || len(storedAgain.CoverageGaps) != 1 || storedAgain.CoverageGaps[0].Path != resolved || storedAgain.SignatureEngine.Status != "not-configured" || storedAgain.MountsSkipped != 2 || storedAgain.CoverageGapsOmitted != 3 {
+		t.Fatalf("coverage or engine metadata lost after restart and re-archive: %#v %v", storedAgain, err)
 	}
 }
 

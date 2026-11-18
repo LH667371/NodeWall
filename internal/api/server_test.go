@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +18,481 @@ import (
 	"nodewall/internal/service"
 	"nodewall/internal/store"
 )
+
+func TestHandleUpdateNodeTriggersRemoteAgent(t *testing.T) {
+	var called bool
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/maintenance/update" {
+			t.Fatalf("unexpected agent request: %s %s", r.Method, r.URL.Path)
+		}
+		var payload map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode update request: %v", err)
+		}
+		if payload["manager_url"] != "http://example.com" {
+			t.Fatalf("manager URL = %q, want current request origin", payload["manager_url"])
+		}
+		called = true
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "started"})
+	}))
+	defer agent.Close()
+
+	st := store.New()
+	st.UpsertNode(context.Background(), models.Node{ID: "node-a", Name: "node-a", AgentURL: agent.URL})
+	handler := &ServerHandler{
+		service:     service.NewPolicyService(st),
+		store:       st,
+		reverseHTTP: &http.Client{Timeout: 2 * time.Second},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/nodes/node-a/update", strings.NewReader(`{}`))
+	req.SetPathValue("node", "node-a")
+	rec := httptest.NewRecorder()
+	handler.handleUpdateNode(rec, req)
+	if rec.Code != http.StatusAccepted || !called {
+		t.Fatalf("expected update trigger, status=%d called=%v body=%s", rec.Code, called, rec.Body.String())
+	}
+}
+
+func TestProxySSHKeyDeleteSkipsPasswordForOrdinaryKey(t *testing.T) {
+	deleted := false
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/ssh-protection/keys":
+			writeJSON(w, http.StatusOK, map[string]any{"keys": []models.SSHAuthorizedKey{
+				{Fingerprint: "SHA256:ordinary", Type: "ssh-ed25519", Comment: "ops-laptop"},
+				{Fingerprint: "SHA256:other", Type: "ssh-ed25519", Comment: "backup"},
+			}})
+		case "/ssh-protection/keys/SHA256:ordinary":
+			deleted = true
+			writeJSON(w, http.StatusOK, map[string]any{"keys": []models.SSHAuthorizedKey{{Fingerprint: "SHA256:other"}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer agent.Close()
+
+	st := store.New()
+	st.UpsertNode(context.Background(), models.Node{ID: "node-a", Name: "node-a", AgentURL: agent.URL})
+	h := &ServerHandler{service: service.NewPolicyService(st), store: st, reverseHTTP: agent.Client()}
+	req := httptest.NewRequest(http.MethodDelete, "/nodes/node-a/ssh-protection/keys/SHA256%3Aordinary", nil)
+	req.SetPathValue("node", "node-a")
+	req.SetPathValue("fingerprint", "SHA256:ordinary")
+	rec := httptest.NewRecorder()
+	h.handleProxySSHAuthorizedKeyDelete(rec, req)
+	if rec.Code != http.StatusOK || !deleted {
+		t.Fatalf("ordinary SSH key deletion was blocked: status=%d deleted=%v body=%s", rec.Code, deleted, rec.Body.String())
+	}
+}
+
+func TestProxySSHKeyDeleteAllowsHistoricalNodeWallKey(t *testing.T) {
+	deleted := false
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/ssh-protection/keys":
+			writeJSON(w, http.StatusOK, map[string]any{"keys": []models.SSHAuthorizedKey{
+				{Fingerprint: "SHA256:history", Type: "ssh-ed25519", Comment: "nodewall-console", NodeWallManaged: true, NodeWallActiveKnown: true},
+				{Fingerprint: "SHA256:active", Type: "ssh-ed25519", Comment: "nodewall-console", NodeWallManaged: true, NodeWallActive: true},
+			}})
+		case "/ssh-protection/keys/SHA256:history":
+			deleted = true
+			writeJSON(w, http.StatusOK, map[string]any{"keys": []models.SSHAuthorizedKey{{Fingerprint: "SHA256:active"}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer agent.Close()
+
+	st := store.New()
+	st.UpsertNode(context.Background(), models.Node{ID: "node-a", Name: "node-a", AgentURL: agent.URL})
+	h := &ServerHandler{service: service.NewPolicyService(st), store: st, reverseHTTP: agent.Client()}
+	req := httptest.NewRequest(http.MethodDelete, "/nodes/node-a/ssh-protection/keys/SHA256%3Ahistory", nil)
+	req.SetPathValue("node", "node-a")
+	req.SetPathValue("fingerprint", "SHA256:history")
+	rec := httptest.NewRecorder()
+	h.handleProxySSHAuthorizedKeyDelete(rec, req)
+	if rec.Code != http.StatusOK || !deleted {
+		t.Fatalf("historical NodeWall key was not removable without password: status=%d deleted=%v body=%s", rec.Code, deleted, rec.Body.String())
+	}
+}
+
+func TestProxySSHKeyDeleteProtectsNodeWallConsoleKey(t *testing.T) {
+	deleted := false
+	allowPassword := false
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/ssh-protection/keys":
+			writeJSON(w, http.StatusOK, map[string]any{"keys": []models.SSHAuthorizedKey{{Fingerprint: "SHA256:console", Type: "ssh-ed25519", Comment: "nodewall-console"}}})
+		case "/ssh-protection":
+			writeJSON(w, http.StatusOK, models.SSHProtectionStatus{Settings: models.SSHProtectionSettings{AllowPasswordLogin: &allowPassword}})
+		case "/ssh-protection/keys/SHA256:console":
+			deleted = true
+			writeJSON(w, http.StatusOK, map[string]any{"keys": []models.SSHAuthorizedKey{}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer agent.Close()
+
+	st := store.New()
+	st.UpsertNode(context.Background(), models.Node{ID: "node-a", Name: "node-a", AgentURL: agent.URL})
+	h := &ServerHandler{service: service.NewPolicyService(st), store: st, reverseHTTP: agent.Client()}
+	req := httptest.NewRequest(http.MethodDelete, "/nodes/node-a/ssh-protection/keys/SHA256%3Aconsole", nil)
+	req.SetPathValue("node", "node-a")
+	req.SetPathValue("fingerprint", "SHA256:console")
+	rec := httptest.NewRecorder()
+	h.handleProxySSHAuthorizedKeyDelete(rec, req)
+	if rec.Code != http.StatusUnauthorized || deleted {
+		t.Fatalf("console SSH key deletion was not protected: status=%d deleted=%v body=%s", rec.Code, deleted, rec.Body.String())
+	}
+}
+
+func TestClusterAggregateDoesNotProbeOfflineNode(t *testing.T) {
+	state := store.New()
+	state.UpsertNode(context.Background(), models.Node{
+		ID:         "offline-node",
+		Name:       "offline-node",
+		AgentURL:   "http://192.0.2.250:9080",
+		LastSeenAt: time.Now().Add(-10 * time.Minute),
+	})
+	handler := &ServerHandler{store: state, service: service.NewPolicyService(state)}
+	result := handler.buildClusterAggregate(context.Background(), models.DirectionIngress)
+	rows, ok := result["nodes"].([]clusterNodeAggregate)
+	if !ok || len(rows) != 1 || rows[0].Status != "offline" {
+		t.Fatalf("offline node was not rendered without probing: %#v", result["nodes"])
+	}
+}
+
+func TestClusterProtectionDoesNotWaitForSystemMetrics(t *testing.T) {
+	metricsStarted := make(chan struct{})
+	releaseMetrics := make(chan struct{})
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/system/metrics":
+			close(metricsStarted)
+			<-releaseMetrics
+			writeJSON(w, http.StatusOK, models.SystemMetrics{Memory: models.MemoryMetrics{TotalBytes: 1}})
+		case "/interfaces":
+			writeJSON(w, http.StatusOK, models.InterfaceInventory{Recommended: "eth0", Interfaces: []models.DetectedInterface{{Name: "eth0", IsPhysical: true}}})
+		case "/health":
+			writeJSON(w, http.StatusOK, models.HealthStatus{Interfaces: []models.InterfaceHealth{{
+				Interface: "eth0", XDPAttached: true, MapOK: true, StatsOK: true, PolicyEnforced: true, EnforcementOK: true,
+			}}})
+		default:
+			writeJSON(w, http.StatusOK, map[string]any{})
+		}
+	}))
+	defer agent.Close()
+	state := store.New()
+	node := models.Node{ID: "node-a", AgentURL: agent.URL, LastSeenAt: time.Now()}
+	state.UpsertNode(context.Background(), node)
+	h := &ServerHandler{store: state, service: service.NewPolicyService(state), reverseHTTP: agent.Client()}
+	metricsDone := make(chan struct{})
+	go func() {
+		defer close(metricsDone)
+		_, _ = h.readSystemMetrics(context.Background(), node)
+	}()
+	defer func() { close(releaseMetrics); <-metricsDone }()
+	<-metricsStarted
+
+	results := make(chan map[string]any, 1)
+	go func() { results <- h.buildClusterAggregate(context.Background(), models.DirectionIngress) }()
+	select {
+	case result := <-results:
+		rows := result["nodes"].([]clusterNodeAggregate)
+		if len(rows) != 1 || rows[0].ProtectionStatus != "enforced" {
+			t.Fatalf("healthy node was not reported as enforced: %#v", rows)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cluster protection waited for a blocked system metrics request")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := h.readSystemMetrics(ctx, node); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waiting metrics request did not honor its deadline: %v", err)
+	}
+}
+
+func TestClusterEventsDeliverNodesBeforeSlowOverview(t *testing.T) {
+	probeStarted := make(chan struct{}, 1)
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case probeStarted <- struct{}{}:
+		default:
+		}
+		<-r.Context().Done()
+	}))
+	defer agent.Close()
+	state := store.New()
+	state.UpsertNode(context.Background(), models.Node{ID: "node-a", AgentURL: agent.URL, LastSeenAt: time.Now()})
+	h := &ServerHandler{store: state, service: service.NewPolicyService(state), reverseHTTP: agent.Client()}
+	server := httptest.NewServer(http.HandlerFunc(h.handleClusterEvents))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("node event was blocked by the overview: %v", err)
+	}
+	defer resp.Body.Close()
+	line, err := bufio.NewReader(resp.Body).ReadString('\n')
+	if err != nil || strings.TrimSpace(line) != "event: nodes" {
+		t.Fatalf("first event = %q, error = %v; want nodes", line, err)
+	}
+}
+
+func TestClusterEventsMonitoringSendsCachedSnapshotWithoutCollecting(t *testing.T) {
+	state := store.New()
+	state.UpsertNode(context.Background(), models.Node{ID: "node-a"})
+	h := &ServerHandler{store: state, service: service.NewPolicyService(state)}
+	server := httptest.NewServer(http.HandlerFunc(h.handleClusterEvents))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"?section=monitoring&overview=0&range=900", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	reader := bufio.NewReader(response.Body)
+	for index := 0; index < 3; index++ {
+		if _, err := readSSEFrame(reader); err != nil {
+			t.Fatalf("initial monitoring frame %d: %v", index, err)
+		}
+	}
+	frame, err := readSSEFrame(reader)
+	if err != nil || !strings.Contains(frame, "event: monitoring") || !strings.Contains(frame, `"scope":"cluster"`) {
+		t.Fatalf("monitoring snapshot frame = %q (%v)", frame, err)
+	}
+}
+
+func TestEventDispositionSSEBroadcastsToEveryBrowser(t *testing.T) {
+	state := store.New()
+	state.UpsertNode(context.Background(), models.Node{ID: "node-a"})
+	h := &ServerHandler{store: state, service: service.NewPolicyService(state)}
+	server := httptest.NewServer(http.HandlerFunc(h.handleClusterEvents))
+	defer server.Close()
+
+	type stream struct {
+		cancel context.CancelFunc
+		body   *http.Response
+		reader *bufio.Reader
+	}
+	open := func() stream {
+		ctx, cancel := context.WithCancel(context.Background())
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"?overview=0", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := server.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reader := bufio.NewReader(response.Body)
+		for index := 0; index < 3; index++ {
+			if _, err := readSSEFrame(reader); err != nil {
+				response.Body.Close()
+				cancel()
+				t.Fatal(err)
+			}
+		}
+		return stream{cancel: cancel, body: response, reader: reader}
+	}
+	first, second := open(), open()
+	defer func() {
+		first.cancel()
+		second.cancel()
+		first.body.Body.Close()
+		second.body.Body.Close()
+	}()
+
+	request := httptest.NewRequest(http.MethodPut, "/events/dispositions/firewall-node-a-event", strings.NewReader(`{"node_id":"node-a","source":"firewall","status":"handled"}`))
+	response := httptest.NewRecorder()
+	h.handleEventDispositions(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("disposition update returned %d: %s", response.Code, response.Body.String())
+	}
+	for _, browser := range []stream{first, second} {
+		frame, err := readSSEFrame(browser.reader)
+		if err != nil || !strings.Contains(frame, "event: event_dispositions") || !strings.Contains(frame, `"revision":1`) || !strings.Contains(frame, `"status":"handled"`) {
+			t.Fatalf("browser did not receive disposition update: %q (%v)", frame, err)
+		}
+	}
+}
+
+func readSSEFrame(reader *bufio.Reader) (string, error) {
+	var frame strings.Builder
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return frame.String(), err
+		}
+		frame.WriteString(line)
+		if line == "\n" {
+			return frame.String(), nil
+		}
+	}
+}
+
+func TestClusterAggregateProbesNodesConcurrently(t *testing.T) {
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/interfaces" {
+			started <- struct{}{}
+			<-release
+		}
+		writeJSON(w, http.StatusOK, map[string]any{})
+	}))
+	defer agent.Close()
+	state := store.New()
+	for _, id := range []string{"node-a", "node-b"} {
+		state.UpsertNode(context.Background(), models.Node{ID: id, AgentURL: agent.URL, LastSeenAt: time.Now()})
+	}
+	h := &ServerHandler{store: state, service: service.NewPolicyService(state), reverseHTTP: agent.Client()}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.buildClusterAggregate(context.Background(), models.DirectionIngress)
+	}()
+	defer func() { close(release); <-done }()
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("one node waited for another node's slow probe")
+		}
+	}
+}
+
+func TestNodeProtectionStatusUsesOnlyHealthAndInventory(t *testing.T) {
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/interfaces":
+			writeJSON(w, http.StatusOK, models.InterfaceInventory{Recommended: "eth0", Interfaces: []models.DetectedInterface{{Name: "eth0", IsPhysical: true}}})
+		case "/health":
+			writeJSON(w, http.StatusOK, models.HealthStatus{Interfaces: []models.InterfaceHealth{{
+				Interface: "eth0", XDPAttached: true, MapOK: true, StatsOK: true, PolicyEnforced: true, EnforcementOK: true,
+			}}})
+		default:
+			t.Errorf("unexpected request for unrelated data: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer agent.Close()
+	state := store.New()
+	state.UpsertNode(context.Background(), models.Node{ID: "node-a", AgentURL: agent.URL})
+	h := &ServerHandler{store: state, service: service.NewPolicyService(state), reverseHTTP: agent.Client()}
+	req := httptest.NewRequest(http.MethodGet, "/nodes/node-a/protection-status", nil)
+	req.SetPathValue("node", "node-a")
+	recorder := httptest.NewRecorder()
+	h.handleNodeProtectionStatus(recorder, req)
+	var result map[string]string
+	if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil || result["protection_status"] != "enforced" {
+		t.Fatalf("unexpected protection response: %s, error: %v", recorder.Body, err)
+	}
+}
+
+func TestProtectionStatusFollowsAttachedInterfaceWhenRecommendationDiffers(t *testing.T) {
+	inventory := models.InterfaceInventory{
+		Recommended: "ens3",
+		Interfaces: []models.DetectedInterface{
+			{Name: "ens3", IsPhysical: true},
+			{Name: "eth1", IsPhysical: true, Attached: true},
+		},
+	}
+	if got := clusterFocusInterface(inventory); got != "eth1" {
+		t.Fatalf("cluster focus ignored attached interface: %q", got)
+	}
+
+	health := models.HealthStatus{
+		Status: "ok",
+		Interfaces: []models.InterfaceHealth{{
+			Interface: "eth1", XDPAttached: true, MapOK: true, StatsOK: true,
+			PolicyEnforced: true, EnforcementOK: true,
+		}},
+	}
+	if got := protectionStatusForInterface(health, "ens3", true); got != "enforced" {
+		t.Fatalf("healthy attached interface was hidden by stale recommendation: %q", got)
+	}
+}
+
+func TestNodeProtectionStatusFallsBackToHealthWhenInventoryIsUnavailable(t *testing.T) {
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/interfaces":
+			http.Error(w, "inventory temporarily unavailable", http.StatusServiceUnavailable)
+		case "/health":
+			writeJSON(w, http.StatusOK, models.HealthStatus{Interfaces: []models.InterfaceHealth{{
+				Interface: "eth1", XDPAttached: true, MapOK: true, StatsOK: true,
+				PolicyEnforced: true, EnforcementOK: true,
+			}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer agent.Close()
+	state := store.New()
+	state.UpsertNode(context.Background(), models.Node{ID: "node-a", AgentURL: agent.URL})
+	h := &ServerHandler{store: state, service: service.NewPolicyService(state), reverseHTTP: agent.Client()}
+	req := httptest.NewRequest(http.MethodGet, "/nodes/node-a/protection-status", nil)
+	req.SetPathValue("node", "node-a")
+	recorder := httptest.NewRecorder()
+	h.handleNodeProtectionStatus(recorder, req)
+	var result map[string]string
+	if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil || result["protection_status"] != "enforced" || result["interface"] != "eth1" {
+		t.Fatalf("health status was hidden by inventory failure: %s, error: %v", recorder.Body, err)
+	}
+}
+
+func TestHandleDeleteNodeForceCleansStaleAgent(t *testing.T) {
+	var cleanupCalls, deleteCalls int
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/maintenance/cleanup":
+			cleanupCalls++
+		case "/maintenance/delete":
+			deleteCalls++
+		default:
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	}))
+	defer agent.Close()
+
+	st := store.New()
+	st.UpsertNode(context.Background(), models.Node{
+		ID:         "node-stale",
+		Name:       "node-stale",
+		AgentURL:   agent.URL,
+		LastSeenAt: time.Now().Add(-10 * time.Minute),
+	})
+	handler := &ServerHandler{
+		service:     service.NewPolicyService(st),
+		store:       st,
+		reverseHTTP: &http.Client{Timeout: 2 * time.Second},
+	}
+	req := httptest.NewRequest(http.MethodDelete, "/nodes/node-stale?force=true", nil)
+	req.SetPathValue("node", "node-stale")
+	rec := httptest.NewRecorder()
+	handler.handleDeleteNode(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected delete status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	if cleanupCalls != 1 || deleteCalls != 1 {
+		t.Fatalf("expected forced cleanup and uninstall, got cleanup=%d delete=%d", cleanupCalls, deleteCalls)
+	}
+	if _, ok := service.FindNode(st.ListNodes(context.Background()), "node-stale"); ok {
+		t.Fatal("expected stale node to be removed from the manager")
+	}
+}
 
 func TestHandleProxyRecentDropLogsAggregatesBlockedLogs(t *testing.T) {
 	t.Parallel()
@@ -115,6 +593,46 @@ func TestHandleProxyInterfacesDoesNotAttachAsReadSideEffect(t *testing.T) {
 	}
 }
 
+func TestHandleProxyInterfacesFallbackPrefersAttachedHealthInterface(t *testing.T) {
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/interfaces":
+			writeError(w, http.StatusServiceUnavailable, errors.New("inventory busy"))
+		case "/health":
+			writeJSON(w, http.StatusOK, models.HealthStatus{
+				NodeID: "node-a", Status: "ok", AgentOK: true,
+				Interfaces: []models.InterfaceHealth{{Interface: "ens3", XDPAttached: true, PolicyEnforced: true}},
+			})
+		default:
+			writeJSON(w, http.StatusOK, map[string]any{})
+		}
+	}))
+	defer agent.Close()
+
+	st := store.New()
+	st.UpsertNode(context.Background(), models.Node{ID: "node-a", Name: "node-a", AgentURL: agent.URL})
+	st.PutPolicy(context.Background(), models.InterfacePolicy{NodeID: "node-a", Interface: "eno1"})
+	st.PutPolicy(context.Background(), models.InterfacePolicy{NodeID: "node-a", Interface: "ens3"})
+	handler := &ServerHandler{service: service.NewPolicyService(st), store: st, reverseHTTP: agent.Client()}
+	req := httptest.NewRequest(http.MethodGet, "/nodes/node-a/interfaces", nil)
+	req.SetPathValue("node", "node-a")
+	rec := httptest.NewRecorder()
+	handler.handleProxyInterfaces(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Interfaces  []models.DetectedInterface `json:"interfaces"`
+		Recommended string                     `json:"recommended"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Interfaces) == 0 || payload.Interfaces[0].Name != "ens3" || payload.Recommended != "ens3" || !payload.Interfaces[0].Attached {
+		t.Fatalf("fallback did not prefer attached health interface: %#v", payload)
+	}
+}
+
 func TestPortMutationFailsWhenAgentCannotApply(t *testing.T) {
 	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/attach") {
@@ -176,35 +694,83 @@ func TestHandleProxyStatsPreservesDirectionQuery(t *testing.T) {
 	}
 }
 
-func TestHandleMonitoringHistoryCollectsAndAggregatesNodeSamples(t *testing.T) {
+func TestMonitoringHistoryPublishesOnlyCompletedRounds(t *testing.T) {
 	t.Parallel()
 
-	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/system/metrics" {
-			writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
-			return
-		}
-		writeJSON(w, http.StatusOK, models.SystemMetrics{
-			CapturedAt: time.Now().UTC(),
-			CPU:        models.CPUMetrics{UsagePercent: 40},
-			Memory:     models.MemoryMetrics{TotalBytes: 1024, UsedPercent: 60},
-			Network: models.NetworkMetrics{
-				RxBytesPerSecond: 1024,
-				TxBytesPerSecond: 2048,
-			},
-		})
-	}))
-	defer agent.Close()
+	var calls atomic.Int32
+	fastReturned, slowStarted, releaseSlow := make(chan struct{}, 1), make(chan struct{}, 1), make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseSlow) }) }
+	newAgent := func(slow bool, skew time.Duration) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/system/metrics" {
+				http.NotFound(w, r)
+				return
+			}
+			calls.Add(1)
+			if slow {
+				select {
+				case slowStarted <- struct{}{}:
+				default:
+				}
+				select {
+				case <-releaseSlow:
+				case <-r.Context().Done():
+					return
+				}
+			}
+			writeJSON(w, http.StatusOK, models.SystemMetrics{
+				CapturedAt: time.Now().UTC().Add(skew),
+				CPU:        models.CPUMetrics{UsagePercent: 40},
+				Memory:     models.MemoryMetrics{TotalBytes: 1024, UsedPercent: 60},
+				Network:    models.NetworkMetrics{RxBytesPerSecond: 1024, TxBytesPerSecond: 2048},
+			})
+			if !slow {
+				select {
+				case fastReturned <- struct{}{}:
+				default:
+				}
+			}
+		}))
+	}
+	fast, slow := newAgent(false, -time.Minute), newAgent(true, time.Minute)
+	defer fast.Close()
+	defer slow.Close()
+	defer release()
 
 	now := time.Now().UTC()
 	st := store.New()
-	st.UpsertNode(context.Background(), models.Node{ID: "node-a", Name: "Node A", AgentURL: agent.URL, LastSeenAt: now})
-	st.UpsertNode(context.Background(), models.Node{ID: "node-b", Name: "Node B", AgentURL: agent.URL, LastSeenAt: now})
+	st.UpsertNode(t.Context(), models.Node{ID: "node-a", Name: "Node A", AgentURL: fast.URL, LastSeenAt: now})
+	st.UpsertNode(t.Context(), models.Node{ID: "node-b", Name: "Node B", AgentURL: slow.URL, LastSeenAt: now})
 	handler := &ServerHandler{
-		service:     service.NewPolicyService(st),
-		store:       st,
-		reverseHTTP: &http.Client{Timeout: 2 * time.Second},
+		service: service.NewPolicyService(st), store: st,
+		reverseHTTP: &http.Client{Timeout: 3 * time.Second},
 	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.collectSystemMetrics(t.Context(), st.ListNodes(t.Context()), now)
+	}()
+	for _, ready := range []chan struct{}{fastReturned, slowStarted} {
+		select {
+		case <-ready:
+		case <-time.After(time.Second):
+			t.Fatal("agents were not sampled concurrently")
+		}
+	}
+
+	partial := httptest.NewRecorder()
+	handler.handleMonitoringHistory(partial, httptest.NewRequest(http.MethodGet, "/monitoring/history?range=300", nil))
+	var before models.SystemMetricsHistory
+	if err := json.Unmarshal(partial.Body.Bytes(), &before); err != nil || len(before.Points) != 0 || !before.SampledAt.IsZero() {
+		t.Fatalf("HTTP exposed part of an unfinished batch: %s (%v)", partial.Body.String(), err)
+	}
+	streamBefore := handler.monitoringStreamSnapshot(t.Context(), "", 300, "", "")
+	if len(streamBefore.Points) != 0 || !streamBefore.SampledAt.IsZero() {
+		t.Fatal("SSE exposed part of an unfinished batch")
+	}
+	release()
+	<-done
 
 	req := httptest.NewRequest(http.MethodGet, "/monitoring/history?range=300", nil)
 	rec := httptest.NewRecorder()
@@ -222,6 +788,12 @@ func TestHandleMonitoringHistoryCollectsAndAggregatesNodeSamples(t *testing.T) {
 	if cluster.Points[0].CPUPercent != 40 || cluster.Points[0].RxBytesPerSecond != 2048 {
 		t.Fatalf("unexpected aggregated point: %#v", cluster.Points[0])
 	}
+	wantAt := now.Truncate(systemMetricsSampleInterval)
+	if !cluster.SampledAt.Equal(wantAt) || cluster.SampleIntervalSeconds != 15 ||
+		len(cluster.NodePoints["node-a"]) != 1 || len(cluster.NodePoints["node-b"]) != 1 ||
+		!cluster.NodePoints["node-a"][0].Timestamp.Equal(wantAt) || !cluster.NodePoints["node-b"][0].Timestamp.Equal(wantAt) {
+		t.Fatalf("node clock skew split one scheduled round: %#v", cluster.NodePoints)
+	}
 
 	nodeReq := httptest.NewRequest(http.MethodGet, "/monitoring/history?node=node-a&range=300", nil)
 	nodeRec := httptest.NewRecorder()
@@ -235,6 +807,9 @@ func TestHandleMonitoringHistoryCollectsAndAggregatesNodeSamples(t *testing.T) {
 	}
 	if nodeHistory.Scope != "node" || nodeHistory.NodeID != "node-a" || len(nodeHistory.Points) != 1 || len(nodeHistory.Nodes) != 1 {
 		t.Fatalf("unexpected node history: %#v", nodeHistory)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("HTTP or SSE initiated extra Agent probes: %d", calls.Load())
 	}
 }
 

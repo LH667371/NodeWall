@@ -3,6 +3,7 @@ package xdp
 import (
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 
 	"nodewall/internal/models"
@@ -619,12 +620,18 @@ func (m *MockManager) WriteConfig(ifaceName string, cfg Config) error {
 		return err
 	}
 	state.cfg = Config{
-		NonIPv4Action:        defaultNonIPv4(cfg.NonIPv4Action),
-		PortPolicyEnabled:    cfg.PortPolicyEnabled,
-		RateLimitEnabled:     cfg.RateLimitEnabled,
-		PolicyEnforced:       cfg.PolicyEnforced,
-		EgressPolicyEnforced: cfg.EgressPolicyEnforced,
-		ObserveOnly:          cfg.ObserveOnly,
+		NonIPv4Action:           defaultNonIPv4(cfg.NonIPv4Action),
+		PortPolicyEnabled:       cfg.PortPolicyEnabled,
+		RateLimitEnabled:        cfg.RateLimitEnabled,
+		PolicyEnforced:          cfg.PolicyEnforced,
+		EgressPolicyEnforced:    cfg.EgressPolicyEnforced,
+		ObserveOnly:             cfg.ObserveOnly,
+		EgressObserveOnly:       cfg.EgressObserveOnly,
+		EgressNonIPv4Action:     defaultNonIPv4(cfg.EgressNonIPv4Action),
+		EgressPortPolicyEnabled: cfg.EgressPortPolicyEnabled,
+		EgressRateLimitEnabled:  cfg.EgressRateLimitEnabled,
+		EgressDefaultDeny:       cfg.EgressDefaultDeny,
+		ReplyFlowTimeoutSeconds: cfg.ReplyFlowTimeoutSeconds,
 	}
 	return nil
 }
@@ -912,8 +919,8 @@ func defaultNonIPv4(action models.NonIPv4Action) models.NonIPv4Action {
 }
 
 func NewDataplane(mode, objectPath string) (Dataplane, error) {
-	switch mode {
-	case "", "real":
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "auto", "real":
 		return NewManager(objectPath), nil
 	case "mock":
 		return NewMockManager(), nil

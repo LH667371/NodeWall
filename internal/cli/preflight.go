@@ -93,6 +93,7 @@ type preflightOptions struct {
 	RequestedDataplane string
 	InstallMode        string
 	EnableServices     bool
+	ServiceManager     string
 	DefaultInterface   string
 	AgentAddr          string
 	ServerAddr         string
@@ -143,9 +144,10 @@ func runPreflight(args []string) error {
 	dataplane := fs.String("dataplane", envOr("NODEWALL_DATAPLANE", "auto"), "数据面：auto|real|iptables")
 	installMode := fs.String("mode", envOr("NODEWALL_INSTALL_MODE", "all-in-one"), "安装模式：all-in-one|server-only|agent-only")
 	enableServices := fs.Bool("enable-services", envBool("NODEWALL_ENABLE_SERVICES", true), "检查 systemd 服务能力")
+	serviceManager := fs.String("service-manager", envOr("NODEWALL_SERVICE_MANAGER", serviceManagerSystemd), "启动管理器：systemd|sysv|none")
 	defaultInterface := fs.String("default-interface", envOr("NODEWALL_DEFAULT_INTERFACE", ""), "待保护网卡，留空自动探测")
 	agentAddr := fs.String("agent-addr", envOr("NODEWALL_AGENT_ADDR", "127.0.0.1:9080"), "Agent 监听地址")
-	serverAddr := fs.String("server-addr", envOr("NODEWALL_SERVER_ADDR", "0.0.0.0:8080"), "Web Server 监听地址")
+	serverAddr := fs.String("server-addr", envOr("NODEWALL_SERVER_ADDR", "0.0.0.0:8086"), "Web Server 监听地址")
 	serverGRPCAddr := fs.String("server-grpc-addr", envOr("NODEWALL_SERVER_GRPC_ADDR", "0.0.0.0:50051"), "gRPC 监听地址，留空禁用")
 	serverQUICAddr := fs.String("server-quic-addr", envOr("NODEWALL_SERVER_QUIC_ADDR", "0.0.0.0:50052"), "QUIC 监听地址，留空禁用")
 	if err := fs.Parse(args); err != nil {
@@ -155,6 +157,13 @@ func runPreflight(args []string) error {
 	mode, err := normalizeInstallMode(*installMode)
 	if err != nil {
 		return err
+	}
+	resolvedServiceManager := strings.ToLower(strings.TrimSpace(*serviceManager))
+	if *enableServices {
+		resolvedServiceManager, err = resolveServiceManager(resolvedServiceManager)
+		if err != nil {
+			return err
+		}
 	}
 	resolvedDataplane, err := resolveInstallDataplane(*dataplane)
 	if err != nil {
@@ -187,6 +196,7 @@ func runPreflight(args []string) error {
 		RequestedDataplane: strings.TrimSpace(*dataplane),
 		InstallMode:        mode,
 		EnableServices:     *enableServices,
+		ServiceManager:     resolvedServiceManager,
 		DefaultInterface:   strings.TrimSpace(*defaultInterface),
 		AgentAddr:          resolvedAgentAddr,
 		ServerAddr:         resolvedServerAddr,
@@ -380,14 +390,28 @@ func checkSystemd(opts preflightOptions, deps preflightDeps) preflightCheck {
 	if !opts.EnableServices {
 		return preflightCheck{Name: "systemd", Status: preflightSkip, Detail: "--enable-services=false，不要求 systemd 在线"}
 	}
+	if strings.EqualFold(strings.TrimSpace(opts.ServiceManager), serviceManagerSysV) {
+		if deps.goos != "linux" {
+			return preflightCheck{Name: "启动管理器", Status: preflightFail, Detail: "SysV 服务只能在 Linux 主机上启用"}
+		}
+		if _, err := deps.stat("/etc/init.d"); err != nil {
+			return preflightCheck{Name: "启动管理器", Status: preflightFail, Detail: fmt.Sprintf("找不到 /etc/init.d: %v", err)}
+		}
+		return preflightCheck{Name: "启动管理器", Status: preflightPass, Detail: "使用 SysV init 脚本，并写入 cron @reboot 兜底"}
+	}
+	if strings.EqualFold(strings.TrimSpace(opts.ServiceManager), serviceManagerNone) {
+		return preflightCheck{Name: "启动管理器", Status: preflightSkip, Detail: "未安装开机自动启动；需要手动运行 nodewall agent/server"}
+	}
 	if deps.goos != "linux" {
 		return preflightCheck{Name: "systemd", Status: preflightFail, Detail: "systemd 服务只能在 Linux 主机上启用"}
 	}
 	if _, err := deps.lookPath("systemctl"); err != nil {
 		return preflightCheck{Name: "systemd", Status: preflightFail, Detail: fmt.Sprintf("找不到 systemctl: %v", err)}
 	}
-	state, err := deps.runCommand("systemctl", "show", "--property=SystemState", "--value")
-	state = strings.TrimSpace(state)
+	// Keep this probe aligned with systemdUsable: CentOS 7's systemctl 219
+	// accepts the property-only form but rejects the newer --value flag.
+	state, err := deps.runCommand("systemctl", "show", "--property=SystemState")
+	state = parseSystemdStateOutput(state)
 	if err != nil || state == "" || state == "offline" || state == "unknown" {
 		if err != nil {
 			return preflightCheck{Name: "systemd", Status: preflightFail, Detail: fmt.Sprintf("systemd 未运行或不可连接: %v", err)}
@@ -534,7 +558,7 @@ func checkBPFXDP(opts preflightOptions, deps preflightDeps) preflightCheck {
 	if err := deps.probeBPF(opts.BPFObject); err != nil {
 		return preflightCheck{Name: "BPF/XDP", Status: preflightFail, Detail: err.Error()}
 	}
-	return preflightCheck{Name: "BPF/XDP", Status: preflightPass, Detail: "BPF 程序和 XDP 类型程序可加载，实际挂载将按 native、generic 顺序尝试"}
+	return preflightCheck{Name: "BPF/XDP", Status: preflightPass, Detail: "BPF 程序和 XDP 类型程序可加载，实际挂载由 Agent 按网卡驱动与内核能力选择 native/generic"}
 }
 
 func probeBPFObject(object []byte) error {
@@ -545,6 +569,21 @@ func probeBPFObject(object []byte) error {
 	program, ok := spec.Programs["xdp_acl"]
 	if !ok || program == nil || program.Type != ebpf.XDP {
 		return errors.New("BPF 对象缺少 xdp_acl XDP 程序")
+	}
+	tcProgram, ok := spec.Programs["tc_egress_track"]
+	if !ok || tcProgram == nil || tcProgram.Type != ebpf.SchedCLS {
+		return errors.New("BPF 对象缺少 tc_egress_track TC egress 程序")
+	}
+	for _, mapName := range []string{
+		"egress_allow_ipv4", "egress_bypass_ipv4", "egress_block_ipv4",
+		"egress_icmp_allow_ipv4", "egress_icmp_block_ipv4", "egress_allow_ports",
+		"egress_public_ports", "egress_deny_ports", "egress_rate_limits",
+		"egress_stats_map", "egress_source_stats", "egress_port_stats", "egress_drop_logs",
+		"reply_flows", "reply_service_flows",
+	} {
+		if spec.Maps[mapName] == nil {
+			return fmt.Errorf("BPF 对象缺少出方向 map %s，请重新生成并打包 XDP/TC 对象", mapName)
+		}
 	}
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return fmt.Errorf("解除 BPF memlock 限制失败: %w", err)
@@ -570,12 +609,15 @@ func checkIPTables(opts preflightOptions, deps preflightDeps) preflightCheck {
 	if _, err := deps.lookPath("iptables"); err != nil {
 		return preflightCheck{Name: "iptables", Status: preflightFail, Detail: fmt.Sprintf("找不到 iptables: %v", err)}
 	}
-	for _, table := range []string{"raw", "mangle"} {
+	for _, table := range []string{"filter", "raw", "mangle"} {
 		if output, err := deps.runCommand("iptables", "-t", table, "-S"); err != nil {
 			return preflightCheck{Name: "iptables", Status: preflightFail, Detail: fmt.Sprintf("无法读取 %s 表: %v%s", table, err, formatCommandOutput(output))}
 		}
 	}
-	return preflightCheck{Name: "iptables", Status: preflightPass, Detail: "iptables 可执行，raw/mangle 表可访问"}
+	if output, err := deps.runCommand("iptables", "-m", "conntrack", "--help"); err != nil {
+		return preflightCheck{Name: "iptables", Status: preflightFail, Detail: fmt.Sprintf("连接跟踪匹配不可用；无法安全保留 DNS/HTTPS/SSH 回包: %v%s", err, formatCommandOutput(output))}
+	}
+	return preflightCheck{Name: "iptables", Status: preflightPass, Detail: "filter 表和 conntrack 匹配可用，raw/mangle 旧版私有链可迁移"}
 }
 
 func checkSSHLogSource(opts preflightOptions, deps preflightDeps) preflightCheck {

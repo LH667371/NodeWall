@@ -48,21 +48,27 @@ func init() {
 }
 
 type ReportRequest struct {
-	NodeID         string   `json:"node_id"`
-	NodeName       string   `json:"node_name"`
-	AgentHTTPAddr  string   `json:"agent_http_addr"`
-	AgentURL       string   `json:"agent_url,omitempty"`
-	PackageVersion string   `json:"package_version,omitempty"`
-	Interfaces     []string `json:"interfaces,omitempty"`
+	NodeID           string   `json:"node_id"`
+	NodeName         string   `json:"node_name"`
+	AgentHTTPAddr    string   `json:"agent_http_addr"`
+	AgentURL         string   `json:"agent_url,omitempty"`
+	AgentCertificate string   `json:"agent_certificate,omitempty"`
+	ServerHTTPAddr   string   `json:"server_http_addr,omitempty"`
+	PackageVersion   string   `json:"package_version,omitempty"`
+	Interfaces       []string `json:"interfaces,omitempty"`
 	// OnUpdate is local-only and is deliberately omitted from the wire request.
 	// Heartbeat responses use it to wake the auto-update loop immediately.
 	OnUpdate func() `json:"-"`
+	// OnManagerURL is local-only. The control-plane response can repair a stale
+	// HTTPS manager URL after a web port migration.
+	OnManagerURL func(string) `json:"-"`
 }
 
 type ReportResponse struct {
 	ServerTime         time.Time `json:"server_time"`
 	RecommendedAgentIP string    `json:"recommended_agent_ip,omitempty"`
 	PackageVersion     string    `json:"package_version,omitempty"`
+	ManagerURL         string    `json:"manager_url,omitempty"`
 	UpdateAvailable    bool      `json:"update_available,omitempty"`
 }
 
@@ -70,11 +76,20 @@ type Server struct {
 	credentials      *nodeauth.Registry
 	store            *store.Store
 	agentBaseURL     string
+	managerURL       string
 	defaultInterface string
 	httpClient       *http.Client
 }
 
 func (s *Server) RequireNodeAuth(registry *nodeauth.Registry) { s.credentials = registry }
+
+// SetManagerURL publishes the manager's current browser/API origin through
+// the control plane. This is intentionally separate from agentBaseURL: agents
+// use the latter for local proxying, while updates and HTTPS heartbeats need
+// the manager's web port.
+func (s *Server) SetManagerURL(managerURL string) {
+	s.managerURL = strings.TrimRight(strings.TrimSpace(managerURL), "/")
+}
 
 type ClientSecurity struct {
 	Token              string
@@ -256,8 +271,23 @@ func (s *Server) Report(ctx context.Context, req *ReportRequest) (*ReportRespons
 		}
 		credential, _ := s.credentials.Get(req.NodeID)
 		origin, err := nodeauth.Origin(req.AgentURL)
-		if err != nil || origin != credential.AgentURL {
-			return nil, status.Error(codes.PermissionDenied, "agent endpoint changed; enroll this node again")
+		if err != nil {
+			return nil, status.Error(codes.PermissionDenied, "invalid agent endpoint")
+		}
+		certificate := strings.TrimSpace(req.AgentCertificate)
+		endpointChanged := origin != credential.AgentURL
+		certificateChanged := certificate != "" && certificate != strings.TrimSpace(credential.Certificate)
+		if endpointChanged || certificateChanged {
+			if certificate == "" {
+				return nil, status.Error(codes.PermissionDenied, "agent certificate is required when the endpoint or certificate changes; enroll this node again")
+			}
+			next := credential
+			next.AgentURL = origin
+			next.Certificate = certificate
+			if err := s.credentials.Put(next); err != nil {
+				return nil, status.Error(codes.PermissionDenied, "refresh agent credential: "+err.Error())
+			}
+			credential = next
 		}
 	}
 	if strings.TrimSpace(req.NodeID) == "" {
@@ -299,19 +329,26 @@ func (s *Server) Report(ctx context.Context, req *ReportRequest) (*ReportRespons
 	if parsed, err := url.Parse(strings.TrimSpace(req.AgentURL)); err == nil && parsed.Scheme != "" {
 		agentScheme = parsed.Scheme
 	}
+	serverHTTPAddr := normalizeReportedHTTPAddr(req.ServerHTTPAddr, advertiseIP)
 	node := models.Node{
-		ID:            req.NodeID,
-		Name:          firstNonEmpty(req.NodeName, req.NodeID),
-		AdvertiseIP:   advertiseIP,
-		AgentHTTPAddr: agentHTTPAddr,
-		AgentURL:      agentScheme + "://" + agentHTTPAddr,
-		LastSeenAt:    time.Now().UTC(),
+		ID:             req.NodeID,
+		Name:           firstNonEmpty(req.NodeName, req.NodeID),
+		AdvertiseIP:    advertiseIP,
+		AgentHTTPAddr:  agentHTTPAddr,
+		ServerHTTPAddr: serverHTTPAddr,
+		PackageVersion: strings.TrimSpace(req.PackageVersion),
+		AgentURL:       agentScheme + "://" + agentHTTPAddr,
+		LastSeenAt:     time.Now().UTC(),
 	}
 	if s.credentials != nil {
 		credential, _ := s.credentials.Get(req.NodeID)
 		endpoint, _ := url.Parse(credential.AgentURL)
 		node.AgentURL = credential.AgentURL
 		node.AgentHTTPAddr = endpoint.Host
+		// Keep the browser-facing manager address useful even when an all-in-one
+		// agent reports over loopback. The peer address is the best available
+		// external host in that case.
+		node.ServerHTTPAddr = normalizeReportedHTTPAddr(serverHTTPAddr, advertiseIP)
 		// The manager's own AgentURL intentionally stays on loopback so its
 		// reverse proxy uses the local agent. Keep the externally useful
 		// advertise address from the peer report in that all-in-one case.
@@ -329,8 +366,37 @@ func (s *Server) Report(ctx context.Context, req *ReportRequest) (*ReportRespons
 		ServerTime:         time.Now().UTC(),
 		RecommendedAgentIP: advertiseIP,
 		PackageVersion:     remoteVersion,
+		ManagerURL:         s.managerURL,
 		UpdateAvailable:    packageUpdateAvailable(req.PackageVersion, remoteVersion),
 	}, nil
+}
+
+// normalizeReportedHTTPAddr turns a bind address such as 0.0.0.0:8082 into
+// an address that can be rendered or opened from another cluster member. The
+// port is retained while unspecified and loopback hosts are replaced with the
+// authenticated peer's advertised address.
+func normalizeReportedHTTPAddr(raw, advertiseIP string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if strings.Contains(raw, "://") {
+		if parsed, err := url.Parse(raw); err == nil && parsed.Host != "" {
+			raw = parsed.Host
+		}
+	}
+	host, port, err := net.SplitHostPort(raw)
+	if err != nil || strings.TrimSpace(port) == "" {
+		return raw
+	}
+	host = strings.Trim(host, "[]")
+	if replacement := strings.TrimSpace(advertiseIP); replacement != "" {
+		ip := net.ParseIP(host)
+		if host == "" || host == "0.0.0.0" || host == "::" || (ip != nil && ip.IsLoopback()) || strings.EqualFold(host, "localhost") {
+			host = replacement
+		}
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func packageUpdateAvailable(local, remote string) bool {
@@ -519,23 +585,19 @@ func ReportLoop(ctx context.Context, managerGRPCAddr string, req ReportRequest, 
 	if interval <= 0 {
 		interval = 10 * time.Second
 	}
-	transportCredentials := credentials.TransportCredentials(insecure.NewCredentials())
-	if len(options) > 0 && options[0].Token != "" {
-		security := options[0]
-		caFile := security.CAFile
-		if caFile == "" {
-			caFile = security.CertFile
-		}
-		tlsConfig, err := transporttls.ClientConfig(caFile, "", security.InsecureSkipVerify)
-		if err != nil {
-			return err
-		}
-		transportCredentials = credentials.NewTLS(tlsConfig)
-	}
 	backoff := time.Second
 	for {
 		if ctx.Err() != nil {
 			return nil
+		}
+		transportCredentials, credentialErr := reportTransportCredentials(options...)
+		if credentialErr != nil {
+			log.Printf("warning: gRPC heartbeat TLS setup failed: %v", credentialErr)
+			if !waitReportRetry(ctx, backoff) {
+				return nil
+			}
+			backoff = nextReportBackoff(backoff)
+			continue
 		}
 		connectCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		conn, err := grpc.DialContext(connectCtx, managerGRPCAddr,
@@ -555,9 +617,14 @@ func ReportLoop(ctx context.Context, managerGRPCAddr string, req ReportRequest, 
 		}
 		ticker := time.NewTicker(interval)
 		send := func() error {
+			requestCtx, cancel := context.WithTimeout(reportCtx, 5*time.Second)
+			defer cancel()
 			var resp ReportResponse
-			if err := conn.Invoke(reportCtx, methodName, &req, &resp, grpc.CallContentSubtype("json")); err != nil {
+			if err := conn.Invoke(requestCtx, methodName, &req, &resp, grpc.CallContentSubtype("json")); err != nil {
 				return err
+			}
+			if resp.ManagerURL != "" && req.OnManagerURL != nil {
+				req.OnManagerURL(resp.ManagerURL)
 			}
 			if resp.UpdateAvailable && req.OnUpdate != nil {
 				req.OnUpdate()
@@ -585,6 +652,22 @@ func ReportLoop(ctx context.Context, managerGRPCAddr string, req ReportRequest, 
 	}
 }
 
+func reportTransportCredentials(options ...ClientSecurity) (credentials.TransportCredentials, error) {
+	if len(options) == 0 || strings.TrimSpace(options[0].Token) == "" {
+		return insecure.NewCredentials(), nil
+	}
+	security := options[0]
+	caFile := security.CAFile
+	if caFile == "" {
+		caFile = security.CertFile
+	}
+	tlsConfig, err := transporttls.ClientConfig(caFile, "", security.InsecureSkipVerify)
+	if err != nil {
+		return nil, err
+	}
+	return credentials.NewTLS(tlsConfig), nil
+}
+
 // ReportLoopHTTP provides a heartbeat path over the manager's HTTPS listener.
 // It keeps nodes online when an existing host policy has not yet opened the
 // optional gRPC/QUIC ports, and it also serves as a simple reconnecting path
@@ -597,12 +680,16 @@ func ReportLoopHTTP(ctx context.Context, managerURL string, req ReportRequest, i
 	if interval <= 0 {
 		interval = 10 * time.Second
 	}
-	tlsConfig, err := transporttls.ClientConfig(security.CAFile, "", security.InsecureSkipVerify)
-	if err != nil {
-		return err
-	}
-	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: tlsConfig, ForceAttemptHTTP2: true}}
 	report := func() error {
+		// Rebuild the client for every heartbeat. Standby synchronization can
+		// atomically replace the manager certificate while this process stays up;
+		// retaining one TLS config would keep the old CA forever.
+		tlsConfig, err := transporttls.ClientConfig(security.CAFile, "", security.InsecureSkipVerify)
+		if err != nil {
+			return err
+		}
+		client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: tlsConfig, ForceAttemptHTTP2: true}}
+		defer client.CloseIdleConnections()
 		body, err := json.Marshal(req)
 		if err != nil {
 			return err
@@ -626,8 +713,13 @@ func ReportLoopHTTP(ctx context.Context, managerURL string, req ReportRequest, i
 			return fmt.Errorf("HTTPS heartbeat failed: %s: %s", resp.Status, strings.TrimSpace(string(message)))
 		}
 		var heartbeat ReportResponse
-		if err := json.NewDecoder(resp.Body).Decode(&heartbeat); err == nil && heartbeat.UpdateAvailable && req.OnUpdate != nil {
-			req.OnUpdate()
+		if err := json.NewDecoder(resp.Body).Decode(&heartbeat); err == nil {
+			if heartbeat.ManagerURL != "" && req.OnManagerURL != nil {
+				req.OnManagerURL(heartbeat.ManagerURL)
+			}
+			if heartbeat.UpdateAvailable && req.OnUpdate != nil {
+				req.OnUpdate()
+			}
 		}
 		return nil
 	}
@@ -690,17 +782,20 @@ func ReportLoopQUIC(ctx context.Context, managerURL, managerQUICAddr string, req
 	if token != "" {
 		insecureSkipVerify = false
 	}
-	tlsConfig, err := transporttls.ClientConfig(caFile, serverName, insecureSkipVerify)
-	if err != nil {
-		return err
-	}
-	transport := &http3.Transport{TLSClientConfig: tlsConfig}
-	defer transport.Close()
-	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
 	if interval <= 0 {
 		interval = 10 * time.Second
 	}
 	report := func() error {
+		// QUIC transports also capture the trust store at construction time. A
+		// short-lived transport lets a manager certificate replacement converge
+		// without requiring an agent restart.
+		tlsConfig, err := transporttls.ClientConfig(caFile, serverName, insecureSkipVerify)
+		if err != nil {
+			return err
+		}
+		transport := &http3.Transport{TLSClientConfig: tlsConfig}
+		defer transport.Close()
+		client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
 		body, err := json.Marshal(req)
 		if err != nil {
 			return err
@@ -723,8 +818,13 @@ func ReportLoopQUIC(ctx context.Context, managerURL, managerQUICAddr string, req
 			return fmt.Errorf("QUIC report failed: %s: %s", response.Status, strings.TrimSpace(string(message)))
 		}
 		var report ReportResponse
-		if err := json.NewDecoder(response.Body).Decode(&report); err == nil && report.UpdateAvailable && req.OnUpdate != nil {
-			req.OnUpdate()
+		if err := json.NewDecoder(response.Body).Decode(&report); err == nil {
+			if report.ManagerURL != "" && req.OnManagerURL != nil {
+				req.OnManagerURL(report.ManagerURL)
+			}
+			if report.UpdateAvailable && req.OnUpdate != nil {
+				req.OnUpdate()
+			}
 		}
 		return nil
 	}

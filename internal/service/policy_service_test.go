@@ -53,6 +53,25 @@ func TestClusterInterconnectRemovesLegacyLoopbackRule(t *testing.T) {
 	}
 }
 
+func TestDirectionHasEnforcementKeepsPermanentPassOpen(t *testing.T) {
+	open := models.DirectionPolicy{
+		Enabled:       true,
+		DefaultAction: "pass",
+		AllowedPortRules: []models.PortRule{
+			{Protocol: models.PortProtocolTCP, Port: 443},
+		},
+	}
+	if directionHasEnforcement(open) {
+		t.Fatal("permanently open egress policy must not request a temporary lease")
+	}
+
+	restricted := open
+	restricted.DeniedPortRules = []models.PortRule{{Protocol: models.PortProtocolTCP, Port: 25}}
+	if !directionHasEnforcement(restricted) {
+		t.Fatal("an explicit deny must keep egress enforcement active")
+	}
+}
+
 func containsAllowRule(rules []models.ACLRule, cidr string) bool {
 	for _, rule := range rules {
 		if rule.CIDR == cidr && (rule.Action == "" || rule.Action == "allow") {

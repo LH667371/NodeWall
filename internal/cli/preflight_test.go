@@ -160,3 +160,40 @@ func TestParseUbuntuVersion(t *testing.T) {
 		}
 	}
 }
+
+func TestLegacyPreflightRequiresFilterAndConnectionTracking(t *testing.T) {
+	for _, failing := range []string{"", "-t filter -S", "-m conntrack --help"} {
+		t.Run(failing, func(t *testing.T) {
+			deps := healthyPreflightDeps()
+			var calls []string
+			deps.runCommand = func(name string, args ...string) (string, error) {
+				command := strings.Join(args, " ")
+				calls = append(calls, name+" "+command)
+				if failing != "" && command == failing {
+					return "unavailable", os.ErrPermission
+				}
+				return "", nil
+			}
+			check := checkIPTables(preflightOptions{InstallMode: "agent-only", Dataplane: "iptables"}, deps)
+			if failing == "" && check.Status != preflightPass || failing != "" && check.Status != preflightFail {
+				t.Fatalf("unexpected compatibility result: %+v calls=%v", check, calls)
+			}
+			for _, command := range calls {
+				if !strings.Contains(command, " -S") && !strings.HasSuffix(command, " --help") {
+					t.Fatalf("preflight mutated firewall rules: %s", command)
+				}
+			}
+		})
+	}
+}
+
+func TestXDPPreflightNeverCallsLegacyBackend(t *testing.T) {
+	deps := healthyPreflightDeps()
+	deps.runCommand = func(name string, args ...string) (string, error) {
+		t.Fatalf("XDP preflight invoked %s %v", name, args)
+		return "", nil
+	}
+	if result := checkIPTables(preflightOptions{InstallMode: "all-in-one", Dataplane: "real"}, deps); result.Status != preflightSkip {
+		t.Fatalf("XDP must skip iptables: %+v", result)
+	}
+}

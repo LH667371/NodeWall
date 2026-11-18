@@ -13,7 +13,7 @@ import {
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { downloadFile, request } from "@/lib/api";
+import { csrfHeaders, downloadFile, request } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
 
 const props = defineProps({
@@ -378,7 +378,7 @@ async function uploadFile(event) {
   const body = new FormData();
   body.append("file", file);
   body.append("path", target);
-  const response = await fetch(`/ssh-sessions/${encodeURIComponent(sessionID.value)}/files`, { method: "POST", body });
+  const response = await fetch(`/ssh-sessions/${encodeURIComponent(sessionID.value)}/files`, { method: "POST", headers: csrfHeaders(), body });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(payload.error || t("sshConsoleUploadFailed"));
   message.value = t("sshConsoleUploadDone");
@@ -468,7 +468,7 @@ onBeforeUnmount(async () => {
 
 <template>
   <section class="page-grid">
-    <article class="panel panel-span-12 ssh-console-page">
+    <article class="panel panel-span-12 ssh-console-page workspace-fill">
       <div class="panel-head">
         <div>
           <p>{{ t("sshConsoleEyebrow") }}</p>

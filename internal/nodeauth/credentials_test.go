@@ -2,6 +2,7 @@ package nodeauth
 
 import (
 	"crypto/tls"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -65,6 +66,38 @@ func TestAnonymousNodeRequestsAreRejected(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNoContent || !called {
 		t.Fatal("valid node credential was rejected")
+	}
+}
+
+func TestPinnedNodeTransportNegotiatesHTTPWithoutQUICALPN(t *testing.T) {
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor != 2 || r.TLS.NegotiatedProtocol != "h2" {
+			t.Errorf("unexpected Agent protocol: %s / %s", r.Proto, r.TLS.NegotiatedProtocol)
+		}
+		if r.Header.Get(NodeHeader) != "node-a" {
+			t.Error("transport did not bind the enrolled node identity")
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	server.EnableHTTP2 = true
+	server.TLS = &tls.Config{NextProtos: []string{"h3", "h2", "http/1.1"}}
+	server.StartTLS()
+	defer server.Close()
+	registry, _ := Open("")
+	token, _ := NewToken()
+	certificate := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
+	if err := registry.Put(Credential{NodeID: "node-a", AgentURL: server.URL, Token: token, Certificate: string(certificate)}); err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: &Transport{Registry: registry}}
+	defer client.CloseIdleConnections()
+	response, err := client.Get(server.URL + "/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatal(response.Status)
 	}
 }
 
@@ -134,5 +167,28 @@ func TestPinnedNodeCertificatesAndIndependentCredentials(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "https://unregistered.invalid/health", nil)
 	if _, err := transport.RoundTrip(request); err == nil || !strings.Contains(err.Error(), "not enrolled") {
 		t.Fatal("unregistered endpoint was trusted")
+	}
+}
+
+func TestGetByAgentURLResolvesReenrolledNodeID(t *testing.T) {
+	registry, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := NewToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Put(Credential{
+		NodeID:      "new-node-id",
+		AgentURL:    "HTTP://127.0.0.1:9080/",
+		Token:       token,
+		Certificate: "",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	credential, ok := registry.GetByAgentURL("http://127.0.0.1:9080")
+	if !ok || credential.NodeID != "new-node-id" || credential.Token != token {
+		t.Fatalf("URL lookup did not resolve the re-enrolled credential: %#v, %v", credential, ok)
 	}
 }

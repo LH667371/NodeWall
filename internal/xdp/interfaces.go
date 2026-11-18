@@ -2,6 +2,7 @@ package xdp
 
 import (
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -19,6 +20,7 @@ func DetectHostInterfaces() (models.InterfaceInventory, error) {
 	}
 
 	detected := make([]models.DetectedInterface, 0, len(ifaces))
+	masters := make(map[string]string)
 	for _, iface := range ifaces {
 		item := models.DetectedInterface{
 			Name:         iface.Name,
@@ -36,7 +38,11 @@ func DetectHostInterfaces() (models.InterfaceInventory, error) {
 		}
 
 		detected = append(detected, item)
+		if master, err := os.Readlink(filepath.Join("/sys/class/net", iface.Name, "master")); err == nil {
+			masters[iface.Name] = filepath.Base(master)
+		}
 	}
+	associateInterfaceAddresses(detected, masters)
 
 	recommended := recommendInterface(detected)
 	for i := range detected {
@@ -51,6 +57,44 @@ func DetectHostInterfaces() (models.InterfaceInventory, error) {
 		Interfaces:  detected,
 		Recommended: recommended,
 	}, nil
+}
+
+// A bridge slave often has only link-local IPv6 while its bridge owns the
+// management IPv4. Keep that association explicit without changing the NIC's
+// own address list or the interface on which a policy is applied.
+func associateInterfaceAddresses(items []models.DetectedInterface, masters map[string]string) {
+	byName := make(map[string]models.DetectedInterface, len(items))
+	for _, item := range items {
+		byName[item.Name] = item
+	}
+	hasIPv4 := func(addresses []string) bool {
+		for _, text := range addresses {
+			addr, err := netip.ParseAddr(strings.SplitN(text, "/", 2)[0])
+			if err == nil && addr.Unmap().Is4() {
+				return true
+			}
+		}
+		return false
+	}
+	for i := range items {
+		items[i].AddressInterface, items[i].RelatedAddresses = "", nil
+		if hasIPv4(items[i].Addresses) {
+			continue
+		}
+		seen := map[string]bool{items[i].Name: true}
+		for master := masters[items[i].Name]; master != "" && !seen[master]; master = masters[master] {
+			seen[master] = true
+			parent, found := byName[master]
+			if !found {
+				break
+			}
+			if hasIPv4(parent.Addresses) {
+				items[i].AddressInterface = parent.Name
+				items[i].RelatedAddresses = append([]string(nil), parent.Addresses...)
+				break
+			}
+		}
+	}
 }
 
 func normalizeFlags(flags net.Flags) []string {

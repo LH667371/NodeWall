@@ -8,7 +8,7 @@ CONTAINER_RUNTIME ?=
 NODEWALL_BPF_IMAGE ?= nodewall-bpf-gen:go1.27.3
 GO_RUN = env GOCACHE=$(GOCACHE) GOPATH=$(GOPATH) GOENV=$(GOENV) $(GO)
 
-.PHONY: generate generate-hostlinux build package package-archive run-agent run-server dev dev-real deploy cleanup test clean help
+.PHONY: generate generate-hostlinux build package package-offline package-update run-agent run-server dev dev-real deploy cleanup test clean help
 
 generate:
 	./scripts/gen_bpf.sh
@@ -22,8 +22,11 @@ build:
 package:
 	NODEWALL_PACKAGE_FORMAT=binary bash ./scripts/package.sh
 
-package-archive:
-	NODEWALL_PACKAGE_FORMAT=archive bash ./scripts/package.sh
+package-offline:
+	NODEWALL_PACKAGE_FORMAT=archive NODEWALL_PACKAGE_CONTENT=offline bash ./scripts/package.sh
+
+package-update:
+	NODEWALL_PACKAGE_FORMAT=archive NODEWALL_PACKAGE_CONTENT=update bash ./scripts/package.sh
 
 run-agent:
 	$(GO_RUN) run ./cmd/nodewall agent
@@ -58,8 +61,10 @@ clean:
 help:
 	@echo "Common commands:"
 	@echo "  make build           Build local binary to bin/nodewall"
-	@echo "  make package         Build web assets and package a linux/amd64 binary under dist/"
-	@echo "  make package-archive Build web assets and package tar.gz archives under dist/"
+	@echo "  make package         Build web assets and standalone Linux binaries under dist/"
+	@echo "  make package-offline Build archives with the ClamAV engine and offline databases"
+	@echo "  make package-update  Build smaller update archives without ClamAV assets"
+	@echo "  make package-archive Alias for package-offline (legacy)"
 	@echo "  make dev             Run demo mode (UI + server + agent)"
 	@echo "  make dev-real        Run real dataplane mode"
 	@echo "  make test            Run Go tests"

@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"nodewall/internal/securityscan"
 )
 
 var scanReportID = regexp.MustCompile(`^scan-[a-zA-Z0-9_-]{1,80}$`)
@@ -22,6 +24,7 @@ const scanReportLimit = 500
 type scanReportSummary struct {
 	ID            string     `json:"id"`
 	Status        string     `json:"status"`
+	Mode          string     `json:"mode,omitempty"`
 	Root          string     `json:"root"`
 	StartedAt     time.Time  `json:"started_at"`
 	FinishedAt    *time.Time `json:"finished_at,omitempty"`
@@ -75,10 +78,22 @@ func (h *AgentHandler) ConfigureSecurityArchive(dir string) (resultErr error) {
 				return err
 			}
 		}
+		if sanitizeScanReportEvidence(&report) {
+			if err := h.saveScanReport(report); err != nil {
+				return err
+			}
+		}
 		h.securityReports[id] = summarizeScan(report)
 		if latest.ReportID == "" || report.StartedAt.After(latest.StartedAt) {
 			latest = report
 		}
+	}
+	removed, skipped, cleanupErr := h.cleanupArchivedScanEvidence(securityQuarantineRoot)
+	if cleanupErr != nil || skipped > 0 {
+		h.securityArchiveWarning = "some retired scan evidence could not be removed safely; check the agent log"
+		log.Printf("warning: clean retired scan evidence: removed=%d skipped=%d error=%v", removed, skipped, cleanupErr)
+	} else if removed > 0 {
+		log.Printf("removed %d retired scan evidence artifact(s); quarantine payloads were preserved", removed)
 	}
 	if latest.ReportID != "" {
 		view := scanReportView(latest)
@@ -88,25 +103,29 @@ func (h *AgentHandler) ConfigureSecurityArchive(dir string) (resultErr error) {
 }
 
 func scanReportView(report securityScanReport) securityScanView {
-	return securityScanView{NodeID: report.NodeID, ID: report.ReportID, Status: report.Status, Root: report.Root,
+	return securityScanView{NodeID: report.NodeID, ID: report.ReportID, Status: report.Status, Mode: report.Mode, Root: report.Root,
 		StartedAt: report.StartedAt, FinishedAt: report.FinishedAt, FilesScanned: report.FilesScanned,
-		BytesScanned: report.BytesScanned, FilesSkipped: report.FilesSkipped, ReadErrors: report.ReadErrors,
+		BytesScanned: report.BytesScanned, FilesSkipped: report.FilesSkipped, MountsSkipped: report.MountsSkipped, ReadErrors: report.ReadErrors,
 		Findings: report.Findings, Truncated: report.Truncated, Error: report.Error,
-		AutoQuarantine: report.AutoQuarantine, AutoTerminateProcesses: report.AutoTerminateProcesses,
+		CoverageGaps: append([]securityscan.CoverageGap(nil), report.CoverageGaps...), CoverageGapsOmitted: report.CoverageGapsOmitted,
+		SignatureEngine: report.SignatureEngine,
+		AutoQuarantine:  report.AutoQuarantine, AutoTerminateProcesses: report.AutoTerminateProcesses,
 		QuarantineErrors: append([]string(nil), report.QuarantineErrors...)}
 }
 
 func scanViewJob(view securityScanView) *securityScanJob {
-	return &securityScanJob{NodeID: view.NodeID, ID: view.ID, Status: view.Status, Root: view.Root,
+	return &securityScanJob{NodeID: view.NodeID, ID: view.ID, Status: view.Status, Mode: view.Mode, Root: view.Root,
 		StartedAt: view.StartedAt, FinishedAt: view.FinishedAt, FilesScanned: view.FilesScanned,
-		BytesScanned: view.BytesScanned, FilesSkipped: view.FilesSkipped, ReadErrors: view.ReadErrors,
+		BytesScanned: view.BytesScanned, FilesSkipped: view.FilesSkipped, MountsSkipped: view.MountsSkipped, ReadErrors: view.ReadErrors,
 		Findings: view.Findings, Truncated: view.Truncated, Error: view.Error,
-		AutoQuarantine: view.AutoQuarantine, AutoTerminateProcesses: view.AutoTerminateProcesses,
+		CoverageGaps: append([]securityscan.CoverageGap(nil), view.CoverageGaps...), CoverageGapsOmitted: view.CoverageGapsOmitted,
+		SignatureEngine: view.SignatureEngine,
+		AutoQuarantine:  view.AutoQuarantine, AutoTerminateProcesses: view.AutoTerminateProcesses,
 		QuarantineErrors: append([]string(nil), view.QuarantineErrors...)}
 }
 
 func summarizeScan(report securityScanReport) scanReportSummary {
-	return scanReportSummary{ID: report.ReportID, Status: report.Status, Root: report.Root,
+	return scanReportSummary{ID: report.ReportID, Status: report.Status, Mode: report.Mode, Root: report.Root,
 		StartedAt: report.StartedAt, FinishedAt: report.FinishedAt, FilesScanned: report.FilesScanned,
 		FindingsCount: report.FindingsCount, Truncated: report.Truncated}
 }
@@ -204,12 +223,37 @@ func (h *AgentHandler) pruneScanReports() error {
 		if report.Status == "running" {
 			continue
 		}
+		detail, err := h.readArchivedScan(report.ID)
+		if err != nil {
+			// A damaged report might be the only remaining ownership record.
+			h.securityArchiveWarning = "some scan reports could not be read for retention; check the agent log"
+			continue
+		}
+		if reportHasOwnedStartupMask(detail) {
+			continue
+		}
 		if err := os.Remove(filepath.Join(h.securityArchiveDir, report.ID+".json")); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 		delete(h.securityReports, report.ID)
 	}
 	return nil
+}
+
+// A mask may outlive the usual report retention window. Keep its ownership
+// record (including an interrupted pending operation) until it can be recovered.
+func reportHasOwnedStartupMask(report securityScanReport) bool {
+	for _, finding := range report.Findings {
+		if finding.StartupBlocked && finding.StartupBlockOwned {
+			return true
+		}
+		for _, block := range finding.StartupBlocks {
+			if block.Owned || block.Status == "pending" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (h *AgentHandler) archiveCurrentScan() error {

@@ -79,3 +79,66 @@ func verifySSHDScopes(config string, data []byte, wrapper, managedDropIn string)
 	}
 	return inspect(config, data)
 }
+
+// A Match or included file can still refer to a helper even when the global
+// sshd -T output does not. Do not remove that helper until every reference is
+// accounted for.
+func verifyNoManagedReferences(config string, data []byte, wrapper, sftp string) error {
+	seen := make(map[string]bool)
+	remaining := 1 << 20
+	var inspect func(string, []byte) error
+	inspect = func(path string, content []byte) error {
+		path = filepath.Clean(path)
+		if seen[path] {
+			return nil
+		}
+		seen[path] = true
+		remaining -= len(content)
+		if remaining < 0 || len(seen) > 64 {
+			return errors.New("SSH include configuration exceeds the recovery limit")
+		}
+		for _, line := range strings.Split(string(content), "\n") {
+			fields := activeFields(line)
+			if len(fields) == 0 {
+				continue
+			}
+			active := strings.SplitN(line, "#", 2)[0]
+			if (wrapper != "" && strings.Contains(active, wrapper)) || (sftp != "" && strings.Contains(active, sftp)) {
+				return fmt.Errorf("SSH config %s still references a NodeWall helper; preserve the helper and remove the reference manually", path)
+			}
+			if !strings.EqualFold(fields[0], "include") {
+				continue
+			}
+			if strings.ContainsAny(line, "\"'\\") {
+				return fmt.Errorf("quoted or escaped SSH Include in %s requires manual recovery review", path)
+			}
+			for _, pattern := range fields[1:] {
+				if !filepath.IsAbs(pattern) {
+					pattern = filepath.Join("/etc/ssh", pattern)
+				}
+				matches, err := filepath.Glob(pattern)
+				if err != nil {
+					return err
+				}
+				for _, include := range matches {
+					info, err := os.Stat(include)
+					if err != nil {
+						return err
+					}
+					if !info.Mode().IsRegular() || info.Size() > int64(remaining) {
+						return fmt.Errorf("SSH include %s is not a bounded regular config file", include)
+					}
+					included, err := os.ReadFile(include)
+					if err != nil {
+						return err
+					}
+					if err := inspect(include, included); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		return nil
+	}
+	return inspect(config, data)
+}

@@ -84,6 +84,11 @@ type Config struct {
 	PolicyEnforced          bool                 `json:"policy_enforced"`
 	EgressPolicyEnforced    bool                 `json:"egress_policy_enforced"`
 	ObserveOnly             bool                 `json:"observe_only"`
+	EgressObserveOnly       bool                 `json:"egress_observe_only"`
+	EgressNonIPv4Action     models.NonIPv4Action `json:"egress_non_ipv4_action"`
+	EgressPortPolicyEnabled bool                 `json:"egress_port_policy_enabled"`
+	EgressRateLimitEnabled  bool                 `json:"egress_rate_limit_enabled"`
+	EgressDefaultDeny       bool                 `json:"egress_default_deny"`
 	ReplyFlowTimeoutSeconds int                  `json:"reply_flow_timeout_seconds"`
 }
 

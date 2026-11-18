@@ -39,6 +39,40 @@ type CommandRunner func(context.Context, string, ...string) ([]byte, error)
 
 type state struct {
 	OriginalSubsystem string `json:"original_subsystem"`
+	AddedSeparator    bool   `json:"added_separator,omitempty"`
+}
+
+// Restore removes only the SSH hooks installed by NodeWall. It also works
+// when the saved policy settings are missing, as long as the SFTP recovery
+// state is still available if NodeWall replaced that subsystem.
+func (a *Applier) Restore(ctx context.Context) error {
+	if a == nil {
+		return errors.New("SSH transfer policy applier is not configured")
+	}
+	config, exists, err := readOptional(a.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read sshd config: %w", err)
+	}
+	managed := strings.Contains(string(config), "# BEGIN NODEWALL SSH POLICY") ||
+		strings.Contains(string(config), passwordBegin) ||
+		strings.Contains(string(config), a.WrapperPath) || strings.Contains(string(config), a.SFTPPath)
+	for _, path := range []string{a.DropInPath, a.WrapperPath, a.SFTPPath, a.StatePath} {
+		_, present, readErr := readOptional(path)
+		if readErr != nil {
+			return fmt.Errorf("inspect SSH recovery file %s: %w", path, readErr)
+		}
+		managed = managed || present
+	}
+	if !managed {
+		return nil
+	}
+	if !exists {
+		return fmt.Errorf("sshd config %s is missing; preserve NodeWall SSH helpers and restore the configuration first", a.ConfigPath)
+	}
+	if err := a.Apply(ctx, models.SSHTransferPolicy{}); err != nil {
+		return err
+	}
+	return a.ClearPasswordAuthentication(ctx)
 }
 
 // Applier owns the files and commands used to apply a transfer policy.
@@ -137,6 +171,20 @@ func (a *Applier) Apply(ctx context.Context, policy models.SSHTransferPolicy) (r
 	stateBefore, stateExists, err := readOptional(a.StatePath)
 	if err != nil {
 		return fmt.Errorf("read SSH transfer state: %w", err)
+	}
+	// Do not overwrite or delete a file merely because it has a reserved name.
+	for _, file := range []struct {
+		path, marker string
+		data         []byte
+		exists       bool
+	}{
+		{a.DropInPath, "# Managed by NodeWall.", dropBefore, dropExists},
+		{a.WrapperPath, "NODEWALL_SSH_SESSION_ID=", wrapperBefore, wrapperExists},
+		{a.SFTPPath, "SFTP transfer is blocked by NodeWall", sftpBefore, sftpExists},
+	} {
+		if file.exists && !strings.Contains(string(file.data), file.marker) {
+			return fmt.Errorf("refusing to modify %s: it is not a recognized NodeWall SSH file", file.path)
+		}
 	}
 
 	var rollbackErr error
@@ -238,7 +286,7 @@ func (a *Applier) Apply(ctx context.Context, policy models.SSHTransferPolicy) (r
 				rollback()
 				return errors.New("original SFTP subsystem state is missing; restore its configuration before updating SSH controls")
 			}
-			data, _ = json.Marshal(state{OriginalSubsystem: original})
+			data, _ = json.Marshal(state{OriginalSubsystem: original, AddedSeparator: original == "" && len(configBefore) > 0 && !strings.HasSuffix(string(configBefore), "\n")})
 		}
 		if err := writeAtomic(a.StatePath, data, 0o600); err != nil {
 			rollback()
@@ -267,6 +315,11 @@ func (a *Applier) Apply(ctx context.Context, policy models.SSHTransferPolicy) (r
 		if !policy.BlockSFTP && (policy.ScanUploads || policy.AuditTransfers) && !supportedSFTPSubsystem(output) {
 			rollback()
 			return errors.New("SFTP subsystem has custom arguments or is missing; NodeWall refuses to weaken existing restrictions")
+		}
+	} else {
+		if err := verifyNoManagedReferences(a.ConfigPath, configAfter, a.WrapperPath, a.SFTPPath); err != nil {
+			rollback()
+			return err
 		}
 	}
 	reloadAttempted = true
@@ -297,6 +350,146 @@ func reloadSSHD(ctx context.Context, run CommandRunner) error {
 	}
 }
 
+const (
+	passwordBegin = "# BEGIN NODEWALL SSH AUTH POLICY\n"
+	passwordEnd   = "# END NODEWALL SSH AUTH POLICY\n"
+)
+
+// ApplyPasswordAuthentication manages only PasswordAuthentication. It keeps
+// the transfer wrapper untouched so the two SSH controls can be changed
+// independently from the UI.
+func (a *Applier) ApplyPasswordAuthentication(ctx context.Context, allow bool) error {
+	value := allow
+	return a.updatePasswordAuthentication(ctx, &value)
+}
+
+// ClearPasswordAuthentication removes NodeWall's authentication block and
+// leaves the host's original sshd configuration in control.
+func (a *Applier) ClearPasswordAuthentication(ctx context.Context) error {
+	return a.updatePasswordAuthentication(ctx, nil)
+}
+
+func (a *Applier) updatePasswordAuthentication(ctx context.Context, allow *bool) (resultErr error) {
+	if a == nil || a.Run == nil {
+		return errors.New("SSH authentication policy command runner is not configured")
+	}
+	if strings.TrimSpace(a.ConfigPath) == "" {
+		return errors.New("SSH authentication policy config path is empty")
+	}
+	before, err := os.ReadFile(a.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read sshd config: %w", err)
+	}
+	info, err := os.Stat(a.ConfigPath)
+	if err != nil {
+		return err
+	}
+	after, err := managedPasswordAuthentication(before, allow)
+	if err != nil {
+		return err
+	}
+	if bytesEqual(before, after) {
+		return nil
+	}
+
+	rollback := func() error {
+		return restoreFile(a.ConfigPath, before, true, info.Mode().Perm())
+	}
+	if err := writeAtomic(a.ConfigPath, after, info.Mode().Perm()); err != nil {
+		return fmt.Errorf("write sshd config: %w", err)
+	}
+	defer func() {
+		if resultErr != nil {
+			resultErr = errors.Join(resultErr, rollback())
+		}
+	}()
+	if _, err := a.Run(ctx, "sshd", "-t", "-f", a.ConfigPath); err != nil {
+		return fmt.Errorf("sshd configuration check failed: %w", err)
+	}
+	output, err := a.Run(ctx, "sshd", "-T", "-f", a.ConfigPath)
+	if err != nil || !effectivePasswordAuthentication(output, allow) {
+		return fmt.Errorf("PasswordAuthentication is not effective: %w", errors.Join(err, errors.New("effective sshd configuration mismatch")))
+	}
+	if err := reloadSSHD(ctx, a.Run); err != nil {
+		// Restore the previous file and positively reload it before returning so
+		// a failed change cannot leave sshd using a half-applied policy.
+		restoreErr := rollback()
+		if restoreErr == nil {
+			restoreErr = reloadSSHD(context.WithoutCancel(ctx), a.Run)
+		}
+		return errors.Join(fmt.Errorf("reload sshd failed: %w", err), restoreErr)
+	}
+	return nil
+}
+
+func managedPasswordAuthentication(data []byte, allow *bool) ([]byte, error) {
+	content := string(data)
+	if strings.Count(content, passwordBegin) != strings.Count(content, passwordEnd) || strings.Count(content, passwordBegin) > 1 {
+		return nil, errors.New("NodeWall SSH authentication markers are incomplete or duplicated; inspect the config before applying")
+	}
+	if begin := strings.Index(content, passwordBegin); begin >= 0 {
+		end := strings.Index(content[begin:], passwordEnd)
+		if end < 0 {
+			return nil, errors.New("NodeWall SSH authentication block is incomplete; restore the config before applying")
+		}
+		content = content[:begin] + content[begin+end+len(passwordEnd):]
+	}
+	if allow == nil {
+		return []byte(content), nil
+	}
+	value := "no"
+	if *allow {
+		value = "yes"
+	}
+	block := passwordBegin + "# Managed by NodeWall. Do not edit.\nPasswordAuthentication " + value + "\n" + passwordEnd
+	if !*allow {
+		// PAM-backed keyboard-interactive authentication can still accept a
+		// password even when PasswordAuthentication is disabled. Close both
+		// spellings used by supported OpenSSH releases for a true key-only mode.
+		block = passwordBegin + "# Managed by NodeWall. Do not edit.\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nChallengeResponseAuthentication no\n" + passwordEnd
+	}
+	// OpenSSH keeps the first global value for a keyword. Place the managed
+	// block before the existing config so a later legacy directive cannot
+	// silently override the operator's explicit choice.
+	return []byte(block + content), nil
+}
+
+func effectivePasswordAuthentication(output []byte, allow *bool) bool {
+	if allow == nil {
+		return true
+	}
+	want := "no"
+	if *allow {
+		want = "yes"
+	}
+	values := make(map[string]string)
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && strings.EqualFold(fields[0], "passwordauthentication") {
+			values["passwordauthentication"] = strings.ToLower(fields[1])
+		}
+		if len(fields) >= 2 && (strings.EqualFold(fields[0], "kbdinteractiveauthentication") || strings.EqualFold(fields[0], "challengeresponseauthentication")) {
+			values[strings.ToLower(fields[0])] = strings.ToLower(fields[1])
+		}
+	}
+	if values["passwordauthentication"] != want {
+		return false
+	}
+	if *allow {
+		return true
+	}
+	if values["kbdinteractiveauthentication"] != "no" {
+		return false
+	}
+	// OpenSSH 9.x omits the deprecated ChallengeResponseAuthentication alias
+	// from `sshd -T`; when it is reported by an older release, it must also be
+	// disabled.
+	if value, present := values["challengeresponseauthentication"]; present && value != "no" {
+		return false
+	}
+	return true
+}
+
 func enableSFTPBlock(data []byte, helperPath string) ([]byte, error) {
 	lines := strings.SplitAfter(string(data), "\n")
 	for i, line := range lines {
@@ -312,7 +505,11 @@ func enableSFTPBlock(data []byte, helperPath string) ([]byte, error) {
 			return []byte(strings.Join(lines, "")), nil
 		}
 	}
-	return []byte(strings.TrimRight(string(data), "\n") + "\nSubsystem sftp " + helperPath + "\n"), nil
+	separator := ""
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		separator = "\n"
+	}
+	return []byte(string(data) + separator + "Subsystem sftp " + helperPath + "\n"), nil
 }
 
 func restoreSFTPBlock(data []byte, helperPath, statePath string) ([]byte, error) {
@@ -338,12 +535,17 @@ func restoreSFTPBlock(data []byte, helperPath, statePath string) ([]byte, error)
 		fields := activeFields(line)
 		if len(fields) >= 3 && strings.EqualFold(fields[0], "subsystem") && strings.EqualFold(fields[1], "sftp") && fields[2] == helperPath {
 			if saved.OriginalSubsystem == "" {
+				if saved.AddedSeparator && i > 0 && strings.TrimSpace(strings.Join(lines[i+1:], "")) == "" {
+					lines[i-1] = strings.TrimSuffix(lines[i-1], "\n")
+				}
 				lines = append(lines[:i], lines[i+1:]...)
 				return []byte(strings.Join(lines, "")), nil
 			}
-			newline := "\n"
+			newline := ""
 			if strings.HasSuffix(line, "\r\n") {
 				newline = "\r\n"
+			} else if strings.HasSuffix(line, "\n") {
+				newline = "\n"
 			}
 			lines[i] = saved.OriginalSubsystem + newline
 			return []byte(strings.Join(lines, "")), nil
@@ -379,6 +581,9 @@ const forceEnd = "# END NODEWALL SSH POLICY\n"
 
 func managedForceCommand(data []byte, wrapper string, enabled bool) ([]byte, error) {
 	content := string(data)
+	if strings.Count(content, forceBegin) != strings.Count(content, forceEnd) || strings.Count(content, forceBegin) > 1 {
+		return nil, errors.New("NodeWall sshd policy markers are incomplete or duplicated; inspect the config before applying")
+	}
 	if begin := strings.Index(content, forceBegin); begin >= 0 {
 		end := strings.Index(content[begin:], forceEnd)
 		if end < 0 {
@@ -484,9 +689,22 @@ scanner_path=%s
 blocked_sftp_helper=%s
 allowed_sftp_command=%s
 original=${SSH_ORIGINAL_COMMAND:-}
+# A removed or interrupted install must never make SSH unusable. The wrapper
+# fails open until cleanup can remove the ForceCommand and restore sshd.
+if [ ! -x "$scanner_path" ]; then
+  if [ -n "$original" ]; then
+    /bin/sh -c "$original"
+  elif [ -n "${SSH_TTY:-}" ]; then
+    "${SHELL:-/bin/sh}" -l
+  else
+    "${SHELL:-/bin/sh}" -s
+  fi
+  exit $?
+fi
 NODEWALL_SSH_SESSION_ID="nw-$$-$(date +%%s)"
 export NODEWALL_SSH_SESSION_ID
 record() {
+	[ -x "$scanner_path" ] || return 0
   event_name=$1
   action_name=${2:-}
   transfer_name=${3:-}
@@ -560,18 +778,18 @@ elif [ "$kind" = "scp" ]; then
 elif [ -n "$original" ]; then
   /bin/sh -c "$original"
   exit_code=$?
-  if [ "$audit_commands" = "1" ]; then
+	  if [ "$audit_commands" = "1" ] && [ -x "$scanner_path" ]; then
     record command executed none none 0 0 "" "$original"
   fi
 elif [ -n "${SSH_TTY:-}" ]; then
-  if [ "$audit_commands" = "1" ]; then
+	  if [ "$audit_commands" = "1" ] && [ -x "$scanner_path" ]; then
     "$scanner_path" ssh-shell --interactive=true --activity-log="$activity_log"
   else
     "${SHELL:-/bin/sh}" -l
   fi
   exit_code=$?
 else
-  if [ "$audit_commands" = "1" ]; then
+	if [ "$audit_commands" = "1" ] && [ -x "$scanner_path" ]; then
     "$scanner_path" ssh-shell --interactive=false --activity-log="$activity_log"
   else
     "${SHELL:-/bin/sh}" -s

@@ -514,6 +514,9 @@ func (a *authManager) authorize(role string, r *http.Request) bool {
 	if path == "/settings/passkey" {
 		return role == security.RoleAdmin
 	}
+	if path == "/nodes/enrollment" {
+		return role == security.RoleAdmin
+	}
 	if path == "/auth/users" || strings.HasPrefix(path, "/auth/users/") {
 		return role == security.RoleAdmin
 	}

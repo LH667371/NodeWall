@@ -12,6 +12,7 @@ WorkingDirectory=/opt/nodewall
 EnvironmentFile=-/etc/nodewall/nodewall.env
 ExecStart=/opt/nodewall/bin/nodewall agent
 Restart=on-failure
+RestartSec=3s
 LimitMEMLOCK=infinity
 Environment=NODEWALL_BPF_OBJECT=/opt/nodewall/bpf/gen/xdpacl_bpfel.o
 

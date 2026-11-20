@@ -2,9 +2,21 @@ import { computed, reactive, ref } from "vue";
 import { downloadFile, request, withDirection } from "@/lib/api";
 import { eventDispositionKey } from "@/lib/eventIds";
 import { buildEventRecords } from "@/lib/eventRecords";
-import { canActOnFirewallSource } from "@/lib/firewallLogs";
+import { canActOnFirewallSource, firewallLogKey } from "@/lib/firewallLogs";
 
 const LEGACY_EVENT_STATUS_KEY = "nodewall-event-status";
+const CIDR_RULES = {
+  allowlist: { path: "allowlist", field: "rules" },
+  bypass: { path: "bypass", field: "bypass_cidrs" },
+  blocked: { path: "block", field: "blocked_cidrs" },
+  icmpAllow: { path: "icmp-allowlist", field: "icmp_allow_cidrs" },
+  icmpBlocked: { path: "icmp-blocklist", field: "icmp_blocked_cidrs" },
+};
+const PORT_RULES = {
+  public: { path: "public-ports", field: "public_port_rules", legacy: "public_ports" },
+  denied: { path: "denied-ports", field: "denied_port_rules", legacy: "denied_ports" },
+  allowed: { path: "ports", field: "allowed_port_rules", legacy: "allowed_ports" },
+};
 
 function loadLegacyEventStatuses() {
   try {
@@ -39,6 +51,25 @@ function normalizePortRules(value, rulesKey, portsKey) {
   if (Array.isArray(value?.[rulesKey]) && value[rulesKey].length) return value[rulesKey];
   const ports = Array.isArray(value?.[portsKey]) ? value[portsKey] : [];
   return ports.flatMap((port) => [{ protocol: "tcp", port }, { protocol: "udp", port }]);
+}
+
+function comparePolicyTimestamps(left, right) {
+  const milliseconds = Date.parse(left) - Date.parse(right);
+  if (!Number.isFinite(milliseconds) || left === right) return 0;
+  if (milliseconds) return milliseconds;
+  // Go's policy version includes nanoseconds, which Date.parse discards.
+  const subMillisecond = (timestamp) => Number((timestamp.match(/\.(\d+)/)?.[1] || "").padEnd(9, "0").slice(3, 9));
+  return subMillisecond(left) - subMillisecond(right);
+}
+
+function isPolicySnapshot(value) {
+  return Boolean(value?.ingress || value?.egress || value?.mode || Array.isArray(value?.rules));
+}
+
+function nodeProtectionReachable(status) {
+  if (typeof status?.reachable === "boolean") return status.reachable;
+  if (status?.connection_status) return status.connection_status === "reachable";
+  return Boolean(status) && status.protection_status !== "unavailable";
 }
 
 function cloneArray(value) {
@@ -88,10 +119,6 @@ function collapsePortRuleDraft(rules) {
 
 function uniqStrings(items = []) {
   return Array.from(new Set((items || []).map((item) => String(item || "").trim()).filter(Boolean)));
-}
-
-function logKey(item) {
-  return [item.interface || "-", item.direction || "ingress", item.source_ip || item.source_cidr || "-", item.port || 0, item.timestamp || "-"].join("|");
 }
 
 function riskFromInsights(insights, stats) {
@@ -161,6 +188,7 @@ export function useNodewallConsole(i18n) {
   let securityScanRevision = 0;
   let clusterEventStreamKey = "";
   let refreshCurrentToken = 0;
+  let interfacePolicyRevision = null;
   let eventsRefreshInFlight = null;
   let eventsDataGeneration = 0;
   let overviewDataGeneration = 0;
@@ -536,6 +564,7 @@ export function useNodewallConsole(i18n) {
     // last frame in the shared store lets the page render immediately after a
     // route switch without starting a second polling loop.
     monitoringHistory: null,
+    monitoringArchiveNodes: [],
     monitoringHistoryError: "",
     monitoringStreamQuery: { scope: "cluster", node: "", range: 900, from: "", to: "" },
     overviewProtectionStatus: "",
@@ -1410,6 +1439,7 @@ export function useNodewallConsole(i18n) {
     if (disposed) return;
     stopClusterEventStream();
     state.consoleRevision = 0;
+    interfacePolicyRevision = null;
     if (typeof window === "undefined" || typeof window.EventSource === "undefined") return;
     // The first SSE frame contains the server's recent event history. Treat it
     // as the baseline so a page refresh does not replay every old operation as
@@ -1491,7 +1521,7 @@ export function useNodewallConsole(i18n) {
         if (!payload || typeof payload !== "object" || state.section !== "cluster") return;
         state.nodeProtection = payload;
         for (const [id, item] of Object.entries(payload)) {
-          state.nodeReachability[id] = item?.reachable !== false && item?.protection_status !== "unavailable";
+          state.nodeReachability[id] = nodeProtectionReachable(item);
         }
       } catch (_) {
         // Keep the last complete cluster protection snapshot on malformed data.
@@ -1611,7 +1641,7 @@ export function useNodewallConsole(i18n) {
         if (payload.node_protection && typeof payload.node_protection === "object") {
           state.nodeProtection = payload.node_protection;
           for (const [id, item] of Object.entries(payload.node_protection)) {
-            state.nodeReachability[id] = item?.reachable !== false && item?.protection_status !== "unavailable";
+            state.nodeReachability[id] = nodeProtectionReachable(item);
           }
         }
       } catch (_) {
@@ -1795,6 +1825,7 @@ export function useNodewallConsole(i18n) {
     if (!Array.isArray(payload.points) || !Array.isArray(payload.nodes)) return false;
     monitoringDataGeneration++;
     state.monitoringHistory = payload;
+    if (Array.isArray(payload.archive_nodes)) state.monitoringArchiveNodes = payload.archive_nodes;
     state.monitoringHistoryError = "";
     return true;
   }
@@ -1857,10 +1888,7 @@ export function useNodewallConsole(i18n) {
         .then((result) => {
           const current = state.nodes.find((node) => node.id === id);
           if (!current) return;
-          const reachable = result?.connection_status
-            ? result.connection_status === "reachable"
-            : result?.protection_status !== "unavailable";
-          state.nodeReachability[id] = reachable;
+          state.nodeReachability[id] = nodeProtectionReachable(result);
           state.nodeProtection[id] = result;
         })
         .catch((error) => {
@@ -2838,7 +2866,7 @@ export function useNodewallConsole(i18n) {
     if (scope === "policy") {
       // Keep policy interactions snappy: only refresh the currently focused
       // interface summary instead of reloading nodes/inventory each click.
-      await queueRefreshCurrentLight();
+      await queueRefreshCurrentLight(false);
       return;
     }
     if (scope === "logs") {
@@ -2925,15 +2953,17 @@ export function useNodewallConsole(i18n) {
   }
 
   function applyInterfaceSummary(summary, autoSwitchDirection = true) {
-    // A summary collected before a write can finish after its response. Keep
-    // the newer confirmed policy while still accepting fresh health/counters.
-    const incoming = summary?.policy || {};
-    if ((incoming.node_id && incoming.node_id !== state.nodeId)
-      || (incoming.interface && incoming.interface !== currentInterface.value)) return false;
-    const currentTime = Date.parse(state.policy?.updated_at || "") || 0;
-    const nextTime = Date.parse(incoming.updated_at || "") || 0;
-    const nextPolicy = currentTime > nextTime && state.policy?.node_id === incoming.node_id
-      && state.policy?.interface === incoming.interface ? state.policy : incoming;
+    const incoming = summary?.policy;
+    if (incoming && (incoming.node_id !== state.nodeId || incoming.interface !== currentInterface.value)) return false;
+    if (!isPolicySnapshot(incoming)) {
+      if (!summary?.health) return false;
+      state.health = summary.health;
+      state.interfaceDataStatus = "ready";
+      return true;
+    }
+    // The interface snapshot can be older than its enclosing page frame.
+    const stalePolicy = isOlderInterfacePolicy(incoming, summary.revision);
+    const nextPolicy = stalePolicy ? currentPolicy.value : incoming;
     const selectedDirectionPolicy = nextPolicy?.[state.direction] || {};
     const policyAllowlist = Array.isArray(selectedDirectionPolicy?.rules)
       ? selectedDirectionPolicy.rules.map((item) => item?.cidr).filter(Boolean)
@@ -2964,12 +2994,12 @@ export function useNodewallConsole(i18n) {
       return false;
     }
 
-    applyPolicyRules(nextPolicy);
-    const summaryTrial = summary?.protection_trial;
-    state.protectionTrial = summaryTrial &&
-      (!summaryTrial.direction || summaryTrial.direction === state.direction)
-      ? summaryTrial
-      : null;
+    if (!stalePolicy) {
+      applyPolicyRules(incoming, summary.revision);
+      const summaryTrial = summary.protection_trial;
+      state.protectionTrial = summaryTrial &&
+        (!summaryTrial.direction || summaryTrial.direction === state.direction) ? summaryTrial : null;
+    }
     state.health = summary?.health || { interfaces: [] };
     state.stats = summary?.stats || { passed: 0, dropped: 0 };
     state.recentStats = summary?.recent_stats || {
@@ -2989,7 +3019,15 @@ export function useNodewallConsole(i18n) {
     return true;
   }
 
-  function applyPolicyRules(policy) {
+  function isOlderInterfacePolicy(incoming, revision) {
+    if (!currentPolicy.value) return false;
+    const order = comparePolicyTimestamps(incoming.updated_at, currentPolicy.value.updated_at);
+    if (order) return order < 0;
+    return Number.isFinite(revision) && Number.isFinite(interfacePolicyRevision) && revision < interfacePolicyRevision;
+  }
+
+  function applyPolicyRules(policy, revision = null) {
+    interfacePolicyRevision = revision;
     state.policy = policy;
     const selected = policy?.[state.direction] || policy || {};
     state.allowlist = (selected.rules || []).map((item) => item?.cidr).filter(Boolean);
@@ -3021,30 +3059,43 @@ export function useNodewallConsole(i18n) {
       && target.direction === state.direction && target.section === state.section && target.feature === state.securityFeature;
   }
 
+  function policyEndpoint(target, path) {
+    return `/nodes/${encodeURIComponent(target.nodeID)}/interfaces/${encodeURIComponent(target.interface)}/${path}`;
+  }
+
   async function writePolicy(path, method, body, target = policyTarget()) {
-    let revision = 0;
+    let revision = null;
     const updated = await requestWithSSHConfirmation(path, {
       method,
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      onResponse: (response) => { revision = Number(response?.headers?.get("X-NodeWall-Revision") || 0); },
+      onResponse: (response) => {
+        const header = response.headers.get("X-NodeWall-Revision");
+        if (header) revision = Number(header);
+      },
+    }).catch((error) => {
+      if (error?.code === "CONFIG_CHANGED" && isCurrentPolicyTarget(target)) queueRefreshCurrentLight(false).catch(() => {});
+      throw error;
     });
-    if (!isCurrentPolicyTarget(target)) return updated;
-    // Use the server's confirmed result immediately, then let SSE maintain it.
-    // Raising the revision floor prevents an older in-flight frame undoing it.
-    if (revision && revision < state.consoleRevision) return updated;
-    state.consoleRevision = Math.max(state.consoleRevision, revision);
-    if (updated?.ingress || updated?.egress) {
-      if (updated.node_id && updated.node_id !== target.nodeID) return updated;
-      if (updated.interface && updated.interface !== target.interface) return updated;
-      refreshCurrentToken++;
-      const currentTime = Date.parse(state.policy?.updated_at || "") || 0;
-      const nextTime = Date.parse(updated.updated_at || "") || 0;
-      if (!currentTime || !nextTime || nextTime >= currentTime) applyPolicyRules(updated);
-      state.interfaceDataStatus = "ready";
-    } else {
-      await refreshAfterWrite("policy");
+    let policy = updated?.policy || updated;
+    if (!isPolicySnapshot(policy)) {
+      // Some older Webs only acknowledge the write. Read the saved policy
+      // directly, without waiting for Agent telemetry to fill a page snapshot.
+      policy = await request(policyEndpoint(target, "policy"), { cache: "no-store" }).catch(() => null);
     }
-    return updated;
+    if (!isPolicySnapshot(policy) || policy.node_id !== target.nodeID || policy.interface !== target.interface) {
+      throw new Error(t("policyWriteUnverified"));
+    }
+    // A newer page revision may carry health or another node's save only.
+    // Compare this result with the policy already rendered for this interface.
+    if (isCurrentPolicyTarget(target)) {
+      if (Number.isFinite(revision)) state.consoleRevision = Math.max(state.consoleRevision, revision);
+      if (!isOlderInterfacePolicy(policy, revision)) {
+        refreshCurrentToken++;
+        applyPolicyRules(policy, revision);
+        state.interfaceDataStatus = "ready";
+      }
+    }
+    return policy;
   }
 
   async function refreshCurrent(autoSwitchDirection = true) {
@@ -3053,23 +3104,20 @@ export function useNodewallConsole(i18n) {
       return;
     }
     const token = ++refreshCurrentToken;
-    state.interfaceDataStatus = "loading";
+    if (!currentPolicy.value) state.interfaceDataStatus = "loading";
     const interfaceName = currentInterface.value;
     const iface = requireInterfaceEncoded();
     const currentNodeId = state.nodeId;
     const currentDirection = state.direction;
     const summary = await request(withDirection(`/nodes/${state.nodeId}/interfaces/${iface}/summary`, currentDirection), {
+      cache: "no-store",
       key: `summary:${currentNodeId}|iface:${iface}|dir:${currentDirection}`,
     }).catch(() => null);
     if (token !== refreshCurrentToken || currentNodeId !== state.nodeId || interfaceName !== currentInterface.value || currentDirection !== state.direction) return;
-    if (!summary) {
-      state.interfaceDataStatus = "unavailable";
-      return;
-    }
-    if (applyInterfaceSummary(summary, autoSwitchDirection && !state.selectedInterface)) return;
+    if (applyInterfaceSummary(summary, autoSwitchDirection && !state.selectedInterface && !currentPolicy.value)) return;
     if (currentDirection !== state.direction) {
       await refreshCurrent(false);
-    } else {
+    } else if (!currentPolicy.value) {
       state.interfaceDataStatus = "unavailable";
     }
   }
@@ -3128,44 +3176,30 @@ export function useNodewallConsole(i18n) {
     const trimmed = String(value || "").trim();
     if (!trimmed) throw new Error(t("policyRuleSourceRequired"));
     const target = policyTarget(options);
-    const iface = encodeURIComponent(target.interface);
-    const node = encodeURIComponent(target.nodeID);
-    const pathMap = {
-      allowlist: `/nodes/${node}/interfaces/${iface}/allowlist`,
-      bypass: `/nodes/${node}/interfaces/${iface}/bypass`,
-      blocked: `/nodes/${node}/interfaces/${iface}/block`,
-      icmpAllow: `/nodes/${node}/interfaces/${iface}/icmp-allowlist`,
-      icmpBlocked: `/nodes/${node}/interfaces/${iface}/icmp-blocklist`,
-    };
+    const rule = CIDR_RULES[kind];
+    if (!target.nodeID || !target.interface || !rule) throw new Error(t("settingsTargetChanged"));
     const body = { cidr: trimmed };
     if (kind === "allowlist") {
       const comment = String(options?.comment || "").trim();
       if (comment) body.comment = comment;
     }
-    if (!target.nodeID || !target.interface || !pathMap[kind]) throw new Error(t("settingsTargetChanged"));
-    return writePolicy(withDirection(pathMap[kind], target.direction), "POST", body, target);
+    return writePolicy(withDirection(policyEndpoint(target, rule.path), target.direction), "POST", body, target);
   }
 
   async function addPort(kind, value, protocol = "", options = {}) {
     const port = Number(value || 0);
     if (String(protocol || "").toLowerCase() !== "icmp" && (!Number.isInteger(port) || port < 1 || port > 65535)) throw new Error(t("policyRulePortInvalid"));
     const target = policyTarget(options);
-    const iface = encodeURIComponent(target.interface);
-    const node = encodeURIComponent(target.nodeID);
-    const pathMap = {
-      public: `/nodes/${node}/interfaces/${iface}/public-ports`,
-      denied: `/nodes/${node}/interfaces/${iface}/denied-ports`,
-      allowed: `/nodes/${node}/interfaces/${iface}/ports`,
-    };
+    const rule = PORT_RULES[kind];
+    if (!target.nodeID || !target.interface || !rule) throw new Error(t("settingsTargetChanged"));
     const normalizedProtocol = protocol === "both" ? "" : protocol;
     const payload = {
       port: String(protocol || "").toLowerCase() === "icmp" ? 0 : port,
       protocol: normalizedProtocol || undefined,
     };
-    if (!target.nodeID || !target.interface || !pathMap[kind]) throw new Error(t("settingsTargetChanged"));
     // Do not auto-create opposite-direction policy entries in UI flow.
     // Reply allowance should be handled by dataplane/runtime logic.
-    return writePolicy(withDirection(pathMap[kind], target.direction), "POST", payload, target);
+    return writePolicy(withDirection(policyEndpoint(target, rule.path), target.direction), "POST", payload, target);
   }
 
   async function saveRuleDescription({ kind, value, protocol = "", description = "" } = {}, options = {}) {
@@ -3204,31 +3238,29 @@ export function useNodewallConsole(i18n) {
 
   async function removeCIDR(kind, value) {
     const target = policyTarget();
-    const iface = requireInterfaceEncoded();
-    const pathMap = {
-      allowlist: `/nodes/${state.nodeId}/interfaces/${iface}/allowlist`,
-      bypass: `/nodes/${state.nodeId}/interfaces/${iface}/bypass`,
-      blocked: `/nodes/${state.nodeId}/interfaces/${iface}/block`,
-      icmpAllow: `/nodes/${state.nodeId}/interfaces/${iface}/icmp-allowlist`,
-      icmpBlocked: `/nodes/${state.nodeId}/interfaces/${iface}/icmp-blocklist`,
-    };
-    const separator = pathMap[kind].includes("?") ? "&" : "?";
-    const path = `${pathMap[kind]}${separator}cidr=${encodeURIComponent(value || "")}`;
-    await writePolicy(withDirection(path, target.direction), "DELETE", undefined, target);
-    setNotice(t("noticeRefreshDone"), "success");
+    const rule = CIDR_RULES[kind];
+    if (!target.nodeID || !target.interface || !rule) throw new Error(t("settingsTargetChanged"));
+    const cidr = String(value || "").trim();
+    const path = `${policyEndpoint(target, rule.path)}?cidr=${encodeURIComponent(cidr)}`;
+    const policy = await writePolicy(withDirection(path, target.direction), "DELETE", undefined, target);
+    const selected = policy[target.direction] || policy;
+    if ((selected[rule.field] || []).some((item) => (kind === "allowlist" ? item.cidr : item) === cidr)) {
+      throw new Error(t("policyRuleRetained"));
+    }
   }
 
   async function removePort(kind, value, protocol = "") {
     const target = policyTarget();
-    const iface = requireInterfaceEncoded();
-    const pathMap = {
-      public: `/nodes/${state.nodeId}/interfaces/${iface}/public-ports/${value}`,
-      denied: `/nodes/${state.nodeId}/interfaces/${iface}/denied-ports/${value}`,
-      allowed: `/nodes/${state.nodeId}/interfaces/${iface}/ports/${value}`,
-    };
-    const path = protocol ? `${pathMap[kind]}?protocol=${encodeURIComponent(protocol)}` : pathMap[kind];
-    await writePolicy(withDirection(path, target.direction), "DELETE", undefined, target);
-    setNotice(t("noticeRefreshDone"), "success");
+    const rule = PORT_RULES[kind];
+    if (!target.nodeID || !target.interface || !rule) throw new Error(t("settingsTargetChanged"));
+    const endpoint = policyEndpoint(target, `${rule.path}/${encodeURIComponent(value)}`);
+    const path = protocol ? `${endpoint}?protocol=${encodeURIComponent(protocol)}` : endpoint;
+    const policy = await writePolicy(withDirection(path, target.direction), "DELETE", undefined, target);
+    const selected = policy[target.direction] || policy;
+    if (normalizePortRules(selected, rule.field, rule.legacy).some((item) =>
+      Number(item.port) === Number(value) && (!protocol || protocol === "both" || item.protocol === protocol))) {
+      throw new Error(t("policyRuleRetained"));
+    }
   }
 
   async function changeRuleStrategy(row, nextStrategy) {
@@ -3289,7 +3321,7 @@ export function useNodewallConsole(i18n) {
     }
 
     await writePolicy(`/nodes/${encodeURIComponent(scope.nodeID)}/interfaces/${iface}/policy`, "PUT", { policy: draft }, scope);
-    setNotice(t("noticeRefreshDone"), "success");
+    if (isCurrentPolicyTarget(scope)) setNotice(t("policyRuleSaved"), "success");
   }
 
   // Edit a rule through one complete policy update. Keeping the replacement
@@ -3310,26 +3342,21 @@ export function useNodewallConsole(i18n) {
       egress: normalizeDirectionPolicyDraft(current.egress, current.non_ipv4_action),
     };
     const selected = draft[state.direction] || draft.ingress;
-    const oldValue = String(row?.value || "");
-
-    if (["allowlist", "blocked", "icmpAllow", "icmpBlocked"].includes(currentKind)) {
-      selected.rules = (selected.rules || []).filter((item) => String(item?.cidr || "") !== oldValue);
-      selected.blocked_cidrs = (selected.blocked_cidrs || []).filter((item) => String(item) !== oldValue);
-      selected.icmp_allow_cidrs = (selected.icmp_allow_cidrs || []).filter((item) => String(item) !== oldValue);
-      selected.icmp_blocked_cidrs = (selected.icmp_blocked_cidrs || []).filter((item) => String(item) !== oldValue);
-    } else if (["public", "allowed", "denied"].includes(currentKind)) {
+    const cidrRule = CIDR_RULES[currentKind];
+    const portRule = PORT_RULES[currentKind];
+    // An allow and a deny can coexist on the same CIDR or port. Editing
+    // one row only replaces that row, including its original protocol.
+    if (cidrRule) {
+      const oldValue = String(row?.value || "");
+      selected[cidrRule.field] = selected[cidrRule.field].filter((item) =>
+        (currentKind === "allowlist" ? item?.cidr : item) !== oldValue);
+    } else if (portRule) {
       const oldPort = Number(row?.value || 0);
       const oldProtocol = String(row?.portProtocol || "tcp").toLowerCase();
-      const ruleSets = [
-        ["public_port_rules", "public_ports"],
-        ["allowed_port_rules", "allowed_ports"],
-        ["denied_port_rules", "denied_ports"],
-      ];
-      for (const [rulesKey, portsKey] of ruleSets) {
-        const rules = normalizedPortRuleDraft(selected[rulesKey], selected[portsKey]);
-        selected[rulesKey] = rules.filter((item) => item.port !== oldPort || item.protocol !== oldProtocol);
-        selected[portsKey] = collapsePortRuleDraft(selected[rulesKey]);
-      }
+      const { field, legacy } = portRule;
+      const rules = normalizedPortRuleDraft(selected[field], selected[legacy]);
+      selected[field] = rules.filter((item) => item.port !== oldPort || item.protocol !== oldProtocol);
+      selected[legacy] = collapsePortRuleDraft(selected[field]);
     }
 
     const nextKind = String(next.kind || "");
@@ -3345,26 +3372,16 @@ export function useNodewallConsole(i18n) {
       const nextPort = nextProtocol === "icmp" ? 0 : Number(next.targetValue || 0);
       if (!nextPort && nextProtocol !== "icmp") return;
       const protocols = nextProtocol === "both" ? ["tcp", "udp"] : [nextProtocol];
-      const targetRulesKey = nextKind === "denied"
-        ? "denied_port_rules"
-        : (state.direction === "egress" ? "allowed_port_rules" : "public_port_rules");
-      for (const protocol of protocols) selected[targetRulesKey].push({ protocol, port: nextPort });
-      const ruleSets = [
-        ["public_port_rules", "public_ports"],
-        ["allowed_port_rules", "allowed_ports"],
-        ["denied_port_rules", "denied_ports"],
-      ];
-      for (const [rulesKey, portsKey] of ruleSets) {
-        selected[rulesKey] = normalizedPortRuleDraft(selected[rulesKey], selected[portsKey]);
-        selected[portsKey] = collapsePortRuleDraft(selected[rulesKey]);
-      }
+      const { field, legacy } = PORT_RULES[nextKind];
+      const rules = normalizedPortRuleDraft(selected[field], selected[legacy]);
+      for (const protocol of protocols) rules.push({ protocol, port: nextPort });
+      selected[field] = rules;
+      selected[legacy] = collapsePortRuleDraft(rules);
     } else {
       return;
     }
 
-    const updated = await writePolicy(`/nodes/${encodeURIComponent(scope.nodeID)}/interfaces/${iface}/policy`, "PUT", { policy: draft }, scope);
-    setNotice(t("noticeRefreshDone"), "success");
-    return updated;
+    return writePolicy(`/nodes/${encodeURIComponent(scope.nodeID)}/interfaces/${iface}/policy`, "PUT", { policy: draft }, scope);
   }
 
   async function addRuleToNodes(rule, targets = [], options = {}) {
@@ -3375,19 +3392,21 @@ export function useNodewallConsole(i18n) {
     // Sequential writes bound Agent load and keep SSH confirmations usable.
     for (const item of targets) {
       const target = policyTarget(item);
-      let ruleSaved = false;
+      let ruleSaved = item.ruleSaved === true;
       try {
         if (cancelled) throw new Error(t("policyRuleNotSubmitted"));
         if (!item.nodeID || !item.interface) throw new Error(t("settingsTargetChanged"));
-        if (options.editingRow && target.nodeID === options.sourceNodeID) {
-          if (!isCurrentPolicyTarget(target)) throw new Error(t("settingsTargetChanged"));
-          await updateRule(options.editingRow, rule);
-        } else if (["allowlist", "bypass", "blocked", "icmpAllow", "icmpBlocked"].includes(rule.kind)) {
-          await addCIDR(rule.kind, rule.sourceValue, { ...target, comment: rule.description });
-        } else {
-          await addPort(rule.kind, rule.targetValue, rule.protocol, target);
+        if (!ruleSaved) {
+          if (options.editingRow && target.nodeID === options.sourceNodeID) {
+            if (!isCurrentPolicyTarget(target)) throw new Error(t("settingsTargetChanged"));
+            await updateRule(options.editingRow, rule);
+          } else if (CIDR_RULES[rule.kind]) {
+            await addCIDR(rule.kind, rule.sourceValue, { ...target, comment: rule.description });
+          } else {
+            await addPort(rule.kind, rule.targetValue, rule.protocol, target);
+          }
+          ruleSaved = true;
         }
-        ruleSaved = true;
         if (rule.description || options.editingRow) {
           try {
             await saveRuleDescription({
@@ -3580,7 +3599,7 @@ export function useNodewallConsole(i18n) {
     await requestWithSSHConfirmation(`/logs/actions/${type}`, {
       method: "POST",
       body: JSON.stringify({
-        node_id: state.nodeId,
+        node_id: item.node_id || state.nodeId,
         interface: item.interface,
         direction: item.direction || "ingress",
         source_ip: sourceIP,
@@ -3592,7 +3611,7 @@ export function useNodewallConsole(i18n) {
   }
 
   function toggleLogSelection(item) {
-    const key = logKey(item);
+    const key = firewallLogKey(item);
     if (state.selection.has(key)) {
       state.selection.delete(key);
       return;

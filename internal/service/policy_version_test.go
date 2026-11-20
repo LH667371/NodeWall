@@ -34,3 +34,27 @@ func TestConcurrentWebPolicySavesRejectStaleVersion(t *testing.T) {
 		t.Fatalf("concurrent results: %d saves, %d conflicts", successes, conflicts)
 	}
 }
+
+func TestPolicySnapshotsCannotReplaceAConfirmedOrRecoveringPolicy(t *testing.T) {
+	ctx := t.Context()
+	state := store.New()
+	svc := NewPolicyService(state)
+	const node, iface = "node-a", "ens3"
+	before := state.PutPolicy(ctx, models.InterfacePolicy{NodeID: node, Interface: iface})
+	draft := models.NormalizeInterfacePolicy(before)
+	draft.Ingress.BlockedCIDRs = []string{"192.0.2.1/32"}
+	saved, err := svc.UpdatePolicyAndApplyIfCurrent(ctx, draft, before.UpdatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actual, err := svc.SavePolicySnapshotIfCurrent(ctx, before); !errors.Is(err, ErrPolicyChanged) || !actual.UpdatedAt.Equal(saved.UpdatedAt) {
+		t.Fatalf("late snapshot could replace a newer save: %#v %v", actual, err)
+	}
+	if err := state.BeginPolicyUpdate(ctx, node, iface); err != nil {
+		t.Fatal(err)
+	}
+	saved.Ingress.BlockedCIDRs = nil
+	if actual, err := svc.SavePolicySnapshotIfCurrent(ctx, saved); !errors.Is(err, ErrPolicyChanged) || len(actual.Ingress.BlockedCIDRs) != 1 {
+		t.Fatalf("snapshot could overwrite a recovering policy: %#v %v", actual, err)
+	}
+}

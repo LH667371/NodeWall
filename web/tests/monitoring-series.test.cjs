@@ -13,6 +13,25 @@ async function load(file) {
 const metric = load('monitoringSeries.js');
 const time = (seconds) => new Date(1700000000000 + seconds * 1000).toISOString();
 
+test('retired nodes remain in monitoring and replay ends at the last archived sample', async () => {
+  const { monitoringNodeCatalog, lastMonitoringHour } = await metric;
+  const catalog = monitoringNodeCatalog([{ id: 'active', name: 'Current name' }], [
+    { node_id: 'active', name: 'Older name', last_sample_at: time(7150), registered: true },
+    { node_id: 'retired', name: 'Build worker', last_sample_at: time(3000), registered: false },
+  ]);
+  assert.deepEqual(Array.from(catalog, node => [node.node_id, node.name, node.registered]), [
+    ['active', 'Current name', true], ['retired', 'Build worker', false],
+  ]);
+  const now = Date.parse(time(7200));
+  const available = lastMonitoringHour(catalog[1].last_sample_at, 7 * 86400, now);
+  assert.equal(available.from, time(-600));
+  assert.equal(available.to, time(3000));
+  const clipped = lastMonitoringHour(catalog[1].last_sample_at, 6000, now);
+  assert.equal(clipped.from, time(1200));
+  assert.equal(clipped.to, time(3000));
+  assert.equal(lastMonitoringHour(catalog[1].last_sample_at, 3600, now), null);
+});
+
 test('many-core detail is paginated before curves are allocated', async () => {
   const { cpuCoreGroups, buildDeviceChart } = await metric;
   const history = { a: [{ timestamp: time(0), logical_cpus: Array.from({ length: 256 }, (_, index) => ({ name: `cpu${index}`, usage_percent: index / 10 })) }] };

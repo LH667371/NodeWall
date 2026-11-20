@@ -42,7 +42,12 @@ function formatTime(value) {
 }
 
 function severityLabel(value) {
+  if (value === "info") return t("firewallAuditInfo");
   return value === "high" ? t("securityHigh") : value === "medium" ? t("securityMedium") : t("securityLow");
+}
+
+function statusLabel(row) {
+  return t({ info: "firewallAuditInfo", pending: "eventsPending", deferred: "eventsDeferred" }[row.status] || "alertsHandled");
 }
 
 const rows = computed(() => props.store.eventRows);
@@ -70,7 +75,7 @@ const matchingRows = computed(() => {
     if (moduleFilter.value && item.sourceKey !== moduleFilter.value) return false;
     const timestamp = item.time ? new Date(item.time).getTime() : NaN;
     if (Number.isFinite(timestamp) && timestamp < rangeStart) return false;
-    return !search || [item.node, nodeLabel(item.node), item.module, item.type, item.description, item.source].join(" ").toLowerCase().includes(search);
+    return !search || [item.node, nodeLabel(item.node), item.module, item.type, item.description, item.source, item.traffic?.origin, item.traffic?.local].join(" ").toLowerCase().includes(search);
   });
 });
 const filteredRows = computed(() => matchingRows.value.filter(item => activeTab.value === "pending" ? item.status === "pending" : activeTab.value === "audit" ? item.status !== "pending" : true));
@@ -85,13 +90,14 @@ const selectedEvent = computed(() => {
   if (!detailOpen.value) return null;
   return filteredRows.value.find((item) => item.id === selectedID.value) || null;
 });
-const allVisibleSelected = computed(() => visibleRows.value.length > 0 && visibleRows.value.every((item) => selectedIDs.value.has(item.id)));
+const selectableRows = computed(() => visibleRows.value.filter((item) => item.status !== "info"));
+const allVisibleSelected = computed(() => selectableRows.value.length > 0 && selectableRows.value.every((item) => selectedIDs.value.has(item.id)));
 
 watch(() => [activeTab.value, query.value, nodeFilter.value, severityFilter.value, moduleFilter.value, rangeFilter.value], () => {
   page.value = 0;
 });
 watch(visibleRows, (items) => {
-  const visibleIDs = new Set(items.map((item) => item.id));
+  const visibleIDs = new Set(items.filter((item) => item.status !== "info").map((item) => item.id));
   selectedIDs.value = new Set([...selectedIDs.value].filter((id) => visibleIDs.has(id)));
 }, { immediate: true });
 
@@ -167,7 +173,7 @@ function exportAudit() {
     severityLabel(row.severity),
     row.description,
     row.source,
-    row.status === "pending" ? t("eventsPending") : row.status === "deferred" ? t("eventsDeferred") : t("alertsHandled"),
+    statusLabel(row),
   ].map(escapeCell).join(","));
   const csv = `\uFEFF${[headers.map(escapeCell).join(","), ...lines].join("\n")}`;
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
@@ -190,7 +196,7 @@ function toggleRow(row) {
 }
 
 function toggleAll() {
-  selectedIDs.value = allVisibleSelected.value ? new Set() : new Set(visibleRows.value.map((item) => item.id));
+  selectedIDs.value = allVisibleSelected.value ? new Set() : new Set(selectableRows.value.map((item) => item.id));
 }
 
 async function showEventDetail(row) {
@@ -238,7 +244,7 @@ async function openSecurity(row = selectedEvent.value) {
       <div class="events-center-filters panel">
         <label><span>{{ t("eventsNode") }}</span><select v-model="nodeFilter"><option value="">{{ t("overviewScopeCluster") }}</option><option v-for="item in nodeOptions" :key="item.value" :value="item.value">{{ item.label }}</option></select></label>
         <label><span>{{ t("eventsType") }}</span><select v-model="moduleFilter"><option value="">{{ t("eventsAll") }}</option><option v-for="item in moduleOptions" :key="item.value" :value="item.value">{{ item.label }}</option></select></label>
-        <label><span>{{ t("eventsSeverity") }}</span><select v-model="severityFilter"><option value="">{{ t("alertsAllSeverity") }}</option><option value="high">{{ t("securityHigh") }}</option><option value="medium">{{ t("securityMedium") }}</option><option value="low">{{ t("securityLow") }}</option></select></label>
+        <label><span>{{ t("eventsSeverity") }}</span><select v-model="severityFilter"><option value="">{{ t("alertsAllSeverity") }}</option><option value="high">{{ t("securityHigh") }}</option><option value="medium">{{ t("securityMedium") }}</option><option value="low">{{ t("securityLow") }}</option><option value="info">{{ t("firewallAuditInfo") }}</option></select></label>
         <label><span>{{ t("eventsTimeRange") }}</span><select v-model="rangeFilter"><option value="all">{{ t("eventsAllTime") }}</option><option value="24h">{{ t("securityOverviewLast24Hours") }}</option><option value="7d">{{ t("securityOverviewLast7Days") }}</option></select></label>
         <label class="events-center-search"><span>{{ t("eventsSearch") }}</span><div class="input-with-icon"><Search :size="16" /><input v-model="query" type="search" :placeholder="t('eventsSearch')" /></div></label>
       </div>
@@ -255,16 +261,19 @@ async function openSecurity(row = selectedEvent.value) {
         <div class="table-shell events-center-table-shell">
           <table class="console-table events-center-table">
             <thead>
-              <tr><th class="select-column"><input type="checkbox" :checked="allVisibleSelected" @change="toggleAll" /></th><th>{{ t("recentTime") }}</th><th>{{ t("eventsNode") }}</th><th>{{ t("eventsType") }}</th><th>{{ t("eventsSeverity") }}</th><th>{{ t("securityOverviewDetails") }}</th><th>{{ t("sourceEndpoint") }}</th><th>{{ t("alertsStatus") }}</th><th>{{ t("policyTableActions") }}</th></tr>
+              <tr><th class="select-column"><input type="checkbox" :disabled="!selectableRows.length" :checked="allVisibleSelected" @change="toggleAll" /></th><th>{{ t("recentTime") }}</th><th>{{ t("eventsNode") }}</th><th>{{ t("eventsType") }}</th><th>{{ t("eventsSeverity") }}</th><th>{{ t("securityOverviewDetails") }}</th><th>{{ t("sourceEndpoint") }}</th><th>{{ t("alertsStatus") }}</th><th>{{ t("policyTableActions") }}</th></tr>
             </thead>
             <tbody>
               <tr v-for="row in visibleRows" :key="row.id" :class="{ selected: row.id === selectedID }" @click="showEventDetail(row)">
-                <td class="select-column"><input type="checkbox" :checked="selectedIDs.has(row.id)" @click.stop="toggleRow(row)" /></td>
+                <td class="select-column"><input v-if="row.status !== 'info'" type="checkbox" :checked="selectedIDs.has(row.id)" @click.stop="toggleRow(row)" /></td>
                 <td>{{ formatTime(row.time) }}</td><td><strong>{{ nodeLabel(row.node) }}</strong></td><td>{{ row.type }}</td>
                 <td><span class="status-pill events-severity-pill" :class="row.severity">{{ severityLabel(row.severity) }}</span></td>
                 <td class="events-description"><InfoTip :text="row.description" ellipsis /></td><td class="events-source"><InfoTip :text="row.source" ellipsis /></td>
-                <td><span class="status-pill" :class="{ danger: row.status === 'pending', warning: row.status === 'deferred' }">{{ row.status === "pending" ? t("eventsPending") : row.status === "deferred" ? t("eventsDeferred") : t("alertsHandled") }}</span></td>
-                <td><button class="ghost-button compact-button" type="button" :title="t('eventsProcessNow')" :aria-label="t('eventsProcessNow')" @click.stop="openSecurity(row)">{{ t("eventsProcessNow") }} <ArrowRight :size="14" /></button></td>
+                <td><span class="status-pill" :class="{ danger: row.status === 'pending', warning: row.status === 'deferred' }">{{ statusLabel(row) }}</span></td>
+                <td>
+                  <button v-if="row.status === 'info'" class="ghost-button compact-button" type="button" @click.stop="showEventDetail(row)">{{ t("eventsDetail") }}</button>
+                  <button v-else class="ghost-button compact-button" type="button" @click.stop="openSecurity(row)">{{ t("eventsProcessNow") }} <ArrowRight :size="14" /></button>
+                </td>
               </tr>
               <tr v-if="!visibleRows.length"><td colspan="9" class="table-empty">{{ emptyLabel }}</td></tr>
             </tbody>
@@ -277,9 +286,26 @@ async function openSecurity(row = selectedEvent.value) {
     <aside v-if="selectedEvent" ref="detailDrawer" class="events-detail-drawer panel">
       <div class="events-detail-head"><div><p>{{ t("eventsDetail") }}</p><h3>{{ selectedEvent.type }}</h3></div><button class="icon-button" type="button" :aria-label="t('close')" @click="detailOpen = false; selectedID = ''"><X :size="18" /></button></div>
       <span class="status-pill" :class="selectedEvent.severity">{{ severityLabel(selectedEvent.severity) }}</span>
-      <dl class="events-detail-list"><div><dt>{{ t("eventsNode") }}</dt><dd>{{ nodeLabel(selectedEvent.node) }}</dd></div><div><dt>{{ t("recentTime") }}</dt><dd>{{ formatTime(selectedEvent.time) }}</dd></div><div><dt>{{ t("sourceEndpoint") }}</dt><dd>{{ selectedEvent.source }}</dd></div><div><dt>{{ t("securityOverviewDetails") }}</dt><dd>{{ selectedEvent.description }}</dd></div></dl>
-      <div class="events-detail-note"><ShieldAlert :size="18" /><p>{{ selectedEvent.status === "pending" ? t("securityOverviewProtectionStatus") : selectedEvent.status === "deferred" ? t("eventsDeferred") : t("alertsHandled") }}</p></div>
-      <div class="events-detail-actions"><button class="primary-button" type="button" @click="handleEvent(selectedEvent).catch(store.handleError)"><Check :size="15" />{{ t("eventsMarkRead") }}</button><button class="ghost-button" type="button" @click="openSecurity(selectedEvent)">{{ t("eventsProcessNow") }}</button><button class="ghost-button" type="button" @click="deferEvent(selectedEvent).catch(store.handleError)">{{ t("eventsProcessLater") }}</button><button class="ghost-button" type="button" @click="activeTab = 'audit'">{{ t("eventsViewAudit") }}</button></div>
+      <dl class="events-detail-list">
+        <div><dt>{{ t("eventsNode") }}</dt><dd>{{ nodeLabel(selectedEvent.node) }}</dd></div>
+        <div><dt>{{ t("recentTime") }}</dt><dd>{{ formatTime(selectedEvent.time) }}</dd></div>
+        <div><dt>{{ t(selectedEvent.raw?.direction === 'egress' ? "firewallRemoteEndpoint" : "sourceEndpoint") }}</dt><dd>{{ selectedEvent.source }}</dd></div>
+        <template v-if="selectedEvent.traffic">
+          <div><dt>{{ t("firewallTrafficOrigin") }}</dt><dd>{{ selectedEvent.traffic.origin }}</dd></div>
+          <div v-if="selectedEvent.traffic.hook"><dt>{{ t("firewallTrafficHook") }}</dt><dd>{{ selectedEvent.traffic.hook }}</dd></div>
+          <div v-if="selectedEvent.traffic.local"><dt>{{ t("firewallLocalEndpoint") }}</dt><dd>{{ selectedEvent.traffic.local }}</dd></div>
+        </template>
+        <div><dt>{{ t("securityOverviewDetails") }}</dt><dd>{{ selectedEvent.description }}</dd></div>
+      </dl>
+      <div class="events-detail-note"><ShieldAlert :size="18" /><p>{{ selectedEvent.traffic?.evidence || statusLabel(selectedEvent) }}</p></div>
+      <div class="events-detail-actions">
+        <template v-if="selectedEvent.status !== 'info'">
+          <button class="primary-button" type="button" @click="handleEvent(selectedEvent).catch(store.handleError)"><Check :size="15" />{{ t("eventsMarkRead") }}</button>
+          <button class="ghost-button" type="button" @click="openSecurity(selectedEvent)">{{ t("eventsProcessNow") }}</button>
+          <button class="ghost-button" type="button" @click="deferEvent(selectedEvent).catch(store.handleError)">{{ t("eventsProcessLater") }}</button>
+        </template>
+        <button class="ghost-button" type="button" @click="activeTab = 'audit'">{{ t("eventsViewAudit") }}</button>
+      </div>
     </aside>
   </section>
 </template>

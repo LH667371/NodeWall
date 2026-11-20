@@ -2,6 +2,7 @@ package xdp
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -76,7 +77,9 @@ type IPTablesManager struct {
 	egressPolicies map[string]DirectionPolicy
 	legacyCleaned  map[string]bool
 	chainDigests   map[string][32]byte
+	chainEpochs    map[string]string
 	applyMu        sync.Mutex
+	packetAudit    bool
 }
 
 func NewIPTablesManager() *IPTablesManager {
@@ -95,6 +98,7 @@ func newIPTablesManager(runner iptablesRunner, inputResolver func(string) string
 		egressPolicies: make(map[string]DirectionPolicy),
 		legacyCleaned:  make(map[string]bool),
 		chainDigests:   make(map[string][32]byte),
+		chainEpochs:    make(map[string]string),
 	}
 }
 
@@ -123,6 +127,8 @@ func (m *IPTablesManager) Detach(ifaceName string) error {
 	delete(m.legacyCleaned, ifaceName)
 	delete(m.chainDigests, iptablesChainName(ifaceName))
 	delete(m.chainDigests, iptablesEgressChainName(ifaceName))
+	delete(m.chainEpochs, iptablesChainName(ifaceName))
+	delete(m.chainEpochs, iptablesEgressChainName(ifaceName))
 	if err := m.MockManager.Detach(ifaceName); err != nil {
 		errs = append(errs, err)
 	}
@@ -452,7 +458,7 @@ func (m *IPTablesManager) ReadDirectionPortStats(ifaceName string, direction mod
 func statsFromCounters(counters []iptablesCounter, direction models.PolicyDirection) models.InterfaceStats {
 	stats := models.InterfaceStats{Direction: direction}
 	for _, counter := range counters {
-		if counter.wouldDrop {
+		if counter.target == "DROP" {
 			stats.Dropped += counter.packets
 		} else if counter.target == "RETURN" {
 			stats.Passed += counter.packets
@@ -463,6 +469,10 @@ func statsFromCounters(counters []iptablesCounter, direction models.PolicyDirect
 
 func dropLogsFromCounters(counters []iptablesCounter, direction models.PolicyDirection, limit int) []models.InterceptLogEntry {
 	aggregated := make(map[string]models.InterceptLogEntry)
+	traffic := &models.FirewallTraffic{Evidence: models.FirewallRuleCounter, Hook: "input"}
+	if direction == models.DirectionEgress {
+		traffic.Hook, traffic.Origin = "output", "host"
+	}
 	for _, counter := range counters {
 		if !counter.wouldDrop || counter.packets == 0 {
 			continue
@@ -472,6 +482,8 @@ func dropLogsFromCounters(counters []iptablesCounter, direction models.PolicyDir
 		key := fmt.Sprintf("%s|%s|%d|%s|%t", direction, remote, counter.port, counter.reason, counter.target == "DROP")
 		item := aggregated[key]
 		item.Direction = direction
+		item.Traffic = traffic
+		item.CounterEpoch = counter.epoch
 		item.SourceIP = sourceForLog(remote)
 		if item.SourceIP == "" {
 			item.SourceCIDR = remote
@@ -516,12 +528,12 @@ func sourceStatsFromCounters(counters []iptablesCounter, direction models.Policy
 	aggregated := make(map[string]models.SourceStat)
 	for _, counter := range counters {
 		remote := sourceForLog(counter.remoteAddress(direction))
-		if remote == "" || remote == "0.0.0.0" {
+		if remote == "" || remote == "0.0.0.0" || !counter.terminal() {
 			continue
 		}
 		current := aggregated[remote]
 		current.SourceIP = remote
-		if counter.wouldDrop {
+		if counter.target == "DROP" {
 			current.Dropped += counter.packets
 		} else if counter.target == "RETURN" {
 			current.Passed += counter.packets
@@ -537,7 +549,15 @@ func sourceStatsFromCounters(counters []iptablesCounter, direction models.Policy
 	for _, item := range aggregated {
 		items = append(items, item)
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].Dropped > items[j].Dropped })
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Dropped != items[j].Dropped {
+			return items[i].Dropped > items[j].Dropped
+		}
+		if items[i].Passed != items[j].Passed {
+			return items[i].Passed > items[j].Passed
+		}
+		return items[i].SourceIP < items[j].SourceIP
+	})
 	if limit > 0 && len(items) > limit {
 		items = items[:limit]
 	}
@@ -555,12 +575,12 @@ func (m *IPTablesManager) ReadPortStats(ifaceName string, limit int) ([]models.P
 func portStatsFromCounters(counters []iptablesCounter, limit int) []models.PortStat {
 	aggregated := make(map[uint16]models.PortStat)
 	for _, counter := range counters {
-		if counter.port == 0 {
+		if counter.port == 0 || !counter.terminal() {
 			continue
 		}
 		item := aggregated[counter.port]
 		item.Port = counter.port
-		if counter.wouldDrop {
+		if counter.target == "DROP" {
 			item.Dropped += counter.packets
 		} else if counter.target == "RETURN" {
 			item.Passed += counter.packets
@@ -604,7 +624,7 @@ func (m *IPTablesManager) syncLocked(ifaceName string) error {
 	if err := m.ensureChain(iptablesTable, chain); err != nil {
 		return err
 	}
-	if err := m.replaceChainRules(chain, runtime); err != nil {
+	if err := m.replaceChainRules(ifaceName, chain, runtime); err != nil {
 		return err
 	}
 	if err := m.ensureFirstJump(input, chain); err != nil {
@@ -615,7 +635,7 @@ func (m *IPTablesManager) syncLocked(ifaceName string) error {
 		if err := m.ensureChain(iptablesTable, egressChain); err != nil {
 			return err
 		}
-		if err := m.replaceDirectionChain(iptablesTable, egressChain, policy, "-d"); err != nil {
+		if err := m.replaceDirectionChain(iptablesTable, egressChain, ifaceName, policy, "-d"); err != nil {
 			return err
 		}
 		if err := m.ensureEgressJumps(ifaceName, egressChain); err != nil {
@@ -642,7 +662,7 @@ func (m *IPTablesManager) ensureChain(table, chain string) error {
 	return err
 }
 
-func (m *IPTablesManager) replaceChainRules(chain string, runtime Runtime) error {
+func (m *IPTablesManager) replaceChainRules(iface, chain string, runtime Runtime) error {
 	policy := DirectionPolicy{
 		BypassCIDRs:      runtime.BypassCIDRs,
 		BlockedCIDRs:     runtime.BlockedCIDRs,
@@ -657,13 +677,14 @@ func (m *IPTablesManager) replaceChainRules(chain string, runtime Runtime) error
 		PolicyEnforced:   runtime.Config.PolicyEnforced,
 		ObserveOnly:      runtime.Config.ObserveOnly,
 	}
-	return m.replaceDirectionChain(iptablesTable, chain, policy, "-s")
+	return m.replaceDirectionChain(iptablesTable, chain, iface, policy, "-s")
 }
 
-func (m *IPTablesManager) replaceDirectionChain(table, chain string, policy DirectionPolicy, addressFlag string) error {
+func (m *IPTablesManager) replaceDirectionChain(table, chain, iface string, policy DirectionPolicy, addressFlag string) error {
 	if _, err := m.runner.Run("-t", table, "-F", chain); err != nil {
 		return err
 	}
+	m.chainEpochs[chain] = rand.Text()
 	failOpen := func(err error) error {
 		delete(m.chainDigests, chain)
 		// A failed policy compile must not leave a half-written DROP chain.
@@ -763,6 +784,23 @@ func (m *IPTablesManager) replaceDirectionChain(table, chain string, policy Dire
 		if len(policy.Allowlist) > 0 || len(policy.AllowedPortRules) > 0 {
 			if err := appendRule("-m", "comment", "--comment", "nodewall:default_deny", "-j", dropTarget); err != nil {
 				return failOpen(err)
+			}
+			if m.packetAudit {
+				direction := models.DirectionIngress
+				if addressFlag == "-d" {
+					direction = models.DirectionEgress
+				}
+				// Insert before the existing verdict. During a live rebuild
+				// a sample can only be emitted once its verdict is installed.
+				location := []string{"-t", table, "-I", chain, strconv.Itoa(compiledRules)}
+				if _, err := m.runner.Run(append(location, defaultDenyAuditRule(iface, direction, policy.ObserveOnly)...)...); err != nil {
+					// Audit support is optional on old kernels and iptables builds.
+					// The verdict and its full rule counter still apply.
+					log.Printf("warning: default-deny packet audit unavailable on %s: %v", iface, err)
+					m.packetAudit = false
+				} else {
+					compiledRules++
+				}
 			}
 		}
 	}
@@ -964,12 +1002,7 @@ func isNodeWallJump(line string) bool {
 }
 
 func (m *IPTablesManager) readCounters(ifaceName string) ([]iptablesCounter, error) {
-	chain := iptablesChainName(ifaceName)
-	output, err := m.runner.Run("-t", iptablesTable, "-L", chain, "-v", "-x", "-n")
-	if err != nil {
-		return nil, err
-	}
-	return parseIPTablesListCounters(output), nil
+	return m.readChainCounters(iptablesChainName(ifaceName))
 }
 
 func (m *IPTablesManager) readDirectionCounters(ifaceName string, direction models.PolicyDirection) ([]iptablesCounter, error) {
@@ -979,11 +1012,25 @@ func (m *IPTablesManager) readDirectionCounters(ifaceName string, direction mode
 	if direction != models.DirectionEgress {
 		return nil, fmt.Errorf("unsupported policy direction %q", direction)
 	}
-	output, err := m.runner.Run("-t", iptablesTable, "-L", iptablesEgressChainName(ifaceName), "-v", "-x", "-n")
+	return m.readChainCounters(iptablesEgressChainName(ifaceName))
+}
+
+func (m *IPTablesManager) readChainCounters(chain string) ([]iptablesCounter, error) {
+	// Take the counters and their generation together, outside a rule rebuild.
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	output, err := m.runner.Run("-t", iptablesTable, "-L", chain, "-v", "-x", "-n")
 	if err != nil {
+		if isMissingIPTablesObject(output, err) || (strings.Contains(strings.ToLower(output), "is incompatible") && m.chainAbsentFromTable(iptablesTable, chain)) {
+			return nil, errNotAttached
+		}
 		return nil, err
 	}
-	return parseIPTablesListCounters(output), nil
+	counters := parseIPTablesListCounters(output)
+	for i := range counters {
+		counters[i].epoch = m.chainEpochs[chain]
+	}
+	return counters, nil
 }
 
 type iptablesCounter struct {
@@ -994,6 +1041,11 @@ type iptablesCounter struct {
 	port        uint16
 	reason      string
 	wouldDrop   bool
+	epoch       string
+}
+
+func (counter iptablesCounter) terminal() bool {
+	return counter.target == "DROP" || counter.target == "RETURN"
 }
 
 func parseIPTablesListCounters(output string) []iptablesCounter {

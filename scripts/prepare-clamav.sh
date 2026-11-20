@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ASSETS_DIR="${NODEWALL_CLAMAV_ASSETS_DIR:-${ROOT_DIR}/tmp/clamav-assets}"
+ENGINE_SEED_DIR="${NODEWALL_CLAMAV_ENGINE_SEED_DIR:-}"
 DATABASE_DIR="${NODEWALL_CLAMAV_DATABASE_DIR:-${ASSETS_DIR}/database}"
 DATABASE_URL="${NODEWALL_CLAMAV_DATABASE_URL:-https://database.clamav.net}"
 DATABASE_URL="${DATABASE_URL%/}"
@@ -11,9 +12,9 @@ BUNDLE_DESTINATION="${1:-}"
 # signed package indexes and packages. The resulting musl runtime is private
 # to NodeWall and does not replace the host's glibc.
 ALPINE_IMAGE="alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf"
-CLAMAV_VERSION="1.4.6"
+CLAMAV_VERSION="1.4.7"
 APORTS_COMMIT="c84b05967ca68847882204bc14ab80ecc7b38c57"
-CLAMAV_SOURCE_SHA256="06dbc7adf96e2f6a27c548a841ce83c95360d1e121b106a6f7cf56f282a3c61b"
+CLAMAV_SOURCE_SHA256="3f93bf28b193677d09427a19602bf07af30629edbce93fd7f92b92a64e75c027"
 
 fail() {
   printf '[clamav] error: %s\n' "$*" >&2
@@ -74,34 +75,95 @@ work_dir="$(mktemp -d "${ASSETS_DIR}/.prepare.XXXXXX")"
 bundle="${work_dir}/bundle"
 mkdir -p "${bundle}/engines" "${bundle}/database" "${bundle}/source/alpine"
 source_archive="source/clamav-${CLAMAV_VERSION}.tar.gz"
-recipe_files=(APKBUILD clamd.confd clamd.initd clamd.logrotate clamd_freshclam_conf_alpine.patch freshclam.confd freshclam.initd freshclam.logrotate link-fts.patch)
+recipe_files=(APKBUILD clamav-daemon.pre-install clamav-daemon.pre-upgrade clamd.confd clamd.initd clamd.logrotate clamd_freshclam_conf_alpine.patch freshclam.confd freshclam.initd freshclam.logrotate freshclam.pre-install link-fts.patch)
 static_assets=(engines/amd64.tar.gz engines/arm64.tar.gz "${source_archive}")
 for file in "${recipe_files[@]}"; do
   static_assets+=("source/alpine/${file}")
 done
 
-# Distribute the corresponding source and the exact Alpine packaging recipe
-# with the binary. Check the cached release independently of mutable CVDs.
-cached=true
-for file in MANIFEST.sha256 "${static_assets[@]}"; do
-  if [[ ! -s "${ASSETS_DIR}/${file}" ]]; then
-    cached=false
-    break
-  fi
-done
-if "${cached}"; then
+# Keep engine builds across failed or interrupted FreshClam runs. The build
+# key also prevents reusing partial results from a different Alpine recipe.
+engine_key="$(printf '%s\n' "${ALPINE_IMAGE}" "${APORTS_COMMIT}" "${CLAMAV_SOURCE_SHA256}" | checksum | awk '{print $1}')"
+engine_cache="${ASSETS_DIR}/.engine-cache/${CLAMAV_VERSION}-${engine_key:0:16}"
+mkdir -p "${engine_cache}/engines" "${engine_cache}/source/alpine"
+
+reuse_static_assets() {
+  local origin="$1" file
+  for file in MANIFEST.sha256 "${static_assets[@]}"; do
+    [[ -s "${origin}/${file}" ]] || return 1
+  done
   for file in "${static_assets[@]}"; do
     awk -v file="${file}" '$2 == file { print; count++ } END { if (count != 1) exit 1 }' \
-      "${ASSETS_DIR}/MANIFEST.sha256" || fail "missing or duplicate checksum for ${file}"
-    cp -p "${ASSETS_DIR}/${file}" "${bundle}/${file}"
+      "${origin}/MANIFEST.sha256" || fail "missing or duplicate checksum for ${file}"
+    cp -p "${origin}/${file}" "${bundle}/${file}" || fail "copy engine asset ${file}"
   done > "${work_dir}/static.sha256"
-  (cd "${bundle}" && checksum -c "${work_dir}/static.sha256")
+  (cd "${bundle}" && checksum -c "${work_dir}/static.sha256") || fail 'invalid cached engine assets'
+  echo "[clamav] reusing verified ClamAV ${CLAMAV_VERSION} engines from ${origin}"
+}
+
+if reuse_static_assets "${engine_cache}" || reuse_static_assets "${ASSETS_DIR}"; then
+  :
+elif [[ -n "${ENGINE_SEED_DIR}" ]]; then
+  reuse_static_assets "${ENGINE_SEED_DIR}" || fail "missing ClamAV ${CLAMAV_VERSION} assets in ${ENGINE_SEED_DIR}"
 else
+  if [[ -s "${ASSETS_DIR}/${source_archive}" ]]; then
+    cp -p "${ASSETS_DIR}/${source_archive}" "${bundle}/${source_archive}"
+  else
+    curl -fL --retry 3 --connect-timeout 15 --max-time 600 \
+      "https://github.com/Cisco-Talos/clamav/releases/download/clamav-${CLAMAV_VERSION}/clamav-${CLAMAV_VERSION}.tar.gz" \
+      -o "${bundle}/${source_archive}"
+  fi
+  (cd "${bundle}" && printf '%s  %s\n' "${CLAMAV_SOURCE_SHA256}" "${source_archive}" | checksum -c -)
+  for file in "${recipe_files[@]}"; do
+    curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 \
+      "https://raw.githubusercontent.com/alpinelinux/aports/${APORTS_COMMIT}/community/clamav/${file}" \
+      -o "${bundle}/source/alpine/${file}"
+  done
+  # The stable repository can lag the upstream security release. Reuse its
+  # audited recipe, with the verified upstream source and a local APK signature.
+  if command -v sha512sum >/dev/null 2>&1; then
+    source_sha512="$(sha512sum "${bundle}/${source_archive}" | awk '{print $1}')"
+  else
+    source_sha512="$(shasum -a 512 "${bundle}/${source_archive}" | awk '{print $1}')"
+  fi
+  awk -v version="${CLAMAV_VERSION}" -v sha="${source_sha512}" '
+    /^pkgver=/ { print "pkgver=" version; print "options=\"!check\""; next }
+    $2 ~ /^clamav-.*\.tar\.gz$/ { print sha "  clamav-" version ".tar.gz"; next }
+    { print }
+  ' "${bundle}/source/alpine/APKBUILD" > "${work_dir}/APKBUILD"
+  mv "${work_dir}/APKBUILD" "${bundle}/source/alpine/APKBUILD"
+
   for arch in amd64 arm64; do
+    engine_archive="engines/${arch}.tar.gz"
+    engine_stamp="${engine_cache}/${arch}.sha256"
+    if [[ -s "${engine_cache}/${engine_archive}" && -s "${engine_stamp}" ]]; then
+      cp -p "${engine_cache}/${engine_archive}" "${bundle}/${engine_archive}"
+      (cd "${bundle}" && checksum -c "${engine_stamp}")
+      echo "[clamav] reusing ${arch} engine from a previous build"
+      continue
+    fi
     echo "[clamav] preparing ${arch} engine"
-    docker run --rm --platform "linux/${arch}" -v "${bundle}:/output" "${ALPINE_IMAGE}" sh -ec '
+    archive_repo="${work_dir}/apk-${arch}"
+    mkdir -p "${archive_repo}"
+    docker run --rm --platform "linux/${arch}" -v "${bundle}/source:/source:ro" -v "${archive_repo}:/packages" "${ALPINE_IMAGE}" sh -ec '
+      apk update
+      apk upgrade
+      apk add alpine-sdk
+      mkdir -p /build/community /var/cache/distfiles
+      cp -R /source/alpine /build/community/clamav
+      cp "/source/clamav-$1.tar.gz" /var/cache/distfiles/
+      abuild-keygen -an
+      cp /root/.abuild/*.rsa.pub /etc/apk/keys/
+      cp /root/.abuild/*.rsa.pub /packages/
+      export JOBS=2 CARGO_BUILD_JOBS=1 CMAKE_BUILD_PARALLEL_LEVEL=2 CARGO_NET_OFFLINE=true
+      abuild -F -r -D "NodeWall ClamAV backport" -C /build/community/clamav -P /packages -s /var/cache/distfiles
+    ' sh "${CLAMAV_VERSION}"
+    docker run --rm --platform "linux/${arch}" -v "${bundle}:/output" -v "${archive_repo}:/packages:ro" "${ALPINE_IMAGE}" sh -ec '
       apk_version="$1"
-      apk add --no-cache "clamav-daemon=$apk_version" "clamav-scanner=$apk_version" "freshclam=$apk_version" "clamav-libs=$apk_version" "clamav-libunrar=$apk_version" ca-certificates
+      cp /packages/*.rsa.pub /etc/apk/keys/
+      # apk add can retain older dependencies already present in the base image.
+      apk --no-cache upgrade
+      apk add --no-cache -X /packages/community "clamav-daemon=$apk_version" "clamav-scanner=$apk_version" "freshclam=$apk_version" "clamav-libs=$apk_version" "clamav-libunrar=$apk_version" ca-certificates
       stage=$(mktemp -d)
       mkdir -p "$stage/lib" "$stage/usr/lib" "$stage/usr/bin" "$stage/usr/sbin" "$stage/etc/ssl"
       for file in /lib/*.so*; do [ ! -e "$file" ] || cp -L "$file" "$stage/lib/"; done
@@ -112,21 +174,17 @@ else
       apk info -vv > "$stage/PACKAGES.txt"
       tar -czf "/output/engines/$2.tar.gz" -C "$stage" .
     ' sh "${CLAMAV_VERSION}-r0" "${arch}"
-  done
-  if [[ -s "${ASSETS_DIR}/${source_archive}" ]]; then
-    cp -p "${ASSETS_DIR}/${source_archive}" "${bundle}/${source_archive}"
-  else
-    curl -fL --retry 3 --connect-timeout 15 --max-time 600 \
-      "https://github.com/Cisco-Talos/clamav/releases/download/clamav-${CLAMAV_VERSION}/clamav-${CLAMAV_VERSION}.tar.gz" \
-      -o "${bundle}/${source_archive}"
-  fi
-  for file in "${recipe_files[@]}"; do
-    curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 \
-      "https://raw.githubusercontent.com/alpinelinux/aports/${APORTS_COMMIT}/community/clamav/${file}" \
-      -o "${bundle}/source/alpine/${file}"
+    (cd "${bundle}" && checksum "${engine_archive}") > "${work_dir}/engine.sha256"
+    publish_file "${bundle}/${engine_archive}" "${engine_cache}/${engine_archive}"
+    publish_file "${work_dir}/engine.sha256" "${engine_stamp}"
   done
 fi
 (cd "${bundle}" && printf '%s  %s\n' "${CLAMAV_SOURCE_SHA256}" "${source_archive}" | checksum -c -)
+for file in "${static_assets[@]}"; do
+  publish_file "${bundle}/${file}" "${engine_cache}/${file}"
+done
+(cd "${bundle}" && checksum "${static_assets[@]}") > "${work_dir}/engine-manifest.sha256"
+publish_file "${work_dir}/engine-manifest.sha256" "${engine_cache}/MANIFEST.sha256"
 
 databases=(main.cvd daily.cvd bytecode.cvd)
 for file in "${databases[@]}"; do

@@ -46,14 +46,12 @@ func (h *ServerHandler) cachedConsoleSnapshot(ctx context.Context, key string, c
 	}
 	// Keep cached maps immutable; a cancelled collector can return a previous
 	// snapshot still being marshalled for another Web client.
-	if key != "node-protection" {
-		copy := make(map[string]any, len(value)+1)
-		for name, item := range value {
-			copy[name] = item
-		}
-		copy["revision"] = revision
-		value = copy
+	copy := make(map[string]any, len(value)+1)
+	for name, item := range value {
+		copy[name] = item
 	}
+	copy["revision"] = revision
+	value = copy
 	h.pageSnapshotMu.Lock()
 	if ctx.Err() == nil && revision == atomic.LoadUint64(&h.consoleRevision) {
 		if h.pageSnapshotCache == nil {

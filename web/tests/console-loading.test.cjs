@@ -41,7 +41,7 @@ async function loadConsole(hash, request, options = {}) {
       return new vm.SyntheticModule(["request", "downloadFile", "withDirection"], function () {
         this.setExport("request", request);
         this.setExport("downloadFile", async () => ({}));
-        this.setExport("withDirection", (url, direction) => `${url}?direction=${direction}`);
+        this.setExport("withDirection", (url, direction) => `${url}${url.includes("?") ? "&" : "?"}direction=${encodeURIComponent(direction)}`);
       }, { context });
     }
     if (specifier === "@/lib/eventIds") return eventIDsModule;
@@ -69,6 +69,56 @@ test("aggregate and unspecified sources cannot create a misleading per-IP action
   assert.equal(store.state.selection.size,1);
   store.toggleLogSelection(row);
   assert.equal(store.state.selection.size,0);
+  store.dispose();
+});
+
+test("firewall samples retain their node through selection and disposition", async () => {
+  const calls = [];
+  const store = await loadConsole("#events", async (url, options) => {
+    calls.push({ url, options });
+    return {};
+  });
+  store.state.nodeId = "a";
+  const row = { node_id: "b", interface: "eno1", direction: "egress", source_ip: "192.0.2.19", port: 8080,
+    timestamp: "2026-11-20T03:36:50Z", reason: "nodewall:default_deny", drops: 1, traffic: { evidence: "packet_sample" } };
+  store.toggleLogSelection(row);
+  store.toggleLogSelection({ ...row, node_id: "a" });
+  assert.equal(store.state.selection.size, 2, "identical endpoints on different nodes share a selection key");
+  await store.runLogAction("allow", row);
+  const request = calls.find(({ url }) => url === "/logs/actions/allow");
+  assert.ok(request);
+  const action = JSON.parse(request.options.body);
+  assert.equal(action.node_id, "b");
+  assert.equal(action.direction, "egress");
+  store.dispose();
+});
+
+test("the pending badge excludes rule totals, host multicast, and observe-only matches", async () => {
+  const store = await loadConsole("#events", async () => ({}));
+  const base = { node_id: "zstack", interface: "eno1", direction: "ingress", reason: "nodewall:default_deny",
+    timestamp: "2026-11-20T03:36:50Z" };
+  const sample = { ...base, source_ip: "192.0.2.19", port: 8080, count: 2, drops: 2,
+    traffic: { evidence: "packet_sample", hook: "input", origin: "vm", device: "vnic12.0", bridge: "br_eno1",
+      guest: "guest-a", basis: "ingress_device", local_ip: "192.0.2.16", protocol: "tcp" } };
+  store.state.eventCenter.logs = [
+    { ...base, source_cidr: "0.0.0.0/0", count: 12, drops: 12, traffic: { evidence: "rule_counter", hook: "input" } },
+    { ...sample, source_ip: "192.0.2.2", port: 1900, traffic: { evidence: "packet_sample", hook: "input",
+      origin: "uplink", device: "eno1", delivery: "multicast", local_ip: "239.255.255.250" } },
+    { ...sample, count: 198, drops: 0 },
+    sample,
+    { ...base, reason: "nodewall:blocked_source", source_cidr: "198.51.100.0/24", count: 3, drops: 3,
+      traffic: { evidence: "rule_counter", hook: "input" } },
+  ];
+  const rows = store.eventRows.value;
+  assert.equal(rows.length, 4);
+  assert.equal(store.pendingEventCount.value, 2);
+  assert.equal(rows.filter(row => row.status === "info").length, 2);
+  const vm = rows.find(row => row.raw.traffic.origin === "vm");
+  assert.equal(vm.status, "pending");
+  assert.match(vm.traffic.origin, /firewallOriginVM.*guest-a.*vnic12\.0/);
+  assert.match(vm.description, /2 firewallSampledPackets.*8080/);
+  assert.match(rows.find(row => row.raw.source_cidr === "0.0.0.0/0").source, /firewallRuleAggregateSource/);
+  assert.match(rows.find(row => row.raw.traffic.delivery === "multicast").traffic.origin, /firewallOriginUplink.*eno1/);
   store.dispose();
 });
 
@@ -218,7 +268,8 @@ test("monitoring range switches clear old custom parameters and reject the previ
   const h = eventStreamHarness();
   const delayed = deferred();
   const requests = [];
-  const history = (scope, node, cpu) => ({ scope, node_id: node, points: [{ cpu_percent: cpu }], nodes: [], sample_interval_seconds: 15 });
+  const archive = [{ node_id: "retired", name: "Old worker", registered: false, last_sample_at: "2026-11-17T00:15:00Z" }];
+  const history = (scope, node, cpu) => ({ scope, node_id: node, points: [{ cpu_percent: cpu }], nodes: [], archive_nodes: archive, sample_interval_seconds: 15 });
   const store = await loadConsole("#monitoring", async url => {
     if (!url.startsWith("/monitoring/history?")) return h.request(url);
     const query = new URL(url, "https://nodewall.test").searchParams;
@@ -228,7 +279,9 @@ test("monitoring range switches clear old custom parameters and reject the previ
   }, { window: { EventSource: h.EventSource } });
   await store.bootstrap();
   assert.equal(store.state.monitoringHistory.scope, "cluster");
+  assert.equal(store.state.monitoringArchiveNodes[0].node_id, "retired");
   store.setMonitoringStreamQuery({ node: "b", range: 604800, from: "2026-11-17T00:00:00Z", to: "2026-11-17T00:15:00Z" });
+  assert.equal(store.state.monitoringArchiveNodes[0].node_id, "retired");
   await tick();
   const previousStream = h.sources.at(-1);
   assert.ok(requests.at(-1).has("from"));
@@ -238,9 +291,10 @@ test("monitoring range switches clear old custom parameters and reject the previ
   assert.equal(requests.at(-1).has("to"), false);
   assert.equal(store.state.monitoringHistory.points[0].cpu_percent, 40);
   delayed.resolve(history("node", "b", 10));
-  previousStream.emit("monitoring", history("node", "b", 1));
+  previousStream.emit("monitoring", { ...history("node", "b", 1), archive_nodes: [] });
   await tick();
   assert.equal(store.state.monitoringHistory.points[0].cpu_percent, 40);
+  assert.equal(store.state.monitoringArchiveNodes[0].node_id, "retired");
   await store.setNode("b");
   assert.equal(store.state.monitoringStreamQuery.node, "b");
   store.dispose();
@@ -461,6 +515,109 @@ test("firewall adds render the confirmed policy without waiting for SSE or reloa
   store.dispose();
 });
 
+test("a newer partial stream frame cannot suppress a confirmed firewall deletion", async () => {
+  const h = eventStreamHarness();
+  const response = deferred();
+  const initial = firewallPolicy("a", "ens3");
+  const saved = firewallPolicy("a", "ens3", [8080], "2026-11-17T10:00:01Z");
+  saved.ingress.rules = null;
+  const store = await loadConsole("#firewall", async (url, options = {}) => {
+    if (url.endsWith("/interfaces")) return { recommended: "ens3", interfaces: [{ name: "ens3" }] };
+    if (url.includes("/summary?")) return { policy: initial, revision: 3 };
+    if (options.method === "DELETE") {
+      const route = new URL(url, "https://nodewall.test");
+      assert.equal(route.pathname, "/nodes/a/interfaces/ens3/allowlist");
+      assert.equal(route.searchParams.get("cidr"), "192.0.2.1/32");
+      assert.equal(route.searchParams.get("direction"), "ingress");
+      await response.promise;
+      options.onResponse({ headers: { get: () => "4" } });
+      return saved;
+    }
+    return h.request(url);
+  }, { window: { EventSource: h.EventSource } });
+  await store.bootstrap();
+  try {
+    assert.equal(store.state.allowlist.length, 1);
+    const deleting = store.removeCIDR("allowlist", "192.0.2.1/32");
+    h.sources.at(-1).emit("security", { revision: 5, nodes: [{ node_id: "a", interface: "ens3", health: { interfaces: [] } }] });
+    response.resolve();
+    await deleting;
+    assert.equal(store.state.allowlist.length, 0);
+    assert.equal(store.state.publicPortRules.length, 2);
+    assert.equal(store.state.consoleRevision, 5);
+    h.sources.at(-1).emit("security", { revision: 6, nodes: [{ node_id: "a", interface: "ens3", current: {} }] });
+    assert.equal(store.currentPolicy.value, saved);
+  } finally {
+    store.dispose();
+  }
+});
+
+test("an older policy from the same millisecond cannot put back a deleted port", async () => {
+  const h = eventStreamHarness();
+  const initial = firewallPolicy("a", "ens3", [8080], "2026-11-17T10:00:00.123100001Z");
+  const saved = firewallPolicy("a", "ens3", [], "2026-11-17T10:00:00.123100002Z");
+  saved.ingress.public_port_rules = [{ protocol: "udp", port: 8080 }];
+  saved.ingress.public_ports = [8080];
+  const store = await loadConsole("#firewall", async (url, options = {}) => {
+    if (url.endsWith("/interfaces")) return { recommended: "ens3", interfaces: [{ name: "ens3" }] };
+    if (url.includes("/summary?")) return { policy: initial };
+    if (options.method === "DELETE") return saved;
+    return h.request(url);
+  }, { window: { EventSource: h.EventSource } });
+  await store.bootstrap();
+  try {
+    await store.removePort("public", 8080, "tcp");
+    h.sources.at(-1).emit("security", { nodes: [{ node_id: "a", interface: "ens3", current: { policy: initial } }] });
+    assert.deepEqual(Array.from(store.state.publicPortRules, (item) => item.protocol), ["udp"]);
+  } finally {
+    store.dispose();
+  }
+});
+
+test("an acknowledged deletion without a policy reads the exact saved interface without a page reload", async () => {
+  const initial = firewallPolicy("a", "ens3");
+  initial.egress = { denied_port_rules: [{ protocol: "tcp", port: 9090 }] };
+  const saved = { ...initial, egress: { denied_ports: null, denied_port_rules: [] }, updated_at: "2026-11-17T10:00:01Z" };
+  const requests = [];
+  const store = await loadConsole("#firewall", async (url, options = {}) => {
+    requests.push(url);
+    return options.method === "DELETE" ? { status: "ok" } : saved;
+  });
+  Object.assign(store.state, { section: "security", nodeId: "a", selectedInterface: "ens3", direction: "egress", policy: initial });
+  try {
+    await store.removePort("denied", 9090, "tcp");
+    assert.deepEqual(requests, ["/nodes/a/interfaces/ens3/denied-ports/9090?protocol=tcp&direction=egress", "/nodes/a/interfaces/ens3/policy"]);
+    assert.equal(store.state.deniedPortRules.length, 0);
+    assert.equal(store.state.direction, "egress");
+    assert.equal(store.currentPolicy.value.ingress.rules.length, 1);
+  } finally {
+    store.dispose();
+  }
+});
+
+test("rejected and retained rules stay in the list without a deletion success", async () => {
+  const initial = firewallPolicy("a", "ens3");
+  let fail = true;
+  const store = await loadConsole("#firewall", async () => {
+    if (fail) throw new Error("agent unavailable");
+    return initial;
+  });
+  Object.assign(store.state, {
+    section: "security", nodeId: "a", selectedInterface: "ens3", policy: initial,
+    allowlist: ["192.0.2.1/32"],
+  });
+  try {
+    await assert.rejects(store.removeCIDR("allowlist", "192.0.2.1/32"), /agent unavailable/);
+    assert.equal(store.state.allowlist[0], "192.0.2.1/32");
+    fail = false;
+    await assert.rejects(store.removeCIDR("allowlist", "192.0.2.1/32"), /policyRuleRetained/);
+    assert.equal(store.state.allowlist[0], "192.0.2.1/32");
+    assert.equal(store.state.toasts.length, 0);
+  } finally {
+    store.dispose();
+  }
+});
+
 test("a delayed firewall save cannot replace a different node, NIC, direction, or page", async () => {
   for (const changed of [{ nodeId: "b" }, { selectedInterface: "eth9" }, { direction: "egress" }, { section: "monitoring" }]) {
     const pending = deferred();
@@ -562,9 +719,12 @@ test("rule edits preserve the policy version and update all displayed rule famil
     return updated;
   });
   const previous = firewallPolicy();
+  previous.ingress.denied_port_rules = [{ port: 8080, protocol: "tcp" }];
   Object.assign(store.state, { section: "security", nodeId: "a", selectedInterface: "ens3", policy: previous });
   await store.updateRule({ kind: "public", value: 8080, portProtocol: "tcp" }, { kind: "public", targetValue: 9090, protocol: "tcp" });
   assert.equal(payload.policy.updated_at, previous.updated_at);
+  assert.deepEqual(payload.policy.ingress.denied_port_rules, previous.ingress.denied_port_rules);
+  assert.deepEqual(payload.policy.ingress.public_port_rules, [{ port: 8080, protocol: "udp" }, { port: 9090, protocol: "tcp" }]);
   assert.equal(store.state.publicPortRules[0].port, 9090);
   assert.equal(store.state.allowlist[0], "192.0.2.1/32");
   store.dispose();
@@ -572,17 +732,24 @@ test("rule edits preserve the policy version and update all displayed rule famil
 
 test("a failed description preserves the saved rule and reports retryable partial success", async () => {
   const calls = [];
+  let fail = true;
   const store = await loadConsole("#firewall", async (url, options) => {
     calls.push({ url, options });
-    if (url.includes("rule-description")) throw new Error("description service unavailable");
+    if (url.includes("rule-description") && fail) throw new Error("description service unavailable");
     return firewallPolicy();
   });
   Object.assign(store.state, { section: "security", nodeId: "a", selectedInterface: "ens3" });
-  const results = await store.addRuleToNodes({ kind: "public", targetValue: 8080, protocol: "tcp", description: "test" }, [{ nodeID: "a", interface: "ens3" }]);
+  const rule = { kind: "public", targetValue: 8080, protocol: "tcp", description: "test" };
+  const results = await store.addRuleToNodes(rule, [{ nodeID: "a", interface: "ens3" }]);
   assert.equal(results[0].status, "failed");
   assert.equal(results[0].ruleSaved, true);
   assert.equal(store.state.publicPortRules[0].port, 8080);
   assert.equal(calls.length, 2);
+  fail = false;
+  const retried = await store.addRuleToNodes(rule, results);
+  assert.equal(retried[0].status, "success");
+  assert.equal(calls.length, 3);
+  assert.match(calls[2].url, /\/rule-description/);
   store.dispose();
 });
 
@@ -610,6 +777,20 @@ test("Webs agree on heartbeat presence when only one Web loses its Agent path", 
   assert.equal(second.state.nodeProtection.target.protection_status, "unavailable");
   assert.match(second.state.nodeProtection.target.reason, /host firewall/);
   first.dispose(); second.dispose();
+});
+
+test("cluster snapshots keep Agent reachability separate from firewall availability", async () => {
+  const h = eventStreamHarness();
+  const store = await loadConsole("#cluster", h.request, { window: { EventSource: h.EventSource } });
+  await store.bootstrap();
+  h.sources[0].emit("cluster", {
+    a: { node_status: "online", reachable: true, protection_status: "unavailable", dataplane_modes: {} },
+    b: { node_status: "online", reachable: false, protection_status: "unavailable" },
+  });
+  assert.equal(store.state.nodeReachability.a, true);
+  assert.deepEqual(Object.keys(store.state.nodeProtection.a.dataplane_modes), []);
+  assert.equal(store.state.nodeReachability.b, false);
+  store.dispose();
 });
 
 test("a newer heartbeat supersedes an older offline snapshot without inventing protection", async () => {
@@ -1155,7 +1336,7 @@ test("a stale unavailable security frame cannot disable a ready firewall page", 
     if (url === "/nodes") return { nodes: [node] };
     if (url.endsWith("/interfaces")) return { recommended: "eth0", interfaces: [{ name: "eth0", is_physical: true }] };
     if (url.includes("/interfaces/eth0/summary")) return {
-      policy: { ingress: { enabled: true, mode: "whitelist", default_action: "drop", rules: [{ cidr: "192.0.2.1/32" }] } },
+      policy: firewallPolicy(node.id, "eth0", []),
       health: { interfaces: [] },
     };
     return {};
@@ -1170,7 +1351,7 @@ test("a stale unavailable security frame cannot disable a ready firewall page", 
       node_id: node.id,
       interface: "eth0",
       interface_status: "unavailable",
-      current: { policy: { ingress: { enabled: true, mode: "whitelist", default_action: "drop", rules: [{ cidr: "192.0.2.1/32" }] } }, health: { interfaces: [] } },
+      current: { policy: firewallPolicy(node.id, "eth0", []), health: { interfaces: [] } },
     }],
   });
   assert.equal(store.state.interfaceDataStatus, "ready");

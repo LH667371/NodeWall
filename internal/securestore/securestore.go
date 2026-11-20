@@ -126,6 +126,16 @@ func Write(path string, data []byte, mode os.FileMode) error {
 	if err != nil {
 		return err
 	}
+	return writeWithBackups(path, encoded, mode)
+}
+
+// WritePlain preserves a legacy file format while using the same crash-safe
+// replacement and backup rotation as encrypted state.
+func WritePlain(path string, data []byte, mode os.FileMode) error {
+	return writeWithBackups(path, data, mode)
+}
+
+func writeWithBackups(path string, data []byte, mode os.FileMode) error {
 	for i := backupCount; i >= 1; i-- {
 		from := path
 		if i > 1 {
@@ -143,7 +153,7 @@ func Write(path string, data []byte, mode os.FileMode) error {
 			continue
 		}
 	}
-	return writeAtomic(path, encoded, mode)
+	return writeAtomic(path, data, mode)
 }
 
 func encode(data []byte, keyPath string) ([]byte, error) {

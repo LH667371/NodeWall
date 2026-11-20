@@ -508,6 +508,7 @@ type SystemMetricPoint struct {
 	MemoryTotalBytes           float64            `json:"memory_total_bytes"`
 	Timestamp                  time.Time          `json:"timestamp"`
 	NodeID                     string             `json:"node_id,omitempty"`
+	NodeName                   string             `json:"node_name,omitempty"`
 	UptimeSeconds              float64            `json:"uptime_seconds"`
 	CPUPercent                 float64            `json:"cpu_percent"`
 	CPUUserPercent             float64            `json:"cpu_user_percent"`
@@ -584,18 +585,30 @@ type SystemMetricNodeSummary struct {
 	Accelerators      []AcceleratorMetrics     `json:"accelerators,omitempty"`
 }
 
+// MonitoringArchiveNode identifies a retained sample source. Registration
+// indicates membership in the current node inventory, independent of liveness.
+type MonitoringArchiveNode struct {
+	NodeID       string    `json:"node_id"`
+	Name         string    `json:"name,omitempty"`
+	LastSampleAt time.Time `json:"last_sample_at"`
+	Registered   bool      `json:"registered"`
+}
+
 // SystemMetricsHistory is the server-side response for the Grafana-like
 // monitoring view. The control plane persists samples independently of browsers
 // and returns bounded, time-bucketed points for long-range queries.
 type SystemMetricsHistory struct {
-	Scope                 string              `json:"scope"`
-	NodeID                string              `json:"node_id,omitempty"`
-	RangeSeconds          int                 `json:"range_seconds"`
-	SampleIntervalSeconds int                 `json:"sample_interval_seconds"`
-	SampledAt             time.Time           `json:"sampled_at"`
-	RetentionSeconds      int                 `json:"retention_seconds"`
-	StorageError          string              `json:"storage_error,omitempty"`
-	Points                []SystemMetricPoint `json:"points"`
+	Scope                 string                  `json:"scope"`
+	NodeID                string                  `json:"node_id,omitempty"`
+	RangeSeconds          int                     `json:"range_seconds"`
+	SampleIntervalSeconds int                     `json:"sample_interval_seconds"`
+	SampledAt             time.Time               `json:"sampled_at"`
+	RetentionSeconds      int                     `json:"retention_seconds"`
+	StorageError          string                  `json:"storage_error,omitempty"`
+	ArchiveReadError      string                  `json:"archive_read_error,omitempty"`
+	ArchiveNodeID         string                  `json:"archive_node_id,omitempty"`
+	ArchiveNodes          []MonitoringArchiveNode `json:"archive_nodes"`
+	Points                []SystemMetricPoint     `json:"points"`
 	// NodePoints preserves the per-node time series alongside the cluster
 	// aggregate. The console uses it to draw separate lines instead of hiding
 	// a slow or busy node inside the cluster average.
@@ -777,6 +790,27 @@ type PortStat struct {
 	Risk    string `json:"risk"`
 }
 
+const (
+	FirewallRuleCounter   = "rule_counter"
+	FirewallPacketCounter = "packet_counter"
+	FirewallPacketSample  = "packet_sample"
+)
+
+// FirewallTraffic records the evidence available at the firewall hook.
+// Origin is omitted when the ingress peer cannot be attributed confidently.
+type FirewallTraffic struct {
+	Evidence string `json:"evidence"`
+	Hook     string `json:"hook,omitempty"`
+	Origin   string `json:"origin,omitempty"`
+	Device   string `json:"device,omitempty"`
+	Bridge   string `json:"bridge,omitempty"`
+	Guest    string `json:"guest,omitempty"`
+	Basis    string `json:"basis,omitempty"`
+	LocalIP  string `json:"local_ip,omitempty"`
+	Protocol string `json:"protocol,omitempty"`
+	Delivery string `json:"delivery,omitempty"`
+}
+
 type InterceptLogEntry struct {
 	Direction    PolicyDirection `json:"direction,omitempty"`
 	SourceIP     string          `json:"source_ip"`
@@ -786,12 +820,14 @@ type InterceptLogEntry struct {
 	SourceCIDR string `json:"source_cidr,omitempty"`
 	// Port is always the packet destination port. For ingress records this is
 	// the local target port; it is never the remote source port.
-	Port        uint16          `json:"port,omitempty"`
-	Reason      string          `json:"reason"`
-	Count       uint64          `json:"count,omitempty"`
-	Drops       uint64          `json:"drops"`
-	Geo         *GeoLocation    `json:"geo,omitempty"`
-	Disposition *LogDisposition `json:"disposition,omitempty"`
+	Port         uint16           `json:"port,omitempty"`
+	Reason       string           `json:"reason"`
+	Count        uint64           `json:"count,omitempty"`
+	Drops        uint64           `json:"drops"`
+	Traffic      *FirewallTraffic `json:"traffic,omitempty"`
+	CounterEpoch string           `json:"-"` // Changes when the kernel counters are recreated.
+	Geo          *GeoLocation     `json:"geo,omitempty"`
+	Disposition  *LogDisposition  `json:"disposition,omitempty"`
 }
 
 type DropLogRecord struct {
@@ -804,12 +840,13 @@ type DropLogRecord struct {
 	SourceCIDR   string          `json:"source_cidr,omitempty"`
 	// Port keeps the packet destination-port semantics of InterceptLogEntry so
 	// older persisted JSON and action APIs remain compatible.
-	Port        uint16          `json:"port,omitempty"`
-	Reason      string          `json:"reason"`
-	Count       uint64          `json:"count,omitempty"`
-	Drops       uint64          `json:"drops"`
-	Geo         *GeoLocation    `json:"geo,omitempty"`
-	Disposition *LogDisposition `json:"disposition,omitempty"`
+	Port        uint16           `json:"port,omitempty"`
+	Reason      string           `json:"reason"`
+	Count       uint64           `json:"count,omitempty"`
+	Drops       uint64           `json:"drops"`
+	Traffic     *FirewallTraffic `json:"traffic,omitempty"`
+	Geo         *GeoLocation     `json:"geo,omitempty"`
+	Disposition *LogDisposition  `json:"disposition,omitempty"`
 }
 
 type DropLogSettings struct {

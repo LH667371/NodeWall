@@ -3,14 +3,18 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"nodewall/internal/models"
+	"nodewall/internal/store"
 	"nodewall/internal/xdp"
 )
 
@@ -35,6 +39,151 @@ func TestHealthEndpoint(t *testing.T) {
 	handler.Routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected status code: %d", rec.Code)
+	}
+}
+
+type bootDataplane struct {
+	*xdp.MockManager
+	attachErrors map[string]error
+	attachCalls  map[string]int
+}
+
+func (m bootDataplane) Attach(iface string, mode xdp.AttachMode) error {
+	if m.attachCalls != nil {
+		m.attachCalls[iface]++
+	}
+	if err := m.attachErrors[iface]; err != nil {
+		return err
+	}
+	return m.MockManager.Attach(iface, mode)
+}
+
+func (m bootDataplane) DiscoverInterfaces() (models.InterfaceInventory, error) {
+	return models.InterfaceInventory{Interfaces: []models.DetectedInterface{
+		{Name: "nw-test0", IsPhysical: true},
+		{Name: "nw-test1", IsPhysical: true},
+	}}, nil
+}
+
+func TestAgentBootKeepsPolicyWhenFirewallCannotAttach(t *testing.T) {
+	state := store.NewFileStateStore(filepath.Join(t.TempDir(), "agent.json"))
+	context := t.Context()
+	desired := models.InterfaceRuntime{
+		Attached: true, AttachMode: "generic", ObserveOnly: true,
+		Allowlist: []string{"192.0.2.0/24"},
+		TemporaryBlocks: []models.TemporaryBlock{
+			{SourceIP: "192.0.2.8", ExpiresAt: time.Now().Add(-time.Minute)},
+		},
+	}
+	if err := state.Save(context, map[string]models.InterfaceRuntime{"nw-test0": desired, "nw-test1": desired}); err != nil {
+		t.Fatal(err)
+	}
+	agent := NewAgentHandler("node-01", bootDataplane{
+		MockManager: xdp.NewMockManager(), attachErrors: map[string]error{"nw-test0": syscall.ENOSYS},
+	}, state, time.Second, nil, nil)
+	if err := agent.LoadState(context); !errors.Is(err, syscall.ENOSYS) {
+		t.Fatalf("boot error = %v", err)
+	}
+	for _, route := range []string{"/health", "/interfaces"} {
+		response := httptest.NewRecorder()
+		agent.Routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, route, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s returned %d", route, response.Code)
+		}
+		if route == "/health" {
+			var health models.HealthStatus
+			err := json.Unmarshal(response.Body.Bytes(), &health)
+			if err != nil || !health.AgentOK || health.Status != "degraded" {
+				t.Fatalf("health: %v %s", err, response.Body)
+			}
+			for _, item := range health.Interfaces {
+				if item.Interface == "nw-test0" && (item.XDPAttached || !strings.Contains(item.LastError, syscall.ENOSYS.Error())) {
+					t.Fatalf("failed interface health: %+v", item)
+				}
+			}
+		} else {
+			var inventory models.InterfaceInventory
+			if err := json.Unmarshal(response.Body.Bytes(), &inventory); err != nil || len(inventory.Interfaces) != 2 ||
+				inventory.Interfaces[0].Attached || !inventory.Interfaces[1].Attached {
+				t.Fatalf("inventory: %v %s", err, response.Body)
+			}
+		}
+	}
+	onDisk, err := state.Load(context)
+	if err != nil || !onDisk["nw-test0"].Attached {
+		t.Fatalf("saved attachment was lost: %v", err)
+	}
+	restarted := NewAgentHandler("node-01", bootDataplane{MockManager: xdp.NewMockManager()}, state, time.Second, nil, nil)
+	if err := restarted.LoadState(context); err != nil {
+		t.Fatal(err)
+	}
+	if runtime := restarted.ensureRuntime("nw-test0"); !runtime.Attached || len(runtime.Allowlist) != 1 || len(runtime.TemporaryBlocks) != 0 {
+		t.Fatalf("restored interface: %+v", runtime)
+	}
+}
+
+func TestAgentBootRestoresPolicyWhenInterfaceAppears(t *testing.T) {
+	ctx := t.Context()
+	state := store.NewFileStateStore(filepath.Join(t.TempDir(), "agent.json"))
+	saved := models.InterfaceRuntime{
+		Attached: true, AttachMode: "generic", EnforcementConfirmed: true,
+		PublicPorts: []uint16{8080}, DeniedPorts: []uint16{18080},
+	}
+	trial := saved
+	trial.PublicPorts = []uint16{8081}
+	trial.Recovery = map[models.PolicyDirection]models.DirectionRuntime{
+		models.DirectionIngress: directionStateFor(saved, models.DirectionIngress),
+	}
+	if err := state.Save(ctx, map[string]models.InterfaceRuntime{
+		"nw-test0": trial, "nw-test1": saved, "nw-permission": saved, "nw-cancel": saved,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dataplane := bootDataplane{
+		MockManager: xdp.NewMockManager(),
+		attachErrors: map[string]error{
+			"nw-test0": xdp.ErrInterfaceNotPresent, "nw-cancel": xdp.ErrInterfaceNotPresent,
+			"nw-permission": syscall.EPERM,
+		},
+		attachCalls: map[string]int{},
+	}
+	agent := NewAgentHandler("node-01", dataplane, state, time.Second, nil, nil)
+	if err := agent.LoadState(ctx); !errors.Is(err, xdp.ErrInterfaceNotPresent) || !errors.Is(err, syscall.EPERM) {
+		t.Fatalf("boot errors: %v", err)
+	}
+	if !agent.retryBootInterfaces(ctx) || !errors.Is(agent.interfaceRestoreError("nw-test0"), xdp.ErrInterfaceNotPresent) {
+		t.Fatal("an absent interface must stay pending")
+	}
+	response := httptest.NewRecorder()
+	agent.Routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/interfaces/nw-cancel/detach", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("detach pending interface: %d %s", response.Code, response.Body)
+	}
+	clear(dataplane.attachErrors)
+	if agent.retryBootInterfaces(ctx) {
+		t.Fatal("recovery kept retrying after the interface was restored")
+	}
+	if got := dataplane.attachCalls; got["nw-test0"] != 3 || got["nw-test1"] != 1 || got["nw-permission"] != 1 || got["nw-cancel"] != 2 {
+		t.Fatalf("attach attempts: %v", got)
+	}
+	if err := agent.interfaceRestoreError("nw-test0"); err != nil {
+		t.Fatalf("restored interface is still degraded: %v", err)
+	}
+	if err := agent.interfaceRestoreError("nw-permission"); !errors.Is(err, syscall.EPERM) {
+		t.Fatalf("permission failure was lost: %v", err)
+	}
+	config, err := dataplane.ReadConfig("nw-test0")
+	if err != nil || !config.PolicyEnforced || config.ObserveOnly {
+		t.Fatalf("restored enforcement: %+v (%v)", config, err)
+	}
+	public, err := dataplane.ListPublicPortRules("nw-test0")
+	ports := models.CollapsePortRules(public)
+	if err != nil || len(ports) != 1 || ports[0] != 8080 {
+		t.Fatalf("restored the wrong policy after an interrupted trial: %v (%v)", public, err)
+	}
+	onDisk, err := state.Load(ctx)
+	if err != nil || onDisk["nw-cancel"].Attached || !onDisk["nw-test0"].Attached || len(onDisk["nw-test0"].Recovery) != 0 {
+		t.Fatalf("wrong persisted recovery state: %+v (%v)", onDisk, err)
 	}
 }
 

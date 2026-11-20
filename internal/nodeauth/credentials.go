@@ -33,6 +33,13 @@ type Credential struct {
 	AgentURL    string `json:"agent_url"`
 	Token       string `json:"token"`
 	Certificate string `json:"certificate"`
+	Standby     *bool  `json:"standby,omitempty"`
+}
+
+// CanSyncStandby preserves the trust of nodes enrolled before standby access
+// was explicit. New enrollments always persist the administrator's choice.
+func (c Credential) CanSyncStandby() bool {
+	return c.Standby == nil || *c.Standby
 }
 
 type Registry struct {
@@ -41,8 +48,8 @@ type Registry struct {
 	nodes map[string]Credential
 }
 
-// ExportJSON returns all enrolled node credentials for a standby manager
-// snapshot. The endpoint exposing this data must require node authentication.
+// ExportJSON returns all enrolled node credentials for a trusted standby
+// manager. Node authentication alone does not authorize this snapshot.
 func (r *Registry) ExportJSON() ([]byte, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -231,6 +238,16 @@ func Open(path string) (*Registry, error) {
 }
 
 func (r *Registry) Put(c Credential) error {
+	return r.put(c, false)
+}
+
+// Refresh updates a node's endpoint with its current token. A stale heartbeat
+// cannot restore a revoked credential or undo a change to standby access.
+func (r *Registry) Refresh(c Credential) error {
+	return r.put(c, true)
+}
+
+func (r *Registry) put(c Credential, refresh bool) error {
 	if strings.TrimSpace(c.NodeID) == "" || len(c.Token) < 32 {
 		return errors.New("node ID and a strong node token are required")
 	}
@@ -263,12 +280,18 @@ func (r *Registry) Put(c Credential) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	previous, existed := r.nodes[c.NodeID]
+	if refresh {
+		if !existed || !EqualToken(c.Token, previous.Token) {
+			return errors.New("node credential is no longer current")
+		}
+		c.Standby = previous.Standby
+	}
 	for id, other := range r.nodes {
 		if id != c.NodeID && other.AgentURL == c.AgentURL {
 			return errors.New("agent endpoint already belongs to another node")
 		}
 	}
-	previous, existed := r.nodes[c.NodeID]
 	r.nodes[c.NodeID] = c
 	if r.path != "" {
 		data, err := json.MarshalIndent(r.nodes, "", "  ")
@@ -357,8 +380,16 @@ func Bearer(header string) string {
 }
 
 func (r *Registry) Authenticate(nodeID, token string) bool {
+	_, ok := r.AuthenticatedCredential(nodeID, token)
+	return ok
+}
+
+func (r *Registry) AuthenticatedCredential(nodeID, token string) (Credential, bool) {
 	c, ok := r.Get(nodeID)
-	return ok && EqualToken(token, c.Token)
+	if !ok || !EqualToken(token, c.Token) {
+		return Credential{}, false
+	}
+	return c, true
 }
 
 func RequireToken(token string, next http.Handler) http.Handler {

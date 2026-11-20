@@ -108,7 +108,12 @@ func (s *Store) FinishPolicyUpdate(_ context.Context, nodeID, iface string, rest
 		if recovery.Previous == nil {
 			delete(s.policies, key)
 		} else {
-			s.policies[key] = *recovery.Previous
+			previous := *recovery.Previous
+			if !hadCurrent || !current.UpdatedAt.Equal(previous.UpdatedAt) {
+				// Restoring older rule content is a new policy version for Web clients.
+				previous.UpdatedAt = time.Now().UTC()
+			}
+			s.policies[key] = previous
 		}
 	}
 	delete(s.recoveries, key)

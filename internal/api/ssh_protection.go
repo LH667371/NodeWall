@@ -500,6 +500,9 @@ func (h *AgentHandler) hasActiveSSHBlock(sourceIP string) bool {
 }
 
 func (h *AgentHandler) addAutomaticSSHBlock(ctx context.Context, sourceIP string, durationSeconds int) error {
+	h.policyMu.Lock()
+	defer h.policyMu.Unlock()
+
 	iface := h.sshProtectionInterface()
 	if iface == "" {
 		return fmt.Errorf("no attached interface available for SSH protection")

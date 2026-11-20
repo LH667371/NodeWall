@@ -31,12 +31,38 @@ log() {
   printf '[package] %s\n' "$*"
 }
 
-build_web_dist() {
-  if ! command -v npm >/dev/null 2>&1; then
-    echo "[package] error: npm is required to build the web assets" >&2
+has_compatible_web_node() {
+  command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && node -e '
+    const [major, minor] = process.versions.node.split(".").map(Number);
+    const supported = (major === 20 && minor >= 19) ||
+      (major === 22 && minor >= 12) || major > 22;
+    process.exit(supported ? 0 : 1);
+  '
+}
+
+select_web_node() {
+  if ! has_compatible_web_node; then
+    local nvm_script="${NVM_DIR:-${HOME:-}/.nvm}/nvm.sh"
+    if [[ -s "${nvm_script}" ]]; then
+      # Sourcing nvm lets npm and its Vite subprocess use the same Node.
+      set +u
+      if source "${nvm_script}" --no-use; then
+        nvm use --silent "$(<"${ROOT_DIR}/.nvmrc")" >/dev/null 2>&1 || true
+      fi
+      set -u
+    fi
+  fi
+  if ! has_compatible_web_node; then
+    local node_version
+    node_version="$(node --version 2>/dev/null || printf 'not found')"
+    echo "[package] error: web builds require npm and Node.js ^20.19.0 or >=22.12.0 (found ${node_version})" >&2
+    echo "[package] run 'nvm install' from the repository root or put a compatible Node.js and npm on PATH" >&2
     exit 1
   fi
+  log "using Node.js $(node --version) for the web build"
+}
 
+build_web_dist() {
   # Keep packaging a one-command operation while avoiding an unnecessary
   # registry access when the locked dependencies are already installed.
   if [[ ! -x "${ROOT_DIR}/web/node_modules/.bin/vite" ]]; then
@@ -94,7 +120,13 @@ package_target() {
   find "${stage_dir}" -name '._*' -delete
 
   log "packing ${archive_path}"
-  tar --format ustar -C "${DIST_DIR}" -czf "${archive_path}" "${package_name}"
+  if [[ "${PACKAGE_CONTENT}" == "offline" ]]; then
+    # Most of the offline payload is already compressed (CVDs, engines,
+    # and corresponding source). A lower gzip level avoids re-compressing it.
+    tar --format ustar -C "${DIST_DIR}" -cf - "${package_name}" | gzip -1 > "${archive_path}"
+  else
+    tar --format ustar -C "${DIST_DIR}" -czf "${archive_path}" "${package_name}"
+  fi
 }
 
 case "${PACKAGE_FORMAT}" in
@@ -110,6 +142,7 @@ esac
   echo "[package] error: missing bpf/gen/xdpacl_bpfel.o; run 'make generate' first" >&2
   exit 1
 }
+select_web_node
 mkdir -p "${DIST_DIR}"
 if [[ "${PACKAGE_FORMAT}" == "archive" && "${PACKAGE_CONTENT}" == "offline" ]]; then
   clamav_stage="$(mktemp -d "${DIST_DIR}/.clamav.XXXXXX")"

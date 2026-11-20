@@ -141,7 +141,8 @@ func (m *Manager) ReadDirectionDropLogs(ifaceName string, direction models.Polic
 	}
 	logMap := state.collection.Maps["egress_drop_logs"]
 	if logMap == nil {
-		return nil, fmt.Errorf("egress_drop_logs not loaded")
+		// Older BPF objects may provide only ingress logs.
+		return nil, errNotAttached
 	}
 	var (
 		key   dropLogKey

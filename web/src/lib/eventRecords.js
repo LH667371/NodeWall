@@ -1,5 +1,5 @@
 import { firewallEventID, scanEventID, sshEventID } from "./eventIds";
-import { firewallSourceLabel } from "./firewallLogs";
+import { firewallSourceLabel, firewallTrafficLabels, isFirewallRuleCounter } from "./firewallLogs";
 
 // The table, overview feed, and notification badge use the same cluster event
 // snapshot. Never infer provenance from the security page's selected node.
@@ -11,12 +11,20 @@ export function buildEventRecords(snapshot, { t = (key) => key, formatLogReason 
     const node = item.node_id;
     const id = firewallEventID(item, index, node);
     const port = Number(item.port || 0);
+    const reason = String(item.reason || "").replace(/^nodewall:/, "");
+    const counter = isFirewallRuleCounter(item);
+    const discovery = reason === "default_deny" && item.traffic?.evidence === "packet_sample" && item.traffic.hook === "input"
+      && ["broadcast", "multicast"].includes(item.traffic.delivery);
+    const informational = (counter && (reason === "default_deny" || reason === "iptables_drop")) || discovery;
+    const protocol = String(item.traffic?.protocol || "").toUpperCase();
     rows.push({
-      id, node, time: item.timestamp, sourceKey: "firewall", module: t("securityOverviewFirewall"), type: t("securityOverviewFirewallEvent"),
-      severity: hits >= 100 || ["blocked_source", "denied_port"].includes(String(item.reason).replace(/^nodewall:/, "")) ? "high" : item.reason === "dhcp_broadcast" ? "low" : "medium",
-      description: `${formatLogReason(item.reason)} · ${hits} ${t("hitCount")}${port > 0 ? ` · ${t("targetPort")} ${port}` : ""}`,
+      id, node, time: item.timestamp, sourceKey: "firewall", module: t("securityOverviewFirewall"),
+      type: t(counter ? "firewallCounterEvent" : discovery ? "firewallDiscoveryEvent" : "securityOverviewFirewallEvent"),
+      severity: informational ? "info" : hits >= 100 || ["blocked_source", "denied_port"].includes(reason) ? "high" : reason === "dhcp_broadcast" ? "low" : "medium",
+      description: `${formatLogReason(item.reason)} · ${hits} ${t(item.traffic?.evidence === "packet_sample" ? "firewallSampledPackets" : "hitCount")}${port > 0 ? ` · ${t("targetPort")} ${port}` : ""}${protocol ? ` · ${protocol}` : ""}`,
       source: firewallSourceLabel(item, t),
-      status: statusFor(id, node, "pending"), raw: item,
+      traffic: firewallTrafficLabels(item, t),
+      status: informational ? "info" : statusFor(id, node, "pending"), raw: item,
     });
   }
   for (const entry of snapshot?.nodes || []) {

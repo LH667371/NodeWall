@@ -18,7 +18,7 @@ type bridgeScopeValue struct {
 }
 
 func discoverBridgeScope(name string, index int) (bridgeScopeValue, error) {
-	return discoverBridgeScopeAt("/sys/class/net", name, index, net.InterfaceByName)
+	return discoverBridgeScopeAt("/sys/class/net", name, index, lookupInterface)
 }
 
 func discoverBridgeScopeAt(root, name string, index int, lookup func(string) (*net.Interface, error)) (bridgeScopeValue, error) {

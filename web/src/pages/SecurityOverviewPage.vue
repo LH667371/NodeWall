@@ -134,7 +134,7 @@ const resourceSummary = computed(() => {
 const events = computed(() => {
   const cutoff = Date.now() - (eventWindow.value === "7d" ? 7 : 1) * 86400000;
   return props.store.eventRows
-    .filter((item) => item.node === state.nodeId && (eventFilter.value === "all" || item.sourceKey === eventFilter.value) && Date.parse(item.time) >= cutoff)
+    .filter((item) => item.status !== "info" && item.node === state.nodeId && (eventFilter.value === "all" || item.sourceKey === eventFilter.value) && Date.parse(item.time) >= cutoff)
     .slice(0, 6);
 });
 </script>

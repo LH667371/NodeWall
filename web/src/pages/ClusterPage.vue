@@ -3,7 +3,10 @@ import { computed, ref, watch } from "vue";
 import { Check, Copy, FileText, Pencil, RefreshCw, Server, ShieldCheck, SquareTerminal, Trash2, X } from "@lucide/vue";
 import { useI18n } from "@/lib/i18n";
 import { request } from "@/lib/api";
+import FirewallBackendBadge from "@/components/FirewallBackendBadge.vue";
+import InfoTip from "@/components/InfoTip.vue";
 import TablePagination from "@/components/TablePagination.vue";
+import { nodeFirewallBackends } from "@/lib/firewallBackend";
 import { formatDateTime } from "@/lib/time";
 
 const props = defineProps({
@@ -44,6 +47,7 @@ const enrollment = ref(null);
 const enrollmentOpen = ref(false);
 const enrollmentLoading = ref(false);
 const enrollmentError = ref("");
+const enrollmentStandby = ref(false);
 const joinBase = computed(() => enrollment.value?.url || "");
 const quickCommand = computed(() => {
   if (!enrollment.value) return "";
@@ -52,10 +56,14 @@ const quickCommand = computed(() => {
 });
 
 async function loadEnrollment() {
+  enrollment.value = null;
   enrollmentLoading.value = true;
   enrollmentError.value = "";
   try {
-    enrollment.value = await request("/nodes/enrollment", { method: "POST" });
+    enrollment.value = await request("/nodes/enrollment", {
+      method: "POST",
+      body: JSON.stringify({ standby: enrollmentStandby.value }),
+    });
     return enrollment.value;
   } catch (error) {
     enrollmentError.value = t("clusterEnrollmentError");
@@ -164,7 +172,7 @@ function renameNode(item) {
 
 <template>
   <section class="page-grid cluster-page">
-    <article v-if="props.store.state.authRole !== 'viewer' && enrollmentOpen" class="panel panel-span-12 cluster-enrollment-panel cluster-enrollment-drawer">
+    <article v-if="props.store.state.authRole === 'admin' && enrollmentOpen" class="panel panel-span-12 cluster-enrollment-panel cluster-enrollment-drawer">
       <div class="cluster-enrollment-head">
         <div>
           <p>{{ t("clusterEnrollmentEyebrow") }}</p>
@@ -181,6 +189,10 @@ function renameNode(item) {
         <div class="cluster-enrollment-copy">
           <div class="cluster-enrollment-step"><b>1</b><span>{{ t("clusterEnrollmentStepOne") }}</span></div>
           <div class="cluster-enrollment-step"><b>2</b><span>{{ t("clusterEnrollmentStepTwo") }}</span></div>
+          <label class="cluster-enrollment-step">
+            <input v-model="enrollmentStandby" type="checkbox" :disabled="enrollmentLoading" @change="ensureEnrollment" />
+            <span>{{ t("clusterEnrollmentStandby") }}</span>
+          </label>
           <div class="cluster-enrollment-links">
             <span>{{ t("clusterJoinCommand") }}</span>
             <a v-if="joinBase" class="text-link" :href="joinBase" target="_blank" rel="noreferrer">
@@ -217,7 +229,7 @@ function renameNode(item) {
         </div>
         <div class="panel-actions">
           <span class="cluster-management-count">{{ t("clusterNodeSummary", { count: rows.length }) }}</span>
-          <button v-if="props.store.state.authRole !== 'viewer'" class="primary-button compact-button" type="button" @click="openEnrollment().catch(props.store.handleError)">{{ t("clusterAddNode") }}</button>
+          <button v-if="props.store.state.authRole === 'admin'" class="primary-button compact-button" type="button" @click="openEnrollment().catch(props.store.handleError)">{{ t("clusterAddNode") }}</button>
         </div>
       </div>
       <div class="cluster-summary-strip">
@@ -266,6 +278,7 @@ function renameNode(item) {
             <col class="cluster-col-address" />
             <col class="cluster-col-agent-status" />
             <col class="cluster-col-protection" />
+            <col class="cluster-col-backend" />
             <col class="cluster-col-actions" />
           </colgroup>
           <thead>
@@ -274,6 +287,11 @@ function renameNode(item) {
               <th>{{ t("clusterAdvertiseIP") }}</th>
               <th>{{ t("clusterAgentStatus") }}</th>
               <th>{{ t("clusterProtectionStatus") }}</th>
+              <th>
+                <div class="table-heading-with-tip">
+                  {{ t("firewallBackend") }} <InfoTip :text="t('firewallBackendHelp')" />
+                </div>
+              </th>
               <th>{{ t("policyTableActions") }}</th>
             </tr>
           </thead>
@@ -309,6 +327,14 @@ function renameNode(item) {
                 </div>
               </td>
               <td>
+                <div class="cluster-backends">
+                  <div v-for="backend in nodeFirewallBackends(protectionByNode[item.id])" :key="backend.mode" class="cluster-backend">
+                    <FirewallBackendBadge :mode="backend.mode" />
+                    <small v-if="backend.interfaces.length" :title="backend.interfaces.join(', ')">{{ backend.interfaces.join(", ") }}</small>
+                  </div>
+                </div>
+              </td>
+              <td>
                 <div class="inline-actions">
                   <button class="icon-button table-action-button" :title="t('clusterRename')" :aria-label="t('clusterRename')" @click.stop="renameNode(item)"><Pencil :size="18" stroke-width="1.8" aria-hidden="true" /></button>
                   <button class="icon-button table-action-button accent" :title="t('clusterUpdate')" :aria-label="t('clusterUpdate')" @click.stop="updateNode(item).catch(props.store.handleError)"><RefreshCw :size="18" stroke-width="1.8" aria-hidden="true" /></button>
@@ -318,7 +344,7 @@ function renameNode(item) {
               </td>
             </tr>
             <tr v-if="!visibleRows.length">
-              <td colspan="5" class="table-empty">{{ rows.length ? t("clusterNoMatches") : t("noData") }}</td>
+              <td colspan="6" class="table-empty">{{ rows.length ? t("clusterNoMatches") : t("noData") }}</td>
             </tr>
           </tbody>
         </table>
@@ -327,3 +353,24 @@ function renameNode(item) {
     </article>
   </section>
 </template>
+
+<style scoped>
+.cluster-backends,
+.cluster-backend {
+  display: grid;
+  min-width: 0;
+  justify-items: start;
+}
+
+.cluster-backends { gap: 6px; }
+.cluster-backend { gap: 2px; }
+
+.cluster-backend small {
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+</style>

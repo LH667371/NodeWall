@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -72,6 +74,12 @@ func (r *fakeIPTablesRunner) Run(args ...string) (string, error) {
 			r.rules[chain] = nil
 		case "-A":
 			r.rules[chain] = append(r.rules[chain], append([]string(nil), args[4:]...))
+		case "-I":
+			position, err := strconv.Atoi(args[4])
+			if err != nil || position < 1 || position > len(r.rules[chain])+1 {
+				return "", fmt.Errorf("invalid rule position")
+			}
+			r.rules[chain] = slices.Insert(r.rules[chain], position-1, append([]string(nil), args[5:]...))
 		case "-S":
 			if rules, ok := r.rules[chain]; ok {
 				lines := []string{"-N " + args[3]}
@@ -236,22 +244,62 @@ func TestIPTablesEgressStatsAndLogsAreReadable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read egress stats: %v", err)
 	}
-	if stats.Direction != models.DirectionEgress || stats.Dropped != 5 || stats.Passed != 2 {
+	if stats.Direction != models.DirectionEgress || stats.Dropped != 0 || stats.Passed != 7 {
 		t.Fatalf("unexpected egress stats: %#v", stats)
 	}
 	logs, err := manager.ReadDirectionDropLogs("em1", models.DirectionEgress, 10)
 	if err != nil {
 		t.Fatalf("read egress logs: %v", err)
 	}
-	if len(logs) != 1 || logs[0].Direction != models.DirectionEgress || logs[0].SourceIP != "198.51.100.8" || logs[0].Port != 443 {
+	if len(logs) != 1 || logs[0].Direction != models.DirectionEgress || logs[0].SourceIP != "198.51.100.8" || logs[0].Port != 443 || logs[0].Drops != 0 || logs[0].Count != 5 {
 		t.Fatalf("unexpected egress logs: %#v", logs)
 	}
 	sources, err := manager.ReadDirectionSourceStats("em1", models.DirectionEgress, 10)
 	if err != nil {
 		t.Fatalf("read egress sources: %v", err)
 	}
-	if len(sources) != 2 || sources[0].SourceIP != "198.51.100.8" || sources[0].Dropped != 5 {
+	if len(sources) != 2 || sources[0].SourceIP != "198.51.100.8" || sources[0].Dropped != 0 || sources[0].Passed != 5 {
 		t.Fatalf("unexpected egress sources: %#v", sources)
+	}
+	ports, err := manager.ReadDirectionPortStats("em1", models.DirectionEgress, 10)
+	if err != nil || len(ports) != 1 || ports[0].Passed != 7 || ports[0].Dropped != 0 {
+		t.Fatalf("observed packets must be counted as passed: %+v %v", ports, err)
+	}
+}
+
+func TestIPTablesAuditIsOptionalAndDoesNotAddToVerdictCounts(t *testing.T) {
+	for _, unavailable := range []bool{false, true} {
+		runner := &fakeIPTablesRunner{errors: make(map[string]error)}
+		audit := "-t filter -I NWRAW_EM1 4 " + strings.Join(defaultDenyAuditRule("em1", models.DirectionIngress, false), " ")
+		if unavailable {
+			runner.errors[audit] = errors.New("NFLOG unavailable")
+		}
+		manager := newIPTablesManager(runner, nil)
+		manager.packetAudit = true
+		policy := DirectionPolicy{Allowlist: []string{"192.0.2.1/32"}, PolicyEnforced: true}
+		if err := manager.replaceDirectionChain(iptablesTable, "NWRAW_EM1", "em1", policy, "-s"); err != nil {
+			t.Fatal(err)
+		}
+		commands := commandLog(runner.calls)
+		if a, d := strings.Index(commands, audit), strings.Index(commands, "nodewall:default_deny -j DROP"); d < 0 || a <= d {
+			t.Fatalf("audit must be installed after the verdict exists:\n%s", commands)
+		}
+		if manager.packetAudit == unavailable {
+			t.Fatal("optional audit did not fall back when its target was unavailable")
+		}
+		rules, err := runner.Run("-t", iptablesTable, "-S", "NWRAW_EM1")
+		if err != nil || (!unavailable && strings.Index(rules, "-j NFLOG") >= strings.Index(rules, "-j DROP")) {
+			t.Fatalf("audit must execute before the verdict: %v\n%s", err, rules)
+		}
+	}
+	input := "5 400 NFLOG tcp -- * * 192.0.2.1 0.0.0.0/0 tcp dpt:443\n" +
+		"6 480 DROP tcp -- * * 192.0.2.1 0.0.0.0/0 tcp dpt:443 /* nodewall:default_deny */\n"
+	counters := parseIPTablesListCounters(input)
+	if stats := statsFromCounters(counters, models.DirectionIngress); stats.Passed != 0 || stats.Dropped != 6 {
+		t.Fatalf("counted sampled packets twice: %+v", stats)
+	}
+	if logs := dropLogsFromCounters(counters, models.DirectionIngress, 10); len(logs) != 1 || logs[0].Drops != 6 || logs[0].Traffic.Evidence != models.FirewallRuleCounter {
+		t.Fatalf("counter rows lost their evidence: %+v", logs)
 	}
 }
 
@@ -369,7 +417,7 @@ func TestIPTablesCompileFailureLeavesFailOpenChain(t *testing.T) {
 	if err := manager.Attach("em1", AttachModeIPTables); err != nil {
 		t.Fatalf("attach legacy dataplane: %v", err)
 	}
-	err := manager.replaceDirectionChain(iptablesTable, iptablesChainName("em1"), DirectionPolicy{
+	err := manager.replaceDirectionChain(iptablesTable, iptablesChainName("em1"), "em1", DirectionPolicy{
 		DeniedPortRules: []models.PortRule{{Protocol: models.PortProtocol("sctp"), Port: 443}},
 		PolicyEnforced:  true,
 	}, "-s")
@@ -387,7 +435,7 @@ func TestIPTablesReplyStateComesAfterRevocationsAndBeforeDefaultDeny(t *testing.
 		t.Run(direction, func(t *testing.T) {
 			runner := &fakeIPTablesRunner{}
 			manager := newIPTablesManager(runner, nil)
-			if err := manager.replaceDirectionChain(iptablesTable, "NWRAW_TEST", DirectionPolicy{
+			if err := manager.replaceDirectionChain(iptablesTable, "NWRAW_TEST", "test", DirectionPolicy{
 				BlockedCIDRs:    []string{"192.0.2.1/32"},
 				DeniedPortRules: []models.PortRule{{Protocol: models.PortProtocolTCP, Port: 443}},
 				Allowlist:       []string{"198.51.100.0/24"},
@@ -455,7 +503,7 @@ func TestIPTablesMissingConntrackFailsOpen(t *testing.T) {
 		"-t filter -A NWRAW_TEST -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment nodewall:reply_flow -j RETURN": fmt.Errorf("conntrack match unavailable"),
 	}}
 	manager := newIPTablesManager(runner, nil)
-	if err := manager.replaceDirectionChain(iptablesTable, "NWRAW_TEST", DirectionPolicy{PolicyEnforced: true, Allowlist: []string{"192.0.2.1/32"}}, "-s"); err == nil {
+	if err := manager.replaceDirectionChain(iptablesTable, "NWRAW_TEST", "test", DirectionPolicy{PolicyEnforced: true, Allowlist: []string{"192.0.2.1/32"}}, "-s"); err == nil {
 		t.Fatal("missing conntrack must prevent enabling stateless enforcement")
 	}
 	joined := commandLog(runner.calls)

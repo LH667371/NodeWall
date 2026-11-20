@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,6 +17,8 @@ import (
 	"nodewall/internal/securestore"
 	"nodewall/internal/transporttls"
 )
+
+var errStandbyAccessDenied = errors.New("standby access denied")
 
 // promoteAgentToStandby upgrades an older agent-only enrollment in place. The
 // first enrollment script already performs this work for new nodes; keeping
@@ -65,6 +68,9 @@ func promoteAgentToStandby(envPath, configDir string) (bool, error) {
 			return nil, err
 		}
 		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusForbidden {
+			return nil, errStandbyAccessDenied
+		}
 		if resp.StatusCode >= 300 {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 			return nil, fmt.Errorf("standby bootstrap %s failed: %s: %s", kind, resp.Status, strings.TrimSpace(string(body)))
@@ -72,6 +78,9 @@ func promoteAgentToStandby(envPath, configDir string) (bool, error) {
 		return io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	}
 	state, err := get("state")
+	if errors.Is(err, errStandbyAccessDenied) {
+		return false, nil // Ordinary agents stay in agent-only mode.
+	}
 	if err != nil {
 		return false, err
 	}

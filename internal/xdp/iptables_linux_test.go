@@ -4,6 +4,7 @@ package xdp
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -48,8 +49,15 @@ func TestIPTablesHostConnections(t *testing.T) {
 
 	runNetworkCommand(t, "ip", "link", "set", "lo", "up")
 	runNetworkCommand(t, "ip", "link", "add", "nwhost", "type", "veth", "peer", "name", "nwpeer")
-	runNetworkCommand(t, "ip", "addr", "add", "192.0.2.1/30", "dev", "nwhost")
+	runNetworkCommand(t, "ip", "addr", "add", "192.0.2.1/30", "broadcast", "+", "dev", "nwhost")
 	runNetworkCommand(t, "ip", "link", "set", "nwhost", "up")
+	hostLink, err := net.InterfaceByName("nwhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !readAuditBroadcasts()[auditBroadcastKey{hostLink.Index, "192.0.2.3"}] {
+		t.Fatal("configured IPv4 broadcast is missing from kernel topology")
+	}
 	peer := iptablesTestProcess("peer")
 	input, err := peer.StdinPipe()
 	if err != nil {
@@ -106,6 +114,20 @@ func TestIPTablesHostConnections(t *testing.T) {
 		runNetworkCommand(t, "iptables", "-t", item.table, "-I", item.parent, "1", item.flag, "nwhost", "-j", item.chain)
 	}
 	manager := newIPTablesManager(execIPTablesRunner{path: "iptables"}, nil)
+	var samples chan models.DropLogRecord
+	if os.Getenv("NODEWALL_NFLOG_TEST") == "1" {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		samples = make(chan models.DropLogRecord, 128)
+		if err := manager.StartPacketAudit(ctx, func(record models.DropLogRecord) {
+			select {
+			case samples <- record:
+			default:
+			}
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := manager.Attach("nwhost", AttachModeIPTables); err != nil {
 		t.Fatal(err)
 	}
@@ -237,6 +259,43 @@ func TestIPTablesHostConnections(t *testing.T) {
 	}
 	if err := callPeer(18082); err != nil {
 		t.Fatalf("observe mode blocked inbound traffic: %v", err)
+	}
+	for _, direction := range []models.PolicyDirection{models.DirectionIngress, models.DirectionEgress} {
+		logs, err := manager.ReadDirectionDropLogs("nwhost", direction, 20)
+		if err != nil || len(logs) != 1 || logs[0].Count == 0 || logs[0].Drops != 0 || logs[0].Traffic.Evidence != models.FirewallRuleCounter {
+			t.Fatalf("incorrect observe-only %s rule count: %+v (%v)", direction, logs, err)
+		}
+		stats, err := manager.ReadDirectionStats("nwhost", direction)
+		if err != nil || stats.Dropped != 0 || stats.Passed < logs[0].Count {
+			t.Fatalf("observe-only %s traffic was counted as drops: %+v (%v)", direction, stats, err)
+		}
+	}
+	if samples != nil {
+		type verdict struct {
+			direction models.PolicyDirection
+			dropped   bool
+		}
+		seen := map[verdict]bool{}
+		deadline := time.After(2 * time.Second)
+		for len(seen) < 4 {
+			select {
+			case sample := <-samples:
+				if sample.SourceIP == "192.0.2.2" && sample.Port == 18082 && sample.Count == 1 && sample.Traffic.Evidence == models.FirewallPacketSample {
+					switch sample.Direction {
+					case models.DirectionIngress:
+						if sample.Traffic.Hook == "input" && sample.Traffic.Origin == "veth" {
+							seen[verdict{sample.Direction, sample.Drops == 1}] = true
+						}
+					case models.DirectionEgress:
+						if sample.Traffic.Hook == "output" && sample.Traffic.Origin == "host" {
+							seen[verdict{sample.Direction, sample.Drops == 1}] = true
+						}
+					}
+				}
+			case <-deadline:
+				t.Fatalf("missing ingress or egress drop/observe packet audit: %+v", seen)
+			}
+		}
 	}
 	for range 2 {
 		if err := manager.Detach("nwhost"); err != nil {

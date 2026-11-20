@@ -266,10 +266,13 @@ func (s *Server) Report(ctx context.Context, req *ReportRequest) (*ReportRespons
 	if s.credentials != nil {
 		md, _ := metadata.FromIncomingContext(ctx)
 		values := md.Get("authorization")
-		if len(values) != 1 || !s.credentials.Authenticate(req.NodeID, nodeauth.Bearer(values[0])) {
+		if len(values) != 1 {
 			return nil, status.Error(codes.Unauthenticated, "node enrollment required")
 		}
-		credential, _ := s.credentials.Get(req.NodeID)
+		credential, ok := s.credentials.AuthenticatedCredential(req.NodeID, nodeauth.Bearer(values[0]))
+		if !ok {
+			return nil, status.Error(codes.Unauthenticated, "node enrollment required")
+		}
 		origin, err := nodeauth.Origin(req.AgentURL)
 		if err != nil {
 			return nil, status.Error(codes.PermissionDenied, "invalid agent endpoint")
@@ -284,10 +287,9 @@ func (s *Server) Report(ctx context.Context, req *ReportRequest) (*ReportRespons
 			next := credential
 			next.AgentURL = origin
 			next.Certificate = certificate
-			if err := s.credentials.Put(next); err != nil {
+			if err := s.credentials.Refresh(next); err != nil {
 				return nil, status.Error(codes.PermissionDenied, "refresh agent credential: "+err.Error())
 			}
-			credential = next
 		}
 	}
 	if strings.TrimSpace(req.NodeID) == "" {
@@ -341,14 +343,21 @@ func (s *Server) Report(ctx context.Context, req *ReportRequest) (*ReportRespons
 		LastSeenAt:     time.Now().UTC(),
 	}
 	if s.credentials != nil {
-		credential, _ := s.credentials.Get(req.NodeID)
+		credential, ok := s.credentials.Get(req.NodeID)
+		if !ok {
+			return nil, status.Error(codes.Unauthenticated, "node credential is no longer current")
+		}
 		endpoint, _ := url.Parse(credential.AgentURL)
 		node.AgentURL = credential.AgentURL
 		node.AgentHTTPAddr = endpoint.Host
 		// Keep the browser-facing manager address useful even when an all-in-one
 		// agent reports over loopback. The peer address is the best available
 		// external host in that case.
-		node.ServerHTTPAddr = normalizeReportedHTTPAddr(serverHTTPAddr, advertiseIP)
+		if credential.CanSyncStandby() {
+			node.ServerHTTPAddr = normalizeReportedHTTPAddr(serverHTTPAddr, advertiseIP)
+		} else {
+			node.ServerHTTPAddr = ""
+		}
 		// The manager's own AgentURL intentionally stays on loopback so its
 		// reverse proxy uses the local agent. Keep the externally useful
 		// advertise address from the peer report in that all-in-one case.

@@ -126,6 +126,12 @@ onBeforeUnmount(clearHideTimer);
 </template>
 
 <style scoped>
+.info-tip:focus-visible {
+  border-radius: 4px;
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .info-tip-text {
   display: block;
   min-width: 0;

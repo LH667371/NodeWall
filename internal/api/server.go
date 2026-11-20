@@ -44,7 +44,7 @@ type ServerHandler struct {
 	relayManagerURL          string
 	relayManagerCA           string
 	enrollmentMu             sync.Mutex
-	enrollmentTickets        map[string]time.Time
+	enrollmentTickets        map[string]enrollmentTicket
 	nodeID                   string
 	webDir                   string
 	defaultInterface         string
@@ -66,6 +66,7 @@ type ServerHandler struct {
 	systemMetricsMu          sync.Mutex
 	systemMetricsFetch       sync.Map
 	monitoringSampledAt      time.Time
+	monitoringFirstRound     time.Time
 	monitoringArchiveMu      sync.Mutex
 	monitoringArchiveCache   map[string]cachedMonitoringArchive
 	metricsArchive           *monitoring.History
@@ -242,7 +243,6 @@ func NewServerHandler(cfg config.ServerConfig, svc *service.PolicyService, st *s
 		if err != nil {
 			archiveError = fmt.Sprintf("open monitoring history: %v", err)
 			log.Printf("warning: %s; monitoring continues in memory", archiveError)
-			history = nil
 		}
 	}
 	auth, err := newAuthManager(cfg)
@@ -601,21 +601,21 @@ func (h *ServerHandler) handleVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ServerHandler) handleJoinVersion(w http.ResponseWriter, r *http.Request) {
-	if !h.joinAuthorized(w, r) {
+	if !h.joinDownloadAuthorized(w, r) {
 		return
 	}
 	h.handleVersion(w, r)
 }
 
 func (h *ServerHandler) handleJoinTLSCert(w http.ResponseWriter, r *http.Request) {
-	if !h.joinAuthorized(w, r) {
+	if !h.joinDownloadAuthorized(w, r) {
 		return
 	}
 	if strings.TrimSpace(h.tlsCertFile) == "" {
 		writeError(w, http.StatusNotFound, errors.New("TLS certificate is not configured"))
 		return
 	}
-	certificate, err := os.ReadFile(h.tlsCertFile)
+	certificate, _, err := h.managerEnrollmentCertificate()
 	if err != nil {
 		writeError(w, http.StatusNotFound, errors.New("TLS certificate is not available"))
 		return
@@ -626,20 +626,18 @@ func (h *ServerHandler) handleJoinTLSCert(w http.ResponseWriter, r *http.Request
 }
 
 func (h *ServerHandler) handleJoinScript(w http.ResponseWriter, r *http.Request) {
-	if !h.joinAuthorized(w, r) {
+	proof := r.URL.Query().Get("token")
+	ticket, ok := h.activeEnrollmentTicket(proof)
+	if r.TLS == nil || h.nodeCredentials == nil || !ok {
+		writeError(w, http.StatusUnauthorized, errors.New("active HTTPS enrollment ticket required"))
 		return
 	}
-	ticket := r.URL.Query().Get("token")
-	pin := ""
-	if h.nodeCredentials != nil {
-		var err error
-		pin, err = h.managerCertificatePin()
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
+	certificate, pin, err := h.managerEnrollmentCertificate()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
-	script, err := h.buildJoinScript(r, ticket, pin)
+	script, err := h.buildJoinScript(r, proof, joinCurlSetupScript(certificate, pin), ticket.Standby)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -649,7 +647,7 @@ func (h *ServerHandler) handleJoinScript(w http.ResponseWriter, r *http.Request)
 	_, _ = w.Write([]byte(script))
 }
 
-func (h *ServerHandler) buildJoinScript(r *http.Request, ticket, pin string) (string, error) {
+func (h *ServerHandler) buildJoinScript(r *http.Request, ticket, tlsSetup string, standby bool) (string, error) {
 	baseURL := requestBaseURL(r, h.auth.trustProxyHeaders)
 	publicKey, err := h.sshConsole.PublicKey()
 	if err != nil {
@@ -688,6 +686,8 @@ func (h *ServerHandler) buildJoinScript(r *http.Request, ticket, pin string) (st
 	// does not prevent a verified Agent from coming online for this boot.
 	script := "#!/usr/bin/env bash\n" +
 		"set -euo pipefail\n" +
+		"INSTALL_STANDBY=" + strconv.FormatBool(standby) + "\n" +
+		"MANAGER_URL=" + shellQuote(baseURL) + "\n" +
 		"progress() { printf '[nodewall] %s\\n' \"$*\" >&2; }\n" +
 		"\n" +
 		"JOIN_IFACE=\"\"\n" +
@@ -771,7 +771,7 @@ func (h *ServerHandler) buildJoinScript(r *http.Request, ticket, pin string) (st
 		"fi\n" +
 		"if [[ \"$SELECTED_BRIDGE\" != \"$JOIN_IFACE\" ]]; then progress \"bridge $SELECTED_BRIDGE -> physical $JOIN_IFACE ($JOIN_IP)\"; else progress \"selected interface $JOIN_IFACE ($JOIN_IP)\"; fi\n" +
 		"\n" +
-		"NODEWALL_SSH_PUBLIC_KEY='" + publicKey + "'\n" +
+		"NODEWALL_SSH_PUBLIC_KEY=" + shellQuote(publicKey) + "\n" +
 		"run_root() { if [[ \"${EUID:-$(id -u)}\" -eq 0 ]]; then \"$@\"; else sudo \"$@\"; fi; }\n" +
 		"\n" +
 		"systemd_online() {\n" +
@@ -798,10 +798,10 @@ func (h *ServerHandler) buildJoinScript(r *http.Request, ticket, pin string) (st
 		"\n" +
 		"JOIN_TMP=$(mktemp -d)\n" +
 		"trap 'rm -f \"$JOIN_TMP/nodewall\" \"$JOIN_TMP/manager.crt\" \"$JOIN_TMP/public.pem\" \"$JOIN_TMP/public.der\" \"$JOIN_TMP/bootstrap-state\" \"$JOIN_TMP/bootstrap-credentials\" \"$JOIN_TMP/bootstrap-auth\" \"$JOIN_TMP/bootstrap-key\"; rmdir \"$JOIN_TMP\"' EXIT\n" +
-		joinCurlSetupScript(baseURL, pin, ticket, binarySHA256) +
-		"if [[ \"${CURL_CERT_MODE:-curl}\" == \"curl\" ]]; then progress 'downloading manager certificate'; curl \"${CURL_ARGS[@]}\" \"" + baseURL + "/join/tls-cert?token=" + url.QueryEscape(ticket) + "\" -o \"$JOIN_TMP/manager.crt\"; fi\n" +
+		tlsSetup +
+		"NODEWALL_BINARY_SHA256=" + shellQuote(binarySHA256) + "\n" +
 		"progress 'downloading NodeWall agent binary'\n" +
-		"curl \"${CURL_ARGS[@]}\" \"" + baseURL + "/join/nodewall?arch=${ARCH}&token=" + url.QueryEscape(ticket) + "\" -o \"$JOIN_TMP/nodewall\"\n" +
+		"join_download \"${MANAGER_URL}/join/nodewall?arch=${ARCH}&token=" + url.QueryEscape(ticket) + "\" \"$JOIN_TMP/nodewall\"\n" +
 		"if [[ -z \"${NODEWALL_BINARY_SHA256:-}\" ]]; then echo '[nodewall] manager did not provide a binary SHA-256' >&2; exit 1; fi\n" +
 		"progress 'verifying NodeWall agent binary'\n" +
 		"printf '%s  %s\\n' \"$NODEWALL_BINARY_SHA256\" \"$JOIN_TMP/nodewall\" | sha256sum -c -\n" +
@@ -811,7 +811,7 @@ func (h *ServerHandler) buildJoinScript(r *http.Request, ticket, pin string) (st
 		"run_root install -m 644 \"$JOIN_TMP/manager.crt\" /etc/nodewall/tls/manager.crt\n" +
 		"INSTALL_SERVICE_ARGS=(--enable-services=false --service-manager=none)\n" +
 		"if [[ \"$SYSTEMD_ONLINE\" == true ]]; then INSTALL_SERVICE_ARGS=(--enable-services=true --service-manager=systemd); elif [[ -d /etc/init.d ]]; then INSTALL_SERVICE_ARGS=(--enable-services=true --service-manager=sysv); fi\n" +
-		"run_root \"$JOIN_TMP/nodewall\" install \"${INSTALL_SERVICE_ARGS[@]}\" --mode agent-only --agent-addr 0.0.0.0:9080 --manager-url \"" + baseURL + "\" --manager-grpc-addr \"" + managerGRPC + "\" --manager-quic-addr \"" + managerQUIC + "\" --advertise-addr \"${JOIN_IP}:9080\" --join-token '" + ticket + "' --manager-ca /etc/nodewall/tls/manager.crt --default-interface \"$JOIN_IFACE\" --console-public-key \"$NODEWALL_SSH_PUBLIC_KEY\"\n" +
+		"run_root \"$JOIN_TMP/nodewall\" install \"${INSTALL_SERVICE_ARGS[@]}\" --mode agent-only --agent-addr 0.0.0.0:9080 --manager-url \"$MANAGER_URL\" --manager-grpc-addr " + shellQuote(managerGRPC) + " --manager-quic-addr " + shellQuote(managerQUIC) + " --advertise-addr \"${JOIN_IP}:9080\" --join-token " + shellQuote(ticket) + " --manager-ca /etc/nodewall/tls/manager.crt --default-interface \"$JOIN_IFACE\" --console-public-key \"$NODEWALL_SSH_PUBLIC_KEY\"\n" +
 		"run_root sed -i '/^NODEWALL_TLS_CA=/d' /etc/nodewall/nodewall.env\n" +
 		"echo 'NODEWALL_TLS_CA=/etc/nodewall/tls/manager.crt' | run_root tee -a /etc/nodewall/nodewall.env >/dev/null\n" +
 		"run_root sed -i '/^NODEWALL_TLS_INSECURE_SKIP_VERIFY=/d' /etc/nodewall/nodewall.env\n" +
@@ -821,11 +821,12 @@ func (h *ServerHandler) buildJoinScript(r *http.Request, ticket, pin string) (st
 		"run_root sed -i \"s/^NODEWALL_AGENT_HTTP_ADDR=.*/NODEWALL_AGENT_HTTP_ADDR=${JOIN_IP}:9080/\" /etc/nodewall/nodewall.env || true\n" +
 		"run_root sed -i '/^NODEWALL_AGENT_URL=/d' /etc/nodewall/nodewall.env || true\n" +
 		"echo \"NODEWALL_AGENT_URL=https://${JOIN_IP}:9080\" | run_root tee -a /etc/nodewall/nodewall.env >/dev/null\n" +
+		"if [[ \"$INSTALL_STANDBY\" == true ]]; then\n" +
 		"progress 'synchronizing standby manager state'\n" +
 		"NODEWALL_JOIN_NODE_ID=\"$(run_root sh -c 'grep ^NODEWALL_NODE_ID= /etc/nodewall/nodewall.env | cut -d= -f2-')\"\n" +
 		"NODEWALL_JOIN_TOKEN=\"$(run_root cat /etc/nodewall/agent-token)\"\n" +
 		"for BOOTSTRAP_KIND in state credentials auth key; do\n" +
-		"  curl \"${CURL_ARGS[@]}\" -H \"X-Nodewall-Node-ID: ${NODEWALL_JOIN_NODE_ID}\" -H \"Authorization: Bearer ${NODEWALL_JOIN_TOKEN}\" \"" + baseURL + "/join/bootstrap/${BOOTSTRAP_KIND}\" -o \"$JOIN_TMP/bootstrap-${BOOTSTRAP_KIND}\"\n" +
+		"  join_download \"${MANAGER_URL}/join/bootstrap/${BOOTSTRAP_KIND}\" \"$JOIN_TMP/bootstrap-${BOOTSTRAP_KIND}\" -H \"X-Nodewall-Node-ID: ${NODEWALL_JOIN_NODE_ID}\" -H \"Authorization: Bearer ${NODEWALL_JOIN_TOKEN}\"\n" +
 		"done\n" +
 		"run_root install -m 600 \"$JOIN_TMP/bootstrap-state\" /etc/nodewall/server-state.json\n" +
 		"run_root install -m 600 \"$JOIN_TMP/bootstrap-credentials\" /etc/nodewall/node-credentials.json\n" +
@@ -851,6 +852,7 @@ func (h *ServerHandler) buildJoinScript(r *http.Request, ticket, pin string) (st
 		"echo 'NODEWALL_WEB_ACCESS=public' | run_root tee -a /etc/nodewall/nodewall.env >/dev/null\n" +
 		"run_root sed -i '/^NODEWALL_AUTH_ENABLED=/d' /etc/nodewall/nodewall.env\n" +
 		"echo 'NODEWALL_AUTH_ENABLED=true' | run_root tee -a /etc/nodewall/nodewall.env >/dev/null\n" +
+		"fi\n" +
 		"run_root install -d -m 755 /etc/systemd/system/nodewall-agent.service.d\n" +
 		"cat <<'NODEWALL_MEMLOCK' | run_root tee /etc/systemd/system/nodewall-agent.service.d/10-memlock.conf >/dev/null\n" +
 		"[Service]\n" +
@@ -894,6 +896,7 @@ func (h *ServerHandler) buildJoinScript(r *http.Request, ticket, pin string) (st
 		"  AGENT_STARTED=true\n" +
 		"fi\n" +
 		"if [[ \"$AGENT_STARTED\" != true ]]; then start_direct_agent; fi\n" +
+		"if [[ \"$INSTALL_STANDBY\" == true ]]; then\n" +
 		"start_direct_server() {\n" +
 		"  progress 'starting NodeWall management server directly'\n" +
 		"  run_root install -d -m 755 /var/run/nodewall /var/log/nodewall\n" +
@@ -915,14 +918,16 @@ func (h *ServerHandler) buildJoinScript(r *http.Request, ticket, pin string) (st
 		"  SERVER_STARTED=true\n" +
 		"fi\n" +
 		"if [[ \"$SERVER_STARTED\" != true ]]; then start_direct_server; fi\n" +
+		"progress 'standby management server started'\n" +
+		"fi\n" +
 		"progress 'ClamAV engine and databases will synchronize automatically from enrolled cluster nodes; check Agent logs for progress'\n" +
-		"progress 'NodeWall agent and management server enrollment completed'\n"
+		"progress 'NodeWall enrollment completed'\n"
 
 	return script, nil
 }
 
 func (h *ServerHandler) handleJoinBinary(w http.ResponseWriter, r *http.Request) {
-	if !h.joinAuthorized(w, r) {
+	if !h.joinDownloadAuthorized(w, r) {
 		return
 	}
 	arch := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("arch")))
@@ -942,12 +947,10 @@ func (h *ServerHandler) handleJoinBinary(w http.ResponseWriter, r *http.Request)
 	http.ServeFile(w, r, resolvedJoinBinaryPath())
 }
 
-// handleJoinBootstrap serves the manager snapshot needed by an enrolled node
-// to run a local standby web console. The node credential is checked by
-// joinAuthorized before any state, credentials, or password hashes leave the
-// active manager.
+// handleJoinBootstrap shares sensitive cluster state only with trusted standby
+// managers authenticated by their enrolled credential over HTTPS.
 func (h *ServerHandler) handleJoinBootstrap(w http.ResponseWriter, r *http.Request) {
-	if !h.joinAuthorized(w, r) {
+	if !h.standbyAuthorized(w, r) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
@@ -962,10 +965,6 @@ func (h *ServerHandler) handleJoinBootstrap(w http.ResponseWriter, r *http.Reque
 		_, _ = w.Write(data)
 	case "credentials":
 		w.Header().Set("Content-Type", "application/json")
-		if h.nodeCredentials == nil {
-			writeError(w, http.StatusServiceUnavailable, errors.New("node credential registry unavailable"))
-			return
-		}
 		data, err := h.nodeCredentials.ExportJSON()
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -1007,6 +1006,8 @@ func (h *ServerHandler) handleJoinBootstrap(w http.ResponseWriter, r *http.Reque
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", "attachment; filename=cluster.key")
 		_, _ = w.Write(data)
+	case "monitoring":
+		h.handleJoinMonitoring(w, r)
 	default:
 		writeError(w, http.StatusNotFound, errors.New("unknown bootstrap resource"))
 	}
@@ -1292,13 +1293,12 @@ func (h *ServerHandler) handleMonitoringHistory(w http.ResponseWriter, r *http.R
 		return
 	}
 	nodeID := strings.TrimSpace(r.URL.Query().Get("node"))
-	if nodeID != "" && h.service != nil {
-		if _, ok := service.FindNode(h.service.ListNodes(r.Context()), nodeID); !ok {
-			writeError(w, http.StatusNotFound, fmt.Errorf("node %q not found", nodeID))
-			return
-		}
+	result := h.monitoringHistorySnapshot(r.Context(), nodeID, from, to, rangeSeconds)
+	if nodeID != "" && h.service != nil && len(result.Nodes) == 0 {
+		writeError(w, http.StatusNotFound, fmt.Errorf("node %q not found in the cluster or monitoring archive", nodeID))
+		return
 	}
-	writeJSON(w, http.StatusOK, h.monitoringHistorySnapshot(r.Context(), nodeID, from, to, rangeSeconds))
+	writeJSON(w, http.StatusOK, result)
 }
 
 func monitoringTimeWindow(r *http.Request, now time.Time) (time.Time, time.Time, int, error) {
@@ -1605,6 +1605,9 @@ func (h *ServerHandler) monitoringHistorySnapshot(ctx context.Context, nodeID st
 		Scope: "cluster", NodeID: nodeID, RangeSeconds: rangeSeconds,
 		SampleIntervalSeconds: int(step / time.Second),
 		RetentionSeconds:      int(systemMetricsHistoryWindow / time.Second),
+		Points:                []models.SystemMetricPoint{},
+		Nodes:                 []models.SystemMetricNodeSummary{},
+		ArchiveNodes:          []models.MonitoringArchiveNode{},
 	}
 	if nodeID != "" {
 		result.Scope = "node"
@@ -1614,33 +1617,45 @@ func (h *ServerHandler) monitoringHistorySnapshot(ctx context.Context, nodeID st
 		return result
 	}
 	nodes := h.service.ListNodes(ctx)
+	archivedNodes, archiveReadErr := h.monitoringArchiveNodes(ctx, nodes)
+	if h.metricsArchive != nil {
+		result.ArchiveNodeID = h.nodeID
+	}
+	for _, source := range archivedNodes {
+		result.ArchiveNodes = append(result.ArchiveNodes, source)
+	}
+	sort.Slice(result.ArchiveNodes, func(i, j int) bool {
+		return result.ArchiveNodes[i].NodeID < result.ArchiveNodes[j].NodeID
+	})
 	if nodeID != "" {
 		nodes = slices.DeleteFunc(nodes, func(node models.Node) bool { return node.ID != nodeID })
+		if source, ok := archivedNodes[nodeID]; len(nodes) == 0 && ok {
+			// Archive-only nodes belong in history, never in the live inventory
+			// or any Agent routing decisions.
+			nodes = append(nodes, models.Node{ID: nodeID, Name: source.Name})
+		}
 	}
 	history, summaries, sampledAt, storageError := h.monitoringLiveSnapshot(nodes, from, to)
 	result.Nodes, result.SampledAt, result.StorageError = summaries, sampledAt, storageError
-	needArchive := rangeSeconds > int(systemMetricsHistoryWindow/time.Second)
+	// A complete live range needs no disk I/O. Any gap can have a sample
+	// stored by the other Web, including points newer than our local round.
+	needArchive := false
+	expectedSamples := int(to.Sub(from) / systemMetricsSampleInterval)
 	for _, current := range history {
-		if len(current) == 0 || current[0].Timestamp.After(from.Add(systemMetricsSampleInterval)) {
+		if len(current) == 0 || len(current) < expectedSamples || current[0].Timestamp.After(from.Add(systemMetricsSampleInterval)) {
 			needArchive = true
 			break
 		}
 	}
 	if needArchive {
-		archiveEnd := to
-		if !sampledAt.IsZero() && sampledAt.Before(archiveEnd) {
-			archiveEnd = sampledAt
+		archived, err := h.monitoringArchivePoints(ctx, nodes, from, to, rangeSeconds)
+		archiveReadErr = errors.Join(archiveReadErr, err)
+		for id, older := range archived {
+			history[id] = mergeMonitoringPoints(older, history[id])
 		}
-		if archiveEnd.After(from) {
-			archived, err := h.monitoringArchivePoints(ctx, nodes, from, archiveEnd, rangeSeconds)
-			if err != nil {
-				result.StorageError = err.Error()
-			} else {
-				for id, older := range archived {
-					history[id] = mergeMonitoringPoints(older, history[id])
-				}
-			}
-		}
+	}
+	if archiveReadErr != nil {
+		result.ArchiveReadError = archiveReadErr.Error()
 	}
 	for id, current := range history {
 		history[id] = resampleMonitoringPoints(current, step)
@@ -1653,7 +1668,9 @@ func (h *ServerHandler) monitoringHistorySnapshot(ctx context.Context, nodeID st
 		}
 	}
 	if nodeID != "" {
-		result.Points = history[nodeID]
+		if current, ok := history[nodeID]; ok {
+			result.Points = current
+		}
 	} else {
 		result.NodePoints = history
 		result.Points = aggregateSystemMetricPoints(history, from.Truncate(step), to)
@@ -2082,62 +2099,25 @@ func (h *ServerHandler) settingsStreamSnapshot(ctx context.Context, nodeID strin
 }
 
 func (h *ServerHandler) protectionStreamSnapshot(ctx context.Context) map[string]any {
-	key := "node-protection"
-	return h.cachedConsoleSnapshot(ctx, key, func(previous cachedPageSnapshot, hadPrevious bool) map[string]any {
-		result := map[string]any{}
-		if h.service == nil {
-			return result
-		}
-		nodes := h.service.ListNodes(ctx)
-		var mu sync.Mutex
-		var workers sync.WaitGroup
-		semaphore := make(chan struct{}, 8)
-		for _, node := range nodes {
-			node := node
-			workers.Go(func() {
-				semaphore <- struct{}{}
-				defer func() { <-semaphore }()
-				status := map[string]any{"node_id": node.ID, "protection_status": "unavailable", "reachable": false}
-				requestCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-				var inventory models.InterfaceInventory
-				var health models.HealthStatus
-				var healthErr error
-				var probes sync.WaitGroup
-				probes.Go(func() {
-					_ = h.nodeJSON(requestCtx, node.ID, http.MethodGet, "/interfaces", nil, &inventory)
-				})
-				probes.Go(func() {
-					healthErr = h.nodeJSON(requestCtx, node.ID, http.MethodGet, "/health", nil, &health)
-				})
-				probes.Wait()
-				iface := clusterFocusInterface(inventory)
-				if iface == "" {
-					iface = healthFocusInterface(health)
-				}
-				if iface != "" {
-					status["interface"] = iface
-				}
-				if healthErr == nil {
-					status["reachable"] = true
-					status["protection_status"] = protectionStatusForInterface(health, iface, true)
-				} else {
-					status["reason"] = healthErr.Error()
-				}
-				status["node_status"] = clusterNodeStatus(node, healthErr == nil)
-				status["checked_at"] = time.Now().UTC()
-				cancel()
-				mu.Lock()
-				result[node.ID] = status
-				mu.Unlock()
-			})
-		}
-		workers.Wait()
-		value := map[string]any{}
-		for key, item := range result {
-			value[key] = item
-		}
-		return value
-	})
+	result := map[string]any{}
+	if h.service == nil {
+		return result
+	}
+	var mu sync.Mutex
+	var workers sync.WaitGroup
+	semaphore := make(chan struct{}, 8)
+	for _, node := range h.service.ListNodes(ctx) {
+		workers.Go(func() {
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+			status := h.nodeProtectionSnapshot(ctx, node)
+			mu.Lock()
+			result[node.ID] = status
+			mu.Unlock()
+		})
+	}
+	workers.Wait()
+	return result
 }
 
 func (h *ServerHandler) overviewStreamSnapshot(ctx context.Context, nodeID, iface string, direction models.PolicyDirection) map[string]any {
@@ -2308,6 +2288,7 @@ func (h *ServerHandler) handleClusterEvents(w http.ResponseWriter, r *http.Reque
 		}()
 	}
 	var lastMonitoringSample time.Time
+	var lastMonitoringStorageError string
 	monitoringSent, monitoringInFlight := false, false
 	monitoringResults := make(chan models.SystemMetricsHistory, 1)
 	startMonitoring := func() {
@@ -2315,7 +2296,7 @@ func (h *ServerHandler) handleClusterEvents(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		h.systemMetricsMu.Lock()
-		unchanged := lastMonitoringSample.Equal(h.monitoringSampledAt)
+		unchanged := lastMonitoringSample.Equal(h.monitoringSampledAt) && lastMonitoringStorageError == h.metricsArchiveError
 		h.systemMetricsMu.Unlock()
 		if monitoringSent && unchanged {
 			return
@@ -2439,6 +2420,7 @@ func (h *ServerHandler) handleClusterEvents(w http.ResponseWriter, r *http.Reque
 			}
 			startPageSnapshot()
 			startEventSnapshot()
+			startMonitoring()
 			startOverview()
 		case result := <-overviewResults:
 			overviewInFlight = false
@@ -2466,6 +2448,7 @@ func (h *ServerHandler) handleClusterEvents(w http.ResponseWriter, r *http.Reque
 		case result := <-monitoringResults:
 			monitoringInFlight = false
 			lastMonitoringSample, monitoringSent = result.SampledAt, true
+			lastMonitoringStorageError = result.StorageError
 			if !send("monitoring", result) {
 				return
 			}
@@ -2520,41 +2503,54 @@ func (h *ServerHandler) handleNodeProtectionStatus(w http.ResponseWriter, r *htt
 		writeError(w, http.StatusNotFound, errors.New("node not found"))
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-	defer cancel()
-	result := map[string]string{"node_id": nodeID, "protection_status": "unavailable"}
-	var inventory models.InterfaceInventory
-	var health models.HealthStatus
-	var healthErr error
-	var probes sync.WaitGroup
-	probes.Go(func() {
-		_ = h.nodeJSON(ctx, nodeID, http.MethodGet, "/interfaces", nil, &inventory)
-	})
-	probes.Go(func() {
-		healthErr = h.nodeJSON(ctx, nodeID, http.MethodGet, "/health", nil, &health)
-	})
-	probes.Wait()
-	iface := clusterFocusInterface(inventory)
-	if strings.TrimSpace(iface) == "" {
-		iface = healthFocusInterface(health)
-	}
-	if strings.TrimSpace(iface) != "" {
-		result["interface"] = iface
-	}
-	if healthErr == nil {
+	writeJSON(w, http.StatusOK, h.nodeProtectionSnapshot(r.Context(), node))
+}
+
+func (h *ServerHandler) nodeProtectionSnapshot(ctx context.Context, node models.Node) map[string]any {
+	return h.cachedConsoleSnapshot(ctx, "node-protection:"+node.ID, func(_ cachedPageSnapshot, _ bool) map[string]any {
+		probeCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+		defer cancel()
+		var inventory models.InterfaceInventory
+		var health models.HealthStatus
+		var healthErr error
+		var probes sync.WaitGroup
+		probes.Go(func() {
+			_ = h.nodeJSON(probeCtx, node.ID, http.MethodGet, "/interfaces", nil, &inventory)
+		})
+		probes.Go(func() {
+			healthErr = h.nodeJSON(probeCtx, node.ID, http.MethodGet, "/health", nil, &health)
+		})
+		probes.Wait()
+		reachable := healthErr == nil
+		result := map[string]any{
+			"node_id": node.ID, "node_status": clusterNodeStatus(node, reachable),
+			"reachable": reachable, "checked_at": time.Now().UTC(),
+			"protection_status": "unavailable", "connection_status": "unreachable",
+		}
+		iface := clusterFocusInterface(inventory)
+		if iface == "" {
+			iface = healthFocusInterface(health)
+		}
+		if iface != "" {
+			result["interface"] = iface
+		}
+		if !reachable {
+			result["reason"] = healthErr.Error()
+			return result
+		}
 		result["protection_status"] = protectionStatusForInterface(health, iface, true)
 		result["connection_status"] = "reachable"
-	} else {
-		// A transient inventory failure must not turn a healthy dataplane into an
-		// unexplained "unknown" status when /health is still authoritative.
-		// Conversely, if the health probe itself failed, return that error for
-		// diagnosis regardless of whether inventory also failed.
-		result["reason"] = healthErr.Error()
-		result["connection_status"] = "unreachable"
-	}
-	result["node_status"] = clusterNodeStatus(node, healthErr == nil)
-	result["checked_at"] = time.Now().UTC().Format(time.RFC3339Nano)
-	writeJSON(w, http.StatusOK, result)
+		// Health reflects attachments restored by this Agent. A saved attach
+		// mode alone does not establish that its dataplane is running.
+		modes := make(map[string]string)
+		for _, item := range health.Interfaces {
+			if item.XDPAttached {
+				modes[item.Interface] = item.DataplaneMode
+			}
+		}
+		result["dataplane_modes"] = modes
+		return result
+	})
 }
 
 // A Web's inability to reach an Agent is a path failure, not evidence that a
@@ -4194,7 +4190,10 @@ func (h *ServerHandler) collectInterfaceSummary(ctx context.Context, nodeID, ifa
 		deniedPorts.DeniedPorts, deniedPorts.DeniedPortRules, allowedPorts.Ports,
 		allowedPorts.AllowedPortRules); ok {
 		if !reflect.DeepEqual(models.NormalizeInterfacePolicy(policy), models.NormalizeInterfacePolicy(recovered)) {
-			policy = h.store.PutPolicy(ctx, recovered)
+			latest, _ := h.service.SavePolicySnapshotIfCurrent(ctx, recovered)
+			if latest.NodeID != "" {
+				policy = latest
+			}
 		} else {
 			policy = recovered
 		}
@@ -4411,8 +4410,10 @@ func (h *ServerHandler) handleProxyAllowlistDelete(w http.ResponseWriter, r *htt
 	policy := h.ensurePolicy(r.Context(), r.PathValue("node"), r.PathValue("iface"))
 	direction := requestDirection(r)
 	selected := models.DirectionPolicyFor(policy, direction)
-	cidrs := deleteString(extractCIDRs(selected.Rules), cidrFromRequest(r))
-	selected.Rules = makeAllowRules(cidrs)
+	cidr := cidrFromRequest(r)
+	selected.Rules = slices.DeleteFunc(slices.Clone(selected.Rules), func(rule models.ACLRule) bool {
+		return rule.CIDR == cidr
+	})
 	h.applyImmediatePolicyUpdate(w, r, models.WithDirectionPolicy(policy, direction, selected))
 }
 
@@ -4480,8 +4481,15 @@ func (h *ServerHandler) handleProxyRuleDescription(w http.ResponseWriter, r *htt
 	if req.Kind == "allowlist" {
 		selected.Rules = appendOrUpdateAllowRule(selected.Rules, req.Value, req.Description)
 	}
-	updated := models.WithDirectionPolicy(policy, direction, selected)
-	updated = h.store.PutPolicy(r.Context(), updated)
+	updated, err := h.service.SavePolicySnapshotIfCurrent(r.Context(), models.WithDirectionPolicy(policy, direction, selected))
+	if errors.Is(err, service.ErrPolicyChanged) {
+		writeJSON(w, http.StatusConflict, map[string]any{"code": "CONFIG_CHANGED", "error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("save rule description: %w", err))
+		return
+	}
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -4726,7 +4734,11 @@ func (h *ServerHandler) applyImmediatePolicyUpdate(w http.ResponseWriter, r *htt
 	if h.blockUnsafeSSHPolicy(w, r, current, policy, confirmPasswordFromRequest(r)) {
 		return
 	}
-	updated, err := h.service.UpdatePolicyAndApply(r.Context(), policy)
+	updated, err := h.service.UpdatePolicyAndApplyIfCurrent(r.Context(), policy, policy.UpdatedAt)
+	if errors.Is(err, service.ErrPolicyChanged) {
+		writeJSON(w, http.StatusConflict, map[string]any{"code": "CONFIG_CHANGED", "error": err.Error()})
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusBadGateway, fmt.Errorf("apply policy immediately: %w", err))
 		return
@@ -4948,10 +4960,11 @@ func (h *ServerHandler) ensurePolicy(ctx context.Context, nodeID, iface string) 
 	policy, err := h.service.GetPolicy(ctx, nodeID, iface)
 	if err == nil {
 		policy = models.NormalizeInterfacePolicy(policy)
-		if h.service != nil {
-			enriched := h.service.WithClusterInterconnect(ctx, policy)
-			if !reflect.DeepEqual(policy, enriched) {
-				policy = h.store.PutPolicy(ctx, enriched)
+		enriched := h.service.WithClusterInterconnect(ctx, policy)
+		if !reflect.DeepEqual(policy, enriched) {
+			latest, _ := h.service.SavePolicySnapshotIfCurrent(ctx, enriched)
+			if latest.NodeID != "" {
+				policy = latest
 			}
 		}
 		return policy
@@ -4971,14 +4984,16 @@ func (h *ServerHandler) ensurePolicy(ctx context.Context, nodeID, iface string) 
 	// the first policy edit carries the same interconnect context as later
 	// reconciliations. The policy is still observe-only until an explicit
 	// protection baseline is published.
-	if h.service != nil {
-		policy = h.service.WithClusterInterconnect(ctx, policy)
-	}
+	policy = h.service.WithClusterInterconnect(ctx, policy)
 	policy = h.ensureControlPlanePortRules(policy)
 	// Reading an untouched interface must not attach a fail-open program as a
 	// side effect. Enforcement starts only after a rule change or the explicit
 	// protection-baseline action has supplied recovery access rules.
-	return h.store.PutPolicy(ctx, models.NormalizeInterfacePolicy(policy))
+	policy = models.NormalizeInterfacePolicy(policy)
+	if latest, _ := h.service.SavePolicySnapshotIfCurrent(ctx, policy); latest.NodeID != "" {
+		return latest
+	}
+	return policy
 }
 
 // controlPlanePortRules derives the listener ports from the active server

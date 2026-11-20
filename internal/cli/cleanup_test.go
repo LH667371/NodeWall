@@ -8,12 +8,16 @@ import (
 
 func TestRemoveOwnedDirAllowsNodeWallRotatedBackups(t *testing.T) {
 	dir := t.TempDir()
-	for _, name := range []string{"auth.json", "auth.json.bak.1", "cluster.key.bak.3"} {
+	for _, name := range []string{"auth.json", "auth.json.bak.1", "cluster.key.bak.3", "drop-log-state.json.bak.1"} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("nodewall"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := removeOwnedDir(dir, map[string]bool{"auth.json": true, "cluster.key": true}); err != nil {
+	allowed, err := nodewallOwnedConfigEntries(dir, filepath.Join(dir, "nodewall.env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := removeOwnedDir(dir, allowed); err != nil {
 		t.Fatal(err)
 	}
 }

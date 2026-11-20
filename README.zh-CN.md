@@ -81,7 +81,7 @@ NodeWall 是一个面向 Kubernetes 节点的主机级防火墙系统。
 
 ## 构建说明
 
-项目当前对齐主机 Go `1.27.3`。
+项目使用 `go.mod` 中声明的 Go 工具链版本。
 
 `make generate` 支持两种方式：
 
@@ -115,6 +115,10 @@ make run-server
 
 ## 多 Web 与节点连通性
 
+管理员可在节点管理中生成一次性接入命令。新节点默认作为普通 Agent 加入。
+需要备用 Web 时，请只为受信节点授予备用管理权限，该权限可同步集群加密密钥与凭据快照。
+已有备用管理节点可继续使用注册凭据同步。
+
 多 Web 控制台会区分集群心跳和当前 Web 到 Agent 的通信状态。宿主机上的其他防火墙可能
 在 XDP 放行后继续拒绝连接；例如某台机器的 INPUT 白名单只允许原管理端，就会导致备用
 Web 无法直连该 Agent。直连 TCP 建连失败时，控制台会尝试通过可达、已登记的其他 Web
@@ -122,6 +126,16 @@ Web 无法直连该 Agent。直连 TCP 建连失败时，控制台会尝试通�
 均需更新到包含 `/join/relay` 的版本，并至少保留一条经过认证的可达路径。
 请求已经送达后发生的超时或响应丢失不会自动重放写操作。各节点继续管理自己的系统
 防火墙；NodeWall 不会为了互联去改写 Docker、CNI 或管理员的 INPUT 规则。
+
+### 资源监控异机归档
+
+每个 Web 管理端每 15 秒采集各节点的指标并写入 `NODEWALL_MONITORING_HISTORY_DIR`。
+记录最长保留 7 天，默认空间上限为 512 MiB，可用 `NODEWALL_MONITORING_HISTORY_MIB` 调整。
+被移出集群的节点在记录到期前仍可从「资源监控 → 历史记录」选中。页面显示最后归档时间，可直接回看截至该条采样的一小时。
+
+要在主 Web 宿主机掉线后回看历史，请在另一台主机启用已有的备用管理权限。备用 Web 会独立采集，
+并在同步主端状态时拉取最近两分钟已完成的采样，用自己的存储保留这些记录。
+
 ## 旧内核与 ZStack 兼容模式
 
 `iptables` 数据面仅用于无法加载 eBPF/XDP 的非 Kubernetes Linux 主机，例如
@@ -168,15 +182,17 @@ TC 挂载失败，出方向强制发布会失败并保持原策略，不会自�
 
 ## 安装前预检
 
-安装前可以先运行预检命令。预检会检查 Ubuntu 版本、root 权限、Linux 内核、systemd、服务端口、目标网卡、BPF/XDP 和 iptables：
+安装前可以先运行预检命令。预检会检查 root 权限、实际运行的 Linux 内核、systemd、服务端口、目标网卡及所选后端的 BPF/XDP 或 iptables 能力。
 
 ```sh
 sudo ./bin/nodewall preflight --default-interface ens18
 ```
 
-预检会逐项输出 `通过`、`警告`、`失败` 或 `跳过`，只有存在 `失败` 项时才返回失败状态。Ubuntu 最低检查版本为 `18.04`；非 Ubuntu 发行版会给出警告，但仍会继续检查内核和数据面依赖。SSH 日志会优先使用 `/var/log/auth.log` 或 `/var/log/secure`，两者都不存在时自动检查 `journalctl`。`--dataplane auto` 不会启用 iptables；Kubernetes 节点无需额外处理 iptables 兼容规则。
+预检会逐项输出 `通过`、`警告`、`失败` 或 `跳过`，只有存在 `失败` 项时才返回失败状态。数据面兼容性由运行内核和后端能力决定。SSH 日志会优先使用 `/var/log/auth.log` 或 `/var/log/secure`，两者都不存在时自动检查 `journalctl`。`--dataplane auto` 选择 XDP 和 TC eBPF。
 
 `nodewall install` 会在写入安装目录、配置文件或 systemd unit 之前自动执行同一套预检；预检出现失败项时安装会停止。使用 `--enable-services=false` 时会跳过 systemd 在线状态检查，但其余与当前安装模式相关的检查仍会执行。
+
+Linux 4.18 是 XDP/TC 的预检版本下限。运行中的内核还需要能加载随包提供的 BPF 程序，目标网卡需要支持相应挂载方式。开机时，Agent 会按已保存的策略恢复已配置的接口。目标网卡尚未出现时，Agent 会继续重试，管理 API 可用，健康状态会显示尚未恢复的接口。
 
 ## 打包分发
 
@@ -201,9 +217,14 @@ make package-update
 ```
 
 两个命令都会自动构建前端并编译当前工作区的 Go 代码；前端依赖尚未安装时会根据
-`web/package-lock.json` 执行 `npm ci`。每次制作离线包都需要 Docker 和网络，用于检查
+`web/package-lock.json` 执行 `npm ci`。打包会先检查 Node.js，接受
+`^20.19.0` 或 `>=22.12.0`。当前版本不满足时，脚本会尝试用 nvm 切换到已安装的
+`.nvmrc` 版本。如需安装该版本，在仓库根目录运行 `nvm install`。
+每次制作离线包都需要 Docker 和网络，用于检查
 `main`、`daily` 和 `bytecode` 病毒库。发现新版时会下载更新并校验三份 CVD 的签名，
-ClamAV 引擎及源码缓存通过摘要校验后直接复用。病毒库刷新或验证失败时会中止打包，
+ClamAV 引擎及源码缓存通过摘要校验后直接复用。已编译的引擎单独保存，病毒库刷新失败也可复用。
+首次打包时，可将 `NODEWALL_CLAMAV_ENGINE_SEED_DIR` 指向同版本离线包解压后的 `clamav/` 目录。
+病毒库刷新或验证失败时会中止打包，
 保留之前的数据库缓存。`make package-archive` 保留为
 `make package-offline` 的兼容别名；`make package` 仍生成不包含 ClamAV 资源的单二进制。
 

@@ -32,7 +32,6 @@ import (
 	"nodewall/internal/version"
 	"nodewall/internal/xdp"
 
-	"github.com/cilium/ebpf/rlimit"
 	"github.com/quic-go/webtransport-go"
 	"google.golang.org/grpc"
 	grpccredentials "google.golang.org/grpc/credentials"
@@ -128,7 +127,7 @@ func RunServer() error {
 		}
 		handler.ConfigureNodeAuth(credentials)
 		if strings.TrimSpace(cfg.ManagerURL) != "" && cfg.InstallMode != "server-only" {
-			go runStandbySync(ctx, cfg, st, credentials)
+			go runStandbySync(ctx, cfg, st, credentials, handler)
 		}
 		// Repair policies created before the current control-plane ports or the
 		// newest enrolled node existed. Reconciliation only touches policies that
@@ -320,15 +319,6 @@ func RunAgent() error {
 	if token != "" && cfg.TLSCAFile == "" && cfg.ManagerURL == "" {
 		cfg.TLSCAFile = cfg.TLSCertFile
 	}
-	if cfg.DataplaneMode == "real" {
-		// systemd normally supplies LimitMEMLOCK, but agents can also run in
-		// containers or under a supervisor that ignores the unit file. Raise
-		// the process limit before cilium/ebpf creates any maps so attach errors
-		// remain actionable instead of surfacing as a generic EPERM.
-		if err := rlimit.RemoveMemlock(); err != nil {
-			return fmt.Errorf("raise BPF memlock limit: %w", err)
-		}
-	}
 	xdpManager, err := xdp.NewDataplane(cfg.DataplaneMode, cfg.BPFObjectPath)
 	if err != nil {
 		return err
@@ -342,7 +332,14 @@ func RunAgent() error {
 		ReplyFlowTimeoutSeconds: int(maxDuration(cfg.ReplyFlowTimeout, 60*time.Second) / time.Second),
 	})
 	if err != nil {
-		return err
+		// A corrupt audit checkpoint can result from an interrupted host
+		// reboot. Keep protection and management available with defaults.
+		log.Printf("warning: %v; using configured drop log defaults", err)
+	}
+	if legacy, ok := xdpManager.(*xdp.IPTablesManager); ok {
+		if err := legacy.StartPacketAudit(ctx, recorder.RecordPacketAudit); err != nil {
+			log.Printf("warning: iptables packet samples unavailable; rule counters remain active: %v", err)
+		}
 	}
 	geoDB, err := geoip.LoadCountryDB(cfg.GeoIPDBPath)
 	if err != nil {
@@ -514,7 +511,17 @@ func RunAgent() error {
 	}
 	go clamav.Run(ctx, clamAVOptions)
 	log.Printf("nodewall agent listening on %s", cfg.ListenAddr)
-	defer detachDataplane(xdpManager)
+	recoveryCtx, cancelRecovery := context.WithCancel(ctx)
+	recoveryDone := make(chan struct{})
+	go func() {
+		defer close(recoveryDone)
+		handler.RunInterfaceRecovery(recoveryCtx)
+	}()
+	defer func() {
+		cancelRecovery()
+		<-recoveryDone
+		detachDataplane(xdpManager)
+	}()
 	var routes http.Handler = handler.Routes()
 	if token != "" {
 		routes = nodeauth.RequireToken(token, routes)

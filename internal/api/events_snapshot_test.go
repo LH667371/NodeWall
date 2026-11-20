@@ -6,16 +6,94 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"nodewall/internal/droplog"
 	"nodewall/internal/models"
 	"nodewall/internal/securityscan"
 	"nodewall/internal/service"
 	"nodewall/internal/store"
+	"nodewall/internal/xdp"
 )
+
+type eventAuditDataplane struct {
+	*xdp.MockManager
+}
+
+func (eventAuditDataplane) ReadDropLogs(string, int) ([]models.InterceptLogEntry, error) {
+	return []models.InterceptLogEntry{
+		{SourceCIDR: "0.0.0.0/0", Reason: "nodewall:default_deny", Count: 12, Drops: 12,
+			Traffic: &models.FirewallTraffic{Evidence: models.FirewallRuleCounter, Hook: "input"}},
+		{SourceCIDR: "192.0.2.0/24", Reason: "nodewall:blocked_source", Count: 198,
+			Traffic: &models.FirewallTraffic{Evidence: models.FirewallRuleCounter, Hook: "input"}},
+	}, nil
+}
+
+func TestEventsSnapshotPreservesAgentFirewallAuditEvidence(t *testing.T) {
+	dir := t.TempDir()
+	recorder, err := droplog.New(dir, filepath.Join(dir, "drop-log-state.json"), models.DropLogSettings{Enabled: true, LogDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dp := eventAuditDataplane{xdp.NewMockManager()}
+	if err := dp.Attach("eno1", xdp.AttachModeGeneric); err != nil {
+		t.Fatal(err)
+	}
+	traffic := models.FirewallTraffic{
+		Evidence: models.FirewallPacketSample, Hook: "input", Origin: "vm", Device: "vnic12.0",
+		Bridge: "br_eno1", Guest: "guest-a", Basis: "ingress_device", LocalIP: "192.0.2.16", Protocol: "tcp",
+	}
+	recorder.RecordPacketAudit(models.DropLogRecord{
+		Timestamp: time.Now().UTC(), Interface: "eno1", Direction: models.DirectionIngress,
+		SourceIP: "192.0.2.19", Port: 8080, Reason: "nodewall:default_deny", Count: 1, Drops: 1, Traffic: &traffic,
+	})
+	if err := recorder.Flush(dp); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewAgentHandler("zstack", dp, memoryStateStore{}, time.Second, recorder, nil, SSHProtectionOptions{
+		ActivityLogPath: filepath.Join(dir, "ssh-activity.log"),
+	})
+	handler.dnsResolver = nil
+	agent := httptest.NewServer(handler.Routes())
+	defer agent.Close()
+	state := store.New()
+	state.UpsertNode(t.Context(), models.Node{ID: "zstack", AgentURL: agent.URL})
+	manager := newConsoleSyncHandler(t, state, "zstack")
+	response := httptest.NewRecorder()
+	manager.Routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/events/snapshot?node=other&direction=egress", nil))
+	var payload struct {
+		Logs []models.DropLogRecord `json:"logs"`
+	}
+	err = json.Unmarshal(response.Body.Bytes(), &payload)
+	if err != nil || response.Code != http.StatusOK || len(payload.Logs) != 3 {
+		t.Fatalf("firewall history did not reach the event snapshot: %d %s (%v)", response.Code, response.Body, err)
+	}
+	for _, record := range payload.Logs {
+		if record.NodeID != "zstack" || record.Interface != "eno1" || record.Direction != models.DirectionIngress || record.Traffic == nil {
+			t.Fatalf("missing firewall provenance: %+v", record)
+		}
+		switch record.Count {
+		case 1:
+			if *record.Traffic != traffic || record.SourceIP != "192.0.2.19" || record.Port != 8080 || record.Drops != 1 {
+				t.Fatalf("packet evidence changed in transit: %+v", record)
+			}
+		case 12:
+			if record.Traffic.Evidence != models.FirewallRuleCounter || record.SourceCIDR != "0.0.0.0/0" || record.SourceIP != "" || record.Drops != 12 {
+				t.Fatalf("rule counter changed in transit: %+v", record)
+			}
+		case 198:
+			if record.Traffic.Evidence != models.FirewallRuleCounter || record.Drops != 0 {
+				t.Fatalf("rule observation became a drop: %+v", record)
+			}
+		default:
+			t.Fatalf("unexpected firewall count: %+v", record)
+		}
+	}
+}
 
 func TestEventSnapshotCollectsAllNodesAndScanHistoryWithoutSecurityForms(t *testing.T) {
 	state := store.New()

@@ -6,6 +6,33 @@ export function numericMetric(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+// Archive membership is separate from the live inventory. Keep retired nodes
+// selectable without reintroducing them into the other console workspaces.
+export function monitoringNodeCatalog(registered, archive) {
+  const nodes = new Map();
+  for (const node of registered) {
+    const id = node.id || node.node_id;
+    if (id) nodes.set(id, { node_id: id, name: node.name || id, registered: true });
+  }
+  for (const source of archive) {
+    if (!source.node_id) continue;
+    const live = nodes.get(source.node_id);
+    nodes.set(source.node_id, {
+      ...source,
+      name: live?.name || source.name || source.node_id,
+      registered: Boolean(live) || source.registered === true,
+    });
+  }
+  return [...nodes.values()];
+}
+
+export function lastMonitoringHour(timestamp, retentionSeconds, now = Date.now()) {
+  const to = Date.parse(timestamp);
+  const from = Math.max(to - 60 * 60 * 1000, now - retentionSeconds * 1000);
+  if (!Number.isFinite(from) || from >= to || to > now) return null;
+  return { range: Math.ceil((to - from) / 1000), from: new Date(from).toISOString(), to: new Date(to).toISOString() };
+}
+
 export function seriesColor(identity, offset = 0) {
   let hash = 2166136261;
   for (const char of String(identity)) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);

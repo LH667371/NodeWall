@@ -95,7 +95,7 @@ func (t *nodeRelayTransport) RoundTrip(req *http.Request) (*http.Response, error
 		return nil, directErr
 	}
 	caller, ok := h.nodeCredentials.Get(h.nodeID)
-	if !ok {
+	if !ok || !caller.CanSyncStandby() {
 		return nil, directErr
 	}
 	origin := req.URL.Scheme + "://" + req.URL.Host
@@ -200,7 +200,7 @@ func (t *nodeRelayTransport) peers(ctx context.Context, targetID string) []relay
 			continue
 		}
 		credential, ok := h.nodeCredentials.Get(node.ID)
-		if !ok || credential.Certificate == "" {
+		if !ok || !credential.CanSyncStandby() || credential.Certificate == "" {
 			continue
 		}
 		endpoint := strings.TrimRight(strings.TrimSpace(node.ServerHTTPAddr), "/")
@@ -295,12 +295,10 @@ func validNodeRelayPath(raw string) bool {
 	}
 }
 
-// handleNodeRelay accepts only a fully enrolled node token, never an enrollment
-// ticket or a browser cookie. Target credentials are resolved locally and all
-// forwarded requests bypass relay fallback, preventing loops and open proxies.
+// A relay acts on behalf of a trusted standby Web. Forwarded requests resolve
+// target credentials locally and bypass relay fallback to prevent loops.
 func (h *ServerHandler) handleNodeRelay(w http.ResponseWriter, r *http.Request) {
-	if r.TLS == nil || h.nodeCredentials == nil || !h.nodeCredentials.Authenticate(r.Header.Get(nodeauth.NodeHeader), nodeauth.Bearer(r.Header.Get("Authorization"))) {
-		writeError(w, http.StatusUnauthorized, errors.New("node relay requires authenticated TLS node access"))
+	if !h.standbyAuthorized(w, r) {
 		return
 	}
 	w.Header().Set(nodeRelayHeader, "1")

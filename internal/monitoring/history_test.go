@@ -1,8 +1,10 @@
 package monitoring
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -76,6 +78,87 @@ func TestHistoryRepairsInterruptedAppend(t *testing.T) {
 	}
 }
 
+func TestHistoryReindexesLongSamplesAndResumesWriting(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	at := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Hour)
+	point := models.SystemMetricPoint{Timestamp: at, NodeID: "many-core", NodeName: "Many-core host", CPUPercent: 12}
+	for i := range 1024 {
+		point.LogicalCPUs = append(point.LogicalCPUs, models.LogicalCPUMetric{Name: fmt.Sprintf("cpu%d", i), UsagePercent: 12.5, SampleReady: true})
+	}
+	encoded, err := json.Marshal(point)
+	if err != nil || len(encoded) <= 64<<10 {
+		t.Fatalf("fixture must exceed the old line buffer: %d bytes (%v)", len(encoded), err)
+	}
+	history, err := OpenHistory(dir, 4<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := history.Append(point); err != nil {
+		t.Fatal(err)
+	}
+	history, err = OpenHistory(dir, 4<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes, err := history.RecordedNodes(ctx)
+	if err != nil || !nodes[point.NodeID].LastSampleAt.Equal(at) {
+		t.Fatalf("could not index the existing sample: %+v (%v)", nodes, err)
+	}
+	point.CPUPercent = 99
+	if err := history.Append(point); err != nil {
+		t.Fatal(err)
+	}
+	point.Timestamp = at.Add(15 * time.Second)
+	if err := history.Append(point); err != nil {
+		t.Fatal(err)
+	}
+	result, err := history.Query(ctx, []string{point.NodeID}, at, at.Add(time.Minute), 15*time.Second)
+	samples := result[point.NodeID]
+	if err != nil || len(samples) != 2 || samples[0].CPUPercent != 12 || samples[1].CPUPercent != 99 || len(samples[0].LogicalCPUs) != 1024 {
+		t.Fatalf("lost original metrics or failed to append after restart: %d samples (%v)", len(samples), err)
+	}
+}
+
+func TestHistoryKeepsGoodRecordsAroundCorruptionAndRepairsLongTail(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	at := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Hour)
+	point := models.SystemMetricPoint{Timestamp: at, NodeID: "host", CPUPercent: 10}
+	var committed bytes.Buffer
+	encoder := json.NewEncoder(&committed)
+	if err := encoder.Encode(point); err != nil {
+		t.Fatal(err)
+	}
+	committed.WriteString("{broken-record}\n")
+	point.Timestamp, point.CPUPercent = at.Add(15*time.Second), 20
+	if err := encoder.Encode(point); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, at.Format("20060102T15.jsonl"))
+	interrupted := append(bytes.Clone(committed.Bytes()), bytes.Repeat([]byte{'{'}, 192<<10)...)
+	if err := os.WriteFile(path, interrupted, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	history, err := OpenHistory(dir, int64(len(interrupted)+32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	point.Timestamp, point.CPUPercent = at.Add(30*time.Second), 30
+	if err := history.Append(point); err != nil {
+		t.Fatalf("interrupted tail or malformed record blocked appending: %v", err)
+	}
+	result, err := history.Query(ctx, []string{point.NodeID}, at, at.Add(time.Minute), 15*time.Second)
+	samples := result[point.NodeID]
+	if err == nil || len(samples) != 3 || samples[0].CPUPercent != 10 || samples[1].CPUPercent != 20 || samples[2].CPUPercent != 30 {
+		t.Fatalf("only the broken record should be reported: %d good samples (%v)", len(samples), err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || !bytes.HasPrefix(data, committed.Bytes()) || len(data) >= len(interrupted) {
+		t.Fatalf("tail repair rewrote committed bytes or left an incomplete record (%v)", err)
+	}
+}
+
 func TestHistoryRetentionAndQuotaDoNotDeleteUnrelatedFiles(t *testing.T) {
 	dir := t.TempDir()
 	old := time.Now().UTC().Add(-HistoryRetention - time.Hour).Format("20060102T15.jsonl")
@@ -84,7 +167,7 @@ func TestHistoryRetentionAndQuotaDoNotDeleteUnrelatedFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	point := models.SystemMetricPoint{Timestamp: time.Now().UTC().Add(-2 * time.Hour), NodeID: "a"}
+	point := models.SystemMetricPoint{Timestamp: time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Hour), NodeID: "a"}
 	data, _ := json.Marshal(point)
 	history, err := OpenHistory(dir, int64(len(data)+10))
 	if err != nil {
@@ -96,6 +179,7 @@ func TestHistoryRetentionAndQuotaDoNotDeleteUnrelatedFiles(t *testing.T) {
 	if err := history.Append(point); err != nil {
 		t.Fatal(err)
 	}
+	point.Timestamp = point.Timestamp.Add(time.Second)
 	if err := history.Append(point); err == nil {
 		t.Fatal("current-hour quota was ignored")
 	}
@@ -134,5 +218,31 @@ func TestHistoryConcurrentQueriesAndCancellation(t *testing.T) {
 	cancel()
 	if _, err := history.Query(ctx, []string{"a"}, at, at.Add(time.Minute), time.Second); err == nil {
 		t.Fatal("canceled history query continued")
+	}
+}
+
+func TestOlderMonitoringCopyKeepsNewestArchiveAtQuota(t *testing.T) {
+	ctx := t.Context()
+	now := time.Now().UTC().Truncate(time.Second)
+	newest := models.SystemMetricPoint{NodeID: "node-a", Timestamp: now, CPUPercent: 82}
+	encoded, err := json.Marshal(newest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	history, err := OpenHistory(t.TempDir(), int64(len(encoded)+1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := history.Append(newest); err != nil {
+		t.Fatal(err)
+	}
+	older := newest
+	older.Timestamp = now.Add(-time.Hour)
+	if err := history.Append(older); err == nil {
+		t.Fatal("an older copy was allowed to evict the last sample")
+	}
+	points, err := history.Query(ctx, []string{"node-a"}, older.Timestamp, now, time.Second)
+	if err != nil || len(points["node-a"]) != 1 || !points["node-a"][0].Timestamp.Equal(now) {
+		t.Fatalf("newest sample was lost: %v (%v)", points, err)
 	}
 }

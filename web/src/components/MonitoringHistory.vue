@@ -24,6 +24,8 @@ const groups = {
       { key: "cpu_percent", label: "monitoringCPU", unit: "percent", csvUnit: "%", trend: true },
       { key: "cpu_iowait_percent", label: "monitoringCPUIowait", unit: "percent", csvUnit: "%" },
       { key: "memory_percent", label: "monitoringMemory", unit: "percent", csvUnit: "%", trend: true },
+      { key: "memory_available_bytes", label: "monitoringMemoryAvailable", unit: "bytes", csvUnit: "B" },
+      { key: "swap_used_bytes", label: "monitoringSwapUsed", unit: "bytes", csvUnit: "B" },
       { key: "load_1", label: "monitoringLoad1", unit: "number" },
     ],
   },
@@ -32,6 +34,8 @@ const groups = {
     columns: [
       { key: "rx_bytes_per_second", label: "monitoringNetworkInShort", unit: "rate", csvUnit: "B/s", trend: true },
       { key: "tx_bytes_per_second", label: "monitoringNetworkOutShort", unit: "rate", csvUnit: "B/s", trend: true },
+      { key: "rx_dropped_per_second", label: "monitoringNetworkDroppedIn", unit: "number", csvUnit: "/s" },
+      { key: "tx_dropped_per_second", label: "monitoringNetworkDroppedOut", unit: "number", csvUnit: "/s" },
     ],
   },
   disk: {
@@ -41,6 +45,17 @@ const groups = {
       { key: "disk_write_bytes_per_second", label: "monitoringDiskWrite", unit: "rate", csvUnit: "B/s", trend: true },
       { key: "disk_read_ops_per_second", label: "monitoringDiskReadOps", unit: "iops", csvUnit: "io/s" },
       { key: "disk_write_ops_per_second", label: "monitoringDiskWriteOps", unit: "iops", csvUnit: "io/s" },
+      { key: "disk_io_utilization_percent", label: "monitoringDiskUtilization", unit: "percent", csvUnit: "%" },
+      { key: "disk_read_await_milliseconds", label: "monitoringDiskReadAwait", unit: "milliseconds", csvUnit: "ms" },
+      { key: "disk_write_await_milliseconds", label: "monitoringDiskWriteAwait", unit: "milliseconds", csvUnit: "ms" },
+    ],
+  },
+  diskSpace: {
+    label: "monitoringHistoryDiskSpace",
+    columns: [
+      { key: "filesystem_used_percent", label: "monitoringFilesystemTrend", unit: "percent", csvUnit: "%", trend: true },
+      { key: "filesystem_peak_percent", label: "monitoringFilesystemPeak", unit: "percent", csvUnit: "%", trend: true },
+      { key: "filesystem_available_bytes", label: "monitoringFilesystemAvailable", unit: "bytes", csvUnit: "B" },
     ],
   },
   system: {
@@ -59,7 +74,22 @@ const viewport = ref(null);
 const columns = computed(() => groups[group.value].columns);
 const trendColumns = computed(() => columns.value.filter((column) => column.trend));
 const series = computed(() => trendColumns.value.map(({ key, label }) => ({ key, label: t(label) })));
-const rows = computed(() => descending.value ? props.points.slice().reverse() : props.points);
+const historyPoints = computed(() => {
+  if (group.value !== "diskSpace") return props.points;
+  return props.points.map((point) => {
+    let peak = null;
+    let mountpoint = "";
+    for (const filesystem of point.filesystems || []) {
+      const used = numericMetric(filesystem.used_percent);
+      if (used !== null && (peak === null || used > peak)) {
+        peak = used;
+        mountpoint = filesystem.mountpoint || filesystem.device || "";
+      }
+    }
+    return { ...point, filesystem_peak_percent: peak, filesystem_peak_mount: mountpoint };
+  });
+});
+const rows = computed(() => descending.value ? historyPoints.value.slice().reverse() : historyPoints.value);
 const visibleRows = computed(() => rows.value.slice(page.value * pageSize.value, (page.value + 1) * pageSize.value));
 const emptyLabel = computed(() => t(props.loading ? "monitoringLoading" : props.failed ? "monitoringHistoryUnavailable" : "monitoringHistoryEmptyRange"));
 
@@ -121,7 +151,7 @@ function exportRows() {
       <template v-if="points.length">
         <MonitoringChart
           :key="group"
-          :points="points"
+          :points="historyPoints"
           :series="series"
           :sample-interval="sampleInterval"
           :unit="trendColumns[0].unit"
@@ -161,7 +191,7 @@ function exportRows() {
           <tbody>
             <tr v-for="point in visibleRows" :key="point.timestamp">
               <td><time :datetime="point.timestamp">{{ displayTime(point.timestamp) }}</time></td>
-              <td v-for="column in columns" :key="column.key">{{ displayMetric(point, column) }}</td>
+              <td v-for="column in columns" :key="column.key" :title="column.key === 'filesystem_peak_percent' ? point.filesystem_peak_mount : undefined">{{ displayMetric(point, column) }}</td>
             </tr>
           </tbody>
         </table>

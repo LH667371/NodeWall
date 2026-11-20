@@ -11,19 +11,27 @@ import (
 	"github.com/cilium/ebpf/link"
 )
 
-func TestAttachModeAvoidsI40EQueueReset(t *testing.T) {
+func TestAttachModeForInterface(t *testing.T) {
 	for _, test := range []struct {
-		name, driver        string
-		requested, expected AttachMode
+		name, driver, features string
+		requested, expected    AttachMode
 	}{
-		{"i40e native", "i40e", AttachModeNative, AttachModeGeneric},
-		{"i40e generic", "i40e", AttachModeGeneric, AttachModeGeneric},
-		{"other driver", "mlx5_core", AttachModeNative, AttachModeNative},
-		{"ixgbe native", "ixgbe", AttachModeNative, AttachModeNative},
-		{"igb native", "igb", AttachModeNative, AttachModeNative},
-		{"virtio capability negotiated at attach", "virtio_net", AttachModeNative, AttachModeNative},
-		{"vmxnet3 capability negotiated at attach", "vmxnet3", AttachModeNative, AttachModeNative},
-		{"missing driver", "", AttachModeNative, AttachModeNative},
+		{"i40e native", "i40e", "", AttachModeNative, AttachModeGeneric},
+		{"i40e generic", "i40e", "", AttachModeGeneric, AttachModeGeneric},
+		{"mlx5 native", "mlx5_core", "", AttachModeNative, AttachModeNative},
+		{"ixgbe native", "ixgbe", "", AttachModeNative, AttachModeNative},
+		{"igb native", "igb", "", AttachModeNative, AttachModeNative},
+		{"virtio guest checksum", "virtio_net", "1100010011\n", AttachModeNative, AttachModeGeneric},
+		{"virtio guest checksum with offload control", "virtio_net", "1110010011\n", AttachModeNative, AttachModeGeneric},
+		{"virtio transmit checksum only", "virtio_net", "1010010011\n", AttachModeNative, AttachModeNative},
+		{"virtio without any checksum offload", "virtio_net", "0010010011\n", AttachModeNative, AttachModeNative},
+		{"virtio without readable features", "virtio_net", "", AttachModeNative, AttachModeGeneric},
+		{"virtio truncated features", "virtio_net", "1\n", AttachModeNative, AttachModeGeneric},
+		{"virtio malformed features", "virtio_net", "10bad\n", AttachModeNative, AttachModeGeneric},
+		{"virtio explicit generic", "virtio_net", "1010010011\n", AttachModeGeneric, AttachModeGeneric},
+		{"virtio explicit iptables", "virtio_net", "1110010011\n", AttachModeIPTables, AttachModeIPTables},
+		{"vmxnet3 native", "vmxnet3", "", AttachModeNative, AttachModeNative},
+		{"missing driver", "", "", AttachModeNative, AttachModeNative},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -34,6 +42,11 @@ func TestAttachModeAvoidsI40EQueueReset(t *testing.T) {
 				}
 				if err := os.Symlink(filepath.Join("/sys/bus/pci/drivers", test.driver), filepath.Join(device, "driver")); err != nil {
 					t.Fatal(err)
+				}
+				if test.features != "" {
+					if err := os.WriteFile(filepath.Join(device, "features"), []byte(test.features), 0o644); err != nil {
+						t.Fatal(err)
+					}
 				}
 			}
 			if got := attachModeForInterface(root, "eno3", test.requested); got != test.expected {

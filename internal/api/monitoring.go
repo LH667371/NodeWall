@@ -1,13 +1,20 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
+	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"nodewall/internal/models"
+	"nodewall/internal/monitoring"
 )
 
 const (
@@ -104,6 +111,7 @@ func (h *ServerHandler) collectSystemMetrics(ctx context.Context, nodes []models
 		id := nodes[index].ID
 		point := systemMetricPoint(id, *metrics)
 		point.Timestamp = at
+		point.NodeName = nodes[index].Name
 		points = append(points, point)
 		h.systemMetricsCache[id] = cachedSystemMetric{metrics: *metrics, fetchedAt: finished}
 		history := append(h.systemMetricsHistory[id], point)
@@ -115,6 +123,9 @@ func (h *ServerHandler) collectSystemMetrics(ctx context.Context, nodes []models
 		h.systemMetricsHistory[id] = history[start:]
 	}
 	// Refreshes during the round keep reading the last complete batch.
+	if h.monitoringFirstRound.IsZero() {
+		h.monitoringFirstRound = at
+	}
 	h.monitoringSampledAt = at
 	h.systemMetricsMu.Unlock()
 
@@ -132,4 +143,123 @@ func (h *ServerHandler) collectSystemMetrics(ctx context.Context, nodes []models
 	if storageError != "" && storageError != previousError {
 		log.Printf("warning: persist monitoring history: %s", storageError)
 	}
+}
+
+func (h *ServerHandler) monitoringArchiveNodes(ctx context.Context, registered []models.Node) (map[string]models.MonitoringArchiveNode, error) {
+	if h.metricsArchive == nil {
+		return nil, nil
+	}
+	archived, err := h.metricsArchive.RecordedNodes(ctx)
+	for _, node := range registered {
+		if source, ok := archived[node.ID]; ok {
+			source.Registered = true
+			if node.Name != "" {
+				source.Name = node.Name
+			}
+			archived[node.ID] = source
+		}
+	}
+	return archived, err
+}
+
+func (h *ServerHandler) recentMonitoringSamples(ctx context.Context, from, to time.Time) ([]models.SystemMetricPoint, error) {
+	h.systemMetricsMu.Lock()
+	var samples []models.SystemMetricPoint
+	for _, history := range h.systemMetricsHistory {
+		for i := len(history) - 1; i >= 0 && !history[i].Timestamp.Before(from); i-- {
+			if !history[i].Timestamp.After(to) {
+				samples = append(samples, history[i])
+			}
+		}
+	}
+	firstRound := h.monitoringFirstRound
+	h.systemMetricsMu.Unlock()
+	// Reuse completed batches for the regular sync. Read disk only for the
+	// part of the overlap before this process could have collected samples.
+	if h.metricsArchive == nil || (!firstRound.IsZero() && !firstRound.After(from)) {
+		return samples, nil
+	}
+	if !firstRound.IsZero() && !firstRound.After(to) {
+		to = firstRound.Add(-time.Nanosecond)
+	}
+	if !to.After(from) {
+		return samples, nil
+	}
+	archived, catalogErr := h.metricsArchive.RecordedNodes(ctx)
+	nodes := make([]models.Node, 0, len(archived))
+	for id, record := range archived {
+		if !record.LastSampleAt.Before(from) {
+			nodes = append(nodes, models.Node{ID: id})
+		}
+	}
+	byNode, err := h.monitoringArchivePoints(ctx, nodes, from, to, int(monitoring.StandbyCopyWindow/time.Second))
+	for _, points := range byNode {
+		samples = append(samples, points...)
+	}
+	return samples, errors.Join(catalogErr, err)
+}
+
+// The bootstrap route has already authenticated this caller as a standby.
+// Export recent completed samples without contacting any Agents.
+func (h *ServerHandler) handleJoinMonitoring(w http.ResponseWriter, r *http.Request) {
+	now := time.Now().UTC()
+	samples, err := h.recentMonitoringSamples(r.Context(), now.Add(-monitoring.StandbyCopyWindow), now)
+	if err != nil && len(samples) == 0 {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	sort.Slice(samples, func(i, j int) bool {
+		if samples[i].Timestamp.Equal(samples[j].Timestamp) {
+			return samples[i].NodeID < samples[j].NodeID
+		}
+		return samples[i].Timestamp.After(samples[j].Timestamp)
+	})
+	var payload bytes.Buffer
+	payload.WriteByte('[')
+	for _, sample := range samples {
+		encoded, err := json.Marshal(sample)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if payload.Len()+len(encoded)+2 > monitoring.StandbyCopyMaxBytes {
+			break // Keep the most recent evidence when the overlap is large.
+		}
+		if payload.Len() > 1 {
+			payload.WriteByte(',')
+		}
+		payload.Write(encoded)
+	}
+	payload.WriteByte(']')
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(payload.Bytes())
+}
+
+// ImportMonitoringHistory stores the samples received by the authenticated
+// standby sync locally. It can be retried after an interrupted transfer.
+func (h *ServerHandler) ImportMonitoringHistory(ctx context.Context, samples []models.SystemMetricPoint) error {
+	if h.metricsArchive == nil {
+		return nil
+	}
+	now := time.Now().UTC()
+	for _, sample := range samples {
+		if strings.TrimSpace(sample.NodeID) == "" || sample.Timestamp.Before(now.Add(-monitoring.HistoryRetention)) || sample.Timestamp.After(now.Add(time.Minute)) {
+			return errors.New("invalid standby monitoring sample")
+		}
+	}
+	sort.Slice(samples, func(i, j int) bool { return samples[i].Timestamp.Before(samples[j].Timestamp) })
+	for len(samples) > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		end := 1
+		for end < len(samples) && samples[end].Timestamp.Equal(samples[0].Timestamp) {
+			end++
+		}
+		if err := h.metricsArchive.AppendBatch(samples[:end]); err != nil {
+			return fmt.Errorf("save standby monitoring samples: %w", err)
+		}
+		samples = samples[end:]
+	}
+	return nil
 }

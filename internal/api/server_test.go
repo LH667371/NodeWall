@@ -245,11 +245,11 @@ func TestClusterEventsDeliverNodesBeforeSlowOverview(t *testing.T) {
 func TestClusterEventsMonitoringSendsCachedSnapshotWithoutCollecting(t *testing.T) {
 	state := store.New()
 	state.UpsertNode(context.Background(), models.Node{ID: "node-a"})
-	h := &ServerHandler{store: state, service: service.NewPolicyService(state)}
+	h := &ServerHandler{store: state, service: service.NewPolicyService(state), metricsArchiveError: "archive unavailable"}
 	server := httptest.NewServer(http.HandlerFunc(h.handleClusterEvents))
 	defer server.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"?section=monitoring&overview=0&range=900", nil)
 	if err != nil {
@@ -267,8 +267,26 @@ func TestClusterEventsMonitoringSendsCachedSnapshotWithoutCollecting(t *testing.
 		}
 	}
 	frame, err := readSSEFrame(reader)
-	if err != nil || !strings.Contains(frame, "event: monitoring") || !strings.Contains(frame, `"scope":"cluster"`) {
+	if err != nil || !strings.Contains(frame, "event: monitoring") || !strings.Contains(frame, `"scope":"cluster"`) || !strings.Contains(frame, `"storage_error":"archive unavailable"`) {
 		t.Fatalf("monitoring snapshot frame = %q (%v)", frame, err)
+	}
+	// A successful write can clear the warning after a snapshot has already
+	// been sent for this round. Publish that change without another sample.
+	h.systemMetricsMu.Lock()
+	h.metricsArchiveError = ""
+	h.systemMetricsMu.Unlock()
+	h.invalidateConsoleSnapshots()
+	for {
+		frame, err := readSSEFrame(reader)
+		if err != nil {
+			t.Fatalf("missing archive recovery frame: %v", err)
+		}
+		if strings.Contains(frame, "event: monitoring") {
+			if strings.Contains(frame, `"storage_error"`) {
+				t.Fatalf("recovered archive still reports a write failure: %q", frame)
+			}
+			break
+		}
 	}
 }
 
@@ -393,7 +411,7 @@ func TestNodeProtectionStatusUsesOnlyHealthAndInventory(t *testing.T) {
 	req.SetPathValue("node", "node-a")
 	recorder := httptest.NewRecorder()
 	h.handleNodeProtectionStatus(recorder, req)
-	var result map[string]string
+	var result map[string]any
 	if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil || result["protection_status"] != "enforced" {
 		t.Fatalf("unexpected protection response: %s, error: %v", recorder.Body, err)
 	}
@@ -445,7 +463,7 @@ func TestNodeProtectionStatusFallsBackToHealthWhenInventoryIsUnavailable(t *test
 	req.SetPathValue("node", "node-a")
 	recorder := httptest.NewRecorder()
 	h.handleNodeProtectionStatus(recorder, req)
-	var result map[string]string
+	var result map[string]any
 	if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil || result["protection_status"] != "enforced" || result["interface"] != "eth1" {
 		t.Fatalf("health status was hidden by inventory failure: %s, error: %v", recorder.Body, err)
 	}
@@ -769,8 +787,14 @@ func TestMonitoringHistoryPublishesOnlyCompletedRounds(t *testing.T) {
 	if len(streamBefore.Points) != 0 || !streamBefore.SampledAt.IsZero() {
 		t.Fatal("SSE exposed part of an unfinished batch")
 	}
+	if samples, err := handler.recentMonitoringSamples(t.Context(), now.Add(-time.Minute), now); err != nil || len(samples) != 0 {
+		t.Fatalf("standby sync exposed part of an unfinished round: %v (%v)", samples, err)
+	}
 	release()
 	<-done
+	if samples, err := handler.recentMonitoringSamples(t.Context(), now.Add(-time.Minute), now); err != nil || len(samples) != 2 {
+		t.Fatalf("standby sync did not reuse the completed round: %v (%v)", samples, err)
+	}
 
 	req := httptest.NewRequest(http.MethodGet, "/monitoring/history?range=300", nil)
 	rec := httptest.NewRecorder()

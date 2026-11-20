@@ -131,7 +131,7 @@ func TestNodeRelayMakesPartitionedWebReadAndWriteSameAgent(t *testing.T) {
 		request.SetPathValue("node", "target")
 		rec := httptest.NewRecorder()
 		web.handleNodeProtectionStatus(rec, request)
-		var result map[string]string
+		var result map[string]any
 		if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil || result["node_status"] != "online" || result["connection_status"] != "reachable" || result["protection_status"] != "enforced" {
 			t.Fatalf("Webs disagree: %s, %v", rec.Body, err)
 		}
@@ -149,7 +149,7 @@ func TestNodeRelayRejectsAnonymousTicketsAndUnsafeTargets(t *testing.T) {
 	var calls atomic.Int32
 	f := newRelayFixture(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(http.StatusNoContent) }))
 	caller, _ := f.registry.Get("standby")
-	f.manager.enrollmentTickets = map[string]time.Time{"ticket": time.Now().Add(time.Minute)}
+	f.manager.enrollmentTickets = map[string]enrollmentTicket{"ticket": {ExpiresAt: time.Now().Add(time.Minute)}}
 	cases := []struct {
 		name, token, target, method, path string
 		want                              int
@@ -180,6 +180,19 @@ func TestNodeRelayRejectsAnonymousTicketsAndUnsafeTargets(t *testing.T) {
 	}
 	if calls.Load() != 0 {
 		t.Fatal("invalid relay reached an agent")
+	}
+	standby := false
+	caller.Standby = &standby
+	if err := f.registry.Put(caller); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "https://manager/join/relay", nil)
+	req.Header.Set(nodeauth.NodeHeader, caller.NodeID)
+	req.Header.Set("Authorization", "Bearer "+caller.Token)
+	rec := httptest.NewRecorder()
+	f.manager.handleNodeRelay(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("ordinary agent relay permission returned %d", rec.Code)
 	}
 }
 

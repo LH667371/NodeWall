@@ -2,10 +2,13 @@
 import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from "vue";
 import { ArrowDown, ArrowLeftRight, ArrowUp, Check, ListFilter, Pencil, Plus, Search, Trash2, X } from "@lucide/vue";
 import { useI18n } from "@/lib/i18n";
+import FirewallBackendBadge from "@/components/FirewallBackendBadge.vue";
+import InfoTip from "@/components/InfoTip.vue";
 import StrategySelect from "@/components/StrategySelect.vue";
 import TablePagination from "@/components/TablePagination.vue";
 import NodeSelector from "@/components/NodeSelector.vue";
 import { request } from "@/lib/api";
+import { interfaceFirewallBackend } from "@/lib/firewallBackend";
 import { interfaceAddress, interfaceAddressLabel } from "@/lib/interfaces";
 import { formatTime as formatClockTime } from "@/lib/time";
 
@@ -231,6 +234,14 @@ const selectedInterfaceName = computed(() => String(
     || "",
 ));
 const selectedInterface = computed(() => props.store.state.interfaces?.find((item) => item.name === selectedInterfaceName.value));
+const backendMode = computed(() => interfaceFirewallBackend(
+  props.store.state.health,
+  selectedInterfaceName.value,
+  props.store.state.interfaceDataStatus,
+));
+const showTCEgress = computed(() => props.store.state.direction === "egress"
+  && ["native", "generic"].includes(backendMode.value));
+const ruleScope = computed(() => JSON.stringify([props.store.state.nodeId, selectedInterfaceName.value, props.store.state.direction]));
 const interfaceOptions = computed(() => {
   const list = props.store.state.interfaces || [];
   const physical = list.filter((item) => item.is_physical);
@@ -243,7 +254,7 @@ function interfaceLabel(item) {
   if (typeof item.is_physical !== "boolean") return item.name;
   return `${item.name} · ${t(item.is_physical ? "interfaceTypePhysical" : "interfaceTypeVirtual")}`;
 }
-watch(() => [props.store.state.nodeId, selectedInterfaceName.value, props.store.state.direction], () => {
+watch(ruleScope, () => {
   recentRuleIDs.value = [];
   highlightedRuleIDs.value = new Set();
   selectedRowIds.value = new Set();
@@ -337,25 +348,6 @@ function toggleSelectRow(row) {
   selectedRowIds.value = next;
 }
 
-async function removeRule(row) {
-  props.store.openModal({
-    title: t("actionDelete"),
-    copy: `${t("policyTableSource")}：${row.source}\n${t("policyTableTarget")}：${row.target}`,
-    fields: [],
-    onConfirm: async () => {
-      await runRowAction(row, async () => {
-        selectedRowIds.value.delete(row.id);
-        if (row.kind === "allowlist" || row.kind === "bypass" || row.kind === "blocked" || row.kind === "icmpAllow" || row.kind === "icmpBlocked") {
-          await props.store.removeCIDR(row.kind, row.value);
-          return;
-        }
-        await props.store.removePort(row.kind, row.value, row.portProtocol || "");
-      });
-      props.store.closeModal();
-    },
-  });
-}
-
 function startDescriptionEdit(row) {
   editingDescriptionId.value = row.id;
   draftDescription.value = row.description || "";
@@ -368,6 +360,7 @@ function cancelDescriptionEdit() {
 
 async function saveDescriptionEdit(row) {
   if (editingDescriptionId.value !== row.id) return;
+  const scope = ruleScope.value;
   await runRowAction(row, async () => {
     await props.store.saveRuleDescription({
       kind: row.kind,
@@ -376,29 +369,52 @@ async function saveDescriptionEdit(row) {
       description: draftDescription.value,
     });
   });
-  cancelDescriptionEdit();
+  if (active && scope === ruleScope.value && editingDescriptionId.value === row.id) cancelDescriptionEdit();
 }
 
-async function removeSelectedRules() {
-  const rows = selectedRows.value;
-  if (!rows.length) return;
+function confirmRuleDeletion(rows, title, copy) {
+  const scope = ruleScope.value;
   props.store.openModal({
-    title: t("policyBatchDeleteTitle"),
-    copy: t("policyBatchDeleteCopy", { count: rows.length }),
+    title,
+    copy,
     fields: [],
     onConfirm: async () => {
-      for (const row of rows) {
-        selectedRowIds.value.delete(row.id);
-        if (row.kind === "allowlist" || row.kind === "bypass" || row.kind === "blocked" || row.kind === "icmpAllow" || row.kind === "icmpBlocked") {
-          await props.store.removeCIDR(row.kind, row.value);
-        } else {
-          await props.store.removePort(row.kind, row.value, row.portProtocol || "");
+      let deleted = 0;
+      try {
+        for (const row of rows) {
+          // The next row still belongs to the context that opened this dialog.
+          if (!active || ruleScope.value !== scope) return;
+          if (isRowBusy(row)) throw new Error(t("policyRuleBusy"));
+          await runRowAction(row, () => row.portProtocol
+            ? props.store.removePort(row.kind, row.value, row.portProtocol)
+            : props.store.removeCIDR(row.kind, row.value));
+          deleted++;
         }
+      } catch (error) {
+        if (!active || ruleScope.value !== scope) return;
+        const detail = props.store.handleError(error, { inline: true });
+        if (deleted && detail) {
+          props.store.handleError(new Error(t("policyRulesDeleteInterrupted", { deleted, remaining: rows.length - deleted, error: detail })));
+          return;
+        }
+        props.store.handleError(error);
       }
-      selectedRowIds.value = new Set();
-      props.store.closeModal();
+      if (deleted && active && ruleScope.value === scope) {
+        props.store.setNotice(t("policyRulesDeleted", { count: deleted }), "success");
+      }
     },
   });
+}
+
+function removeRule(row) {
+  confirmRuleDeletion([row], t("actionDelete"),
+    `${t("policyTableSource")}：${row.source}\n${t("policyTableTarget")}：${row.target}`);
+}
+
+function removeSelectedRules() {
+  const rows = selectedRows.value;
+  if (!rows.length) return;
+  confirmRuleDeletion(rows, t("policyBatchDeleteTitle"), t("policyBatchDeleteCopy", { count: rows.length }));
 }
 
 function openComposer() {
@@ -412,13 +428,15 @@ function openComposer() {
 function openRuleEditor(row) {
   openComposer();
   composer.editingRow = row;
+  const portRule = Boolean(row.portProtocol);
+  const hasTargetPort = portRule && !isICMPRule(row);
   applyPreset({
     strategy: row.kind === "blocked" || row.kind === "denied" || row.kind === "icmpBlocked" ? "deny" : "allow",
     protocol: row.portProtocol || (isICMPRule(row) ? "icmp" : "tcp"),
-    sourceType: row.kind === "public" || row.kind === "denied" || row.kind === "allowed" ? "any" : "ipv4",
-    sourceValue: row.kind === "public" || row.kind === "denied" || row.kind === "allowed" ? "" : String(row.value || ""),
-    targetType: row.kind === "public" || row.kind === "denied" || row.kind === "allowed" ? "port" : "all",
-    targetValue: row.kind === "public" || row.kind === "denied" || row.kind === "allowed" ? String(row.value || "") : "",
+    sourceType: portRule ? "any" : "ipv4",
+    sourceValue: portRule ? "" : String(row.value || ""),
+    targetType: hasTargetPort ? "port" : "all",
+    targetValue: hasTargetPort ? String(row.value) : "",
     comment: row.description || "",
   });
 }
@@ -511,6 +529,7 @@ onBeforeUnmount(() => { active = false; for (const controller of inventoryContro
 
 async function submitComposer(retry = false) {
   if (composerBusy.value || (!retry && !canSubmitComposer.value)) return;
+  const scope = ruleScope.value;
   const beforeIDs = new Set(allRuleRows.value.map((row) => row.id));
   const sourceNodeID = props.store.state.nodeId;
   let targets;
@@ -533,7 +552,7 @@ async function submitComposer(retry = false) {
   composerError.value = "";
   try {
     const results = await props.store.addRuleToNodes(submittedRule, targets, submittedOptions);
-    if (!active) return;
+    if (!active || scope !== ruleScope.value) return;
     composerResults.value = [...composerResults.value.filter((item) => !targets.some((target) => target.nodeID === item.nodeID)), ...results];
     if (results.some((item) => item.nodeID === sourceNodeID && (item.status === "success" || item.ruleSaved))) {
       const additions = allRuleRows.value.filter((row) => !beforeIDs.has(row.id));
@@ -556,8 +575,11 @@ async function submitComposer(retry = false) {
       savedRow?.scrollIntoView({ block: "nearest" });
     }
   } catch (error) {
-    if (active) composerError.value = error.message;
-  } finally { composerBusy.value = false; }
+    if (active && scope === ruleScope.value) composerError.value = error.message;
+  } finally {
+    composerBusy.value = false;
+    if (active && scope !== ruleScope.value) closeComposer();
+  }
 }
 
 async function toggleRuleStrategy(row) {
@@ -574,7 +596,9 @@ async function setRuleStrategy(row, nextStrategy) {
 
 async function toggleSelectedRulesStrategy() {
   const rows = selectedRows.value.filter((row) => row.kind !== "bypass");
+  const scope = ruleScope.value;
   for (const row of rows) {
+    if (!active || scope !== ruleScope.value) return;
     await toggleRuleStrategy(row);
   }
 }
@@ -606,6 +630,12 @@ async function toggleSelectedRulesStrategy() {
           <span v-if="selectedInterface" id="policy-interface-address" class="policy-interface-address">{{ interfaceAddressLabel(selectedInterface) }}</span>
         </div>
         <span class="status-pill" :class="{ accent: protectionStatus === 'enforced', warning: protectionStatus === 'degraded' }">{{ protectionLabel }}</span>
+        <div class="policy-context-backend">
+          <span>{{ t("firewallBackend") }}</span>
+          <FirewallBackendBadge :mode="backendMode" />
+          <InfoTip :text="t('firewallBackendHelp')" />
+          <span v-if="showTCEgress">{{ t("firewallBackendEgressHook") }}</span>
+        </div>
       </div>
       <div class="policy-context-actions" :class="`is-${protectionStatus}`">
         <template v-if="protectionTrialActive">
@@ -665,7 +695,7 @@ async function toggleSelectedRulesStrategy() {
             <ArrowLeftRight :size="16" aria-hidden="true" />
             {{ t("policyBatchStrategy") }}
           </button>
-          <button class="ghost-button danger-text" :disabled="protectionTrialActive || !interfaceReady" @click="removeSelectedRules().catch(store.handleError)">
+          <button class="ghost-button danger-text" :disabled="protectionTrialActive || !interfaceReady || selectedRows.some(isRowBusy)" @click="removeSelectedRules">
             <Trash2 :size="16" aria-hidden="true" />
             {{ t("policyBatchDelete") }}
           </button>
@@ -788,7 +818,7 @@ async function toggleSelectedRulesStrategy() {
                       :disabled="protectionTrialActive || !interfaceReady"
                       @click="openRuleEditor(row)"
                     ><Pencil :size="16" aria-hidden="true" /></button>
-                    <button class="icon-button table-action-button danger" :title="t('actionDelete')" :aria-label="t('actionDelete')" :disabled="protectionTrialActive || !interfaceReady || isRowBusy(row)" @click="removeRule(row).catch(store.handleError)">
+                    <button class="icon-button table-action-button danger" :title="t('actionDelete')" :aria-label="t('actionDelete')" :disabled="protectionTrialActive || !interfaceReady || isRowBusy(row)" @click="removeRule(row)">
                       <Trash2 :size="16" aria-hidden="true" />
                     </button>
                   </div>
@@ -969,6 +999,15 @@ async function toggleSelectedRulesStrategy() {
   padding-right: 8px;
 }
 .policy-interface-address { overflow-wrap: anywhere; }
+.policy-context-backend {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  max-width: 100%;
+  color: var(--muted-strong);
+  font-size: 12px;
+}
 .policy-context-panel .protection-trial-field { display: inline-flex; flex: 0 1 auto; flex-direction: row; align-items: center; gap: 7px; margin: 0; }
 .policy-context-panel .protection-trial-field span { white-space: nowrap; }
 .policy-context-panel .protection-trial-field input { width: 66px; min-width: 0; }
@@ -985,7 +1024,7 @@ async function toggleSelectedRulesStrategy() {
 .rules-table .table-action-button { padding: 0; }
 .rules-table button > svg { flex: none; }
 @media (max-width: 640px) {
-  .policy-context-interface { order: 1; flex-basis: 100%; }
+  .policy-context-interface { flex-basis: 100%; }
   .policy-context-panel .protection-trial-field { flex-basis: 100%; }
   .rules-toolbar .policy-search-field { flex-basis: 100%; }
 }

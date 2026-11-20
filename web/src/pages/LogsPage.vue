@@ -5,7 +5,7 @@ import InfoTip from "@/components/InfoTip.vue";
 import { useI18n } from "@/lib/i18n";
 import TablePagination from "@/components/TablePagination.vue";
 import { formatDateTime } from "@/lib/time";
-import { canActOnFirewallSource, firewallSourceLabel } from "@/lib/firewallLogs";
+import { canActOnFirewallSource, firewallLogKey, firewallSourceLabel, isFirewallRuleCounter } from "@/lib/firewallLogs";
 
 const props = defineProps({
   store: { type: Object, required: true },
@@ -35,25 +35,27 @@ function normalizeIPv4(value) {
 }
 
 function displaySourceIP(item) {
-  if (item?.source_cidr || item?.reason === "dhcp_broadcast") return firewallSourceLabel(item, t);
+  if (isFirewallRuleCounter(item) || item?.reason === "dhcp_broadcast") return firewallSourceLabel(item, t);
   return normalizeIPv4(item?.source_ip) || String(item?.source_ip || "-");
 }
 
 function displaySourceDomain(item) {
+  if (isFirewallRuleCounter(item)) return "";
   return String(item?.source_domain || "").trim();
 }
 
-function itemKey(item) {
-  return [item.interface || "-", item.direction || "ingress", item.source_ip || item.source_cidr || "-", item.port || 0, item.timestamp || "-"].join("|");
+function interfaceLabel(item) {
+  const node = props.store.state.nodes.find((entry) => entry.id === item.node_id);
+  return [node?.name || item.node_id, item.interface].filter(Boolean).join(" · ");
 }
 
 function isSelected(item) {
-  return props.store.state.selection.has(itemKey(item));
+  return props.store.state.selection.has(firewallLogKey(item));
 }
 
 function toggleAllLogs() {
   if (allVisibleSelected.value) {
-    selectableLogs.value.forEach((item) => props.store.state.selection.delete(itemKey(item)));
+    selectableLogs.value.forEach((item) => props.store.state.selection.delete(firewallLogKey(item)));
     return;
   }
   selectableLogs.value.forEach((item) => {
@@ -106,8 +108,8 @@ function actionTooltip(item, action) {
 }
 
 function hitCount(item) {
-  const value = item?.count ?? item?.drops ?? 0;
-  return props.store.formatNumber(Number(value || 0));
+  const value = props.store.formatNumber(Number(item?.count ?? item?.drops ?? 0));
+  return item?.traffic?.evidence === "packet_sample" ? `${value} ${t("firewallPacketSamples")}` : value;
 }
 
 function formatTime(value) {
@@ -301,7 +303,7 @@ async function bulkRateLimit() {
                     <span>{{ allVisibleSelected ? t("deselectAll") : t("selectAll") }}</span>
                   </label>
                 </th>
-                <th>{{ t("sourceEndpoint") }}</th>
+                <th>{{ t("firewallPeerEndpoint") }}</th>
                 <th>{{ t("targetPort") }}</th>
                 <th>{{ t("toolbarDirection") }}</th>
                 <th>{{ t("reason") }}</th>
@@ -317,12 +319,12 @@ async function bulkRateLimit() {
               </tr>
             </thead>
             <tbody>
-              <tr v-for="item in visibleLogs" :key="itemKey(item)">
+              <tr v-for="item in visibleLogs" :key="firewallLogKey(item)">
                 <td><input type="checkbox" :checked="isSelected(item)" :disabled="!canActOnFirewallSource(item)" @change="props.store.toggleLogSelection(item)" /></td>
-                <td class="log-source" :title="[displaySourceDomain(item), displaySourceIP(item), item.interface].filter(Boolean).join(' · ')">
+                <td class="log-source" :title="[displaySourceDomain(item), displaySourceIP(item), interfaceLabel(item)].filter(Boolean).join(' · ')">
                   <strong v-if="displaySourceDomain(item)">{{ displaySourceDomain(item) }}</strong>
                   <span>{{ displaySourceIP(item) }}</span>
-                  <small>{{ item.interface }}</small>
+                  <small>{{ interfaceLabel(item) }}</small>
                 </td>
                 <td :title="item.direction === 'egress' ? t('targetPortEgressHint') : t('targetPortIngressHint')">{{ item.port || "-" }}</td>
                 <td>{{ item.direction === "egress" ? t("toolbarEgress") : t("toolbarIngress") }}</td>
@@ -330,9 +332,9 @@ async function bulkRateLimit() {
                 <td>{{ hitCount(item) }}</td>
                 <td>{{ formatTime(item.timestamp) }}</td>
                 <td>
-                  <span v-if="isHandled(item)" class="status-pill">{{ t("handled") }}</span>
-                  <span v-else-if="isIntercepted(item)" class="status-pill danger">{{ t("intercepted") }}</span>
-                  <span v-else class="status-pill">{{ t("firewallObservedOnly") }}</span>
+                  <span v-if="!isIntercepted(item)" class="status-pill">{{ t("firewallObservedOnly") }}</span>
+                  <span v-else-if="isHandled(item)" class="status-pill">{{ t("handled") }}</span>
+                  <span v-else class="status-pill danger">{{ t("intercepted") }}</span>
                 </td>
                 <td>
                   <div class="inline-actions">

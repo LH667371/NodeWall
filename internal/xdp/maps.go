@@ -301,12 +301,17 @@ func dropReasonLabel(reason uint8) string {
 }
 
 func interceptLogFromMap(key dropLogKey, value dropLogValue, direction models.PolicyDirection) models.InterceptLogEntry {
+	traffic := &models.FirewallTraffic{Evidence: models.FirewallPacketCounter, Hook: "protected_ingress"}
+	if direction == models.DirectionEgress {
+		traffic.Hook, traffic.Origin = "tc_egress", "host"
+	}
 	entry := models.InterceptLogEntry{
 		Direction: direction,
 		SourceIP:  sourceIPFromUint32(key.SourceIP),
 		Port:      key.DestPort,
 		Reason:    dropReasonLabel(key.Reason),
 		Count:     value.Drops,
+		Traffic:   traffic,
 	}
 	// Keep observation counters separate across mode changes. Reading the
 	// current config would incorrectly relabel old drops or old observations.

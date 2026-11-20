@@ -7,7 +7,9 @@ export function eventDispositionKey(nodeID, eventID) {
 
 export function firewallEventID(item, index, fallbackNode = "-") {
   const node = item?.node_id || fallbackNode || "-";
-  const token = item?.event_id || [item?.timestamp || index, item?.source_ip || item?.source_cidr || "unknown", item?.port || "", item?.reason || ""].join("-");
+  const parts = [item?.timestamp || index, item?.source_ip || item?.source_cidr || "unknown", item?.port || "", item?.reason || ""];
+  if (item?.traffic?.evidence) parts.push(item.interface, item.direction, item.traffic.evidence, item.traffic.device, item.traffic.local_ip, item.traffic.protocol);
+  const token = item?.event_id || parts.join("-");
   return `firewall-${node}-${token}`;
 }
 

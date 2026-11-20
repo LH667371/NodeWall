@@ -3647,18 +3647,6 @@ textarea:focus {
   background: #e85f72;
 }
 
-.monitoring-lower-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 18px;
-}
-
-/* The lower section is a two-column grid; full-width monitoring tables must
-   span the real grid instead of creating implicit off-screen columns. */
-.monitoring-lower-grid > .panel-span-12 {
-  grid-column: 1 / -1;
-}
-
 .monitoring-subhead {
   margin-bottom: 8px;
   color: var(--muted-strong);
@@ -3800,8 +3788,7 @@ textarea:focus {
   .ssh-console-layout,
   .ssh-console-connect,
   .resource-summary-grid,
-  .monitoring-chart-grid,
-  .monitoring-lower-grid {
+  .monitoring-chart-grid {
     grid-template-columns: 1fr;
   }
 
@@ -4438,8 +4425,7 @@ input {
 
   .overview-main-grid,
   .overview-ranking-grid,
-  .overview-trend-grid,
-  .monitoring-lower-grid {
+  .overview-trend-grid {
     grid-template-columns: 1fr;
   }
 
@@ -6201,9 +6187,24 @@ textarea:focus {
 .monitoring-node-resource-panel .console-table { min-width: 960px; }
 
 .monitoring-lower-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  display: flex;
+  flex-direction: column;
   gap: var(--panel-gap);
+}
+
+.monitoring-lower-grid > .workspace-panel {
+  flex: 1 0 auto;
+}
+
+/* Keep table widths independent of the charts available in each snapshot. */
+.monitoring-accelerator-charts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--panel-gap);
+}
+
+.monitoring-accelerator-charts > .monitoring-chart-panel {
+  flex: 1 1 420px;
 }
 
 .monitoring-process-table { max-height: clamp(250px, 47dvh, 460px); }
@@ -6660,8 +6661,7 @@ textarea:focus {
 
   .overview-main-grid,
   .overview-ranking-grid,
-  .overview-trend-grid,
-  .monitoring-lower-grid {
+  .overview-trend-grid {
     grid-template-columns: 1fr;
   }
 
@@ -8054,11 +8054,11 @@ html[data-theme="dark"] .shell .header-user-button span {
   min-width: 0;
 }
 
-.cluster-node-table .cluster-col-name { width: 24%; }
-.cluster-node-table .cluster-col-address { width: 27%; }
-.cluster-node-table .cluster-col-agent-status { width: 16%; }
-.cluster-node-table .cluster-col-protection { width: 17%; }
-.cluster-node-table .cluster-col-actions { width: 16%; }
+.cluster-node-table .cluster-col-name { width: 16%; }
+.cluster-node-table .cluster-col-address { width: auto; }
+.cluster-node-table .cluster-col-agent-status { width: 13%; }
+.cluster-node-table .cluster-col-protection { width: 19%; }
+.cluster-node-table .cluster-col-backend { width: 16%; }
 
 /* Keep all four node actions reachable. Information columns may ellipsize;
  * an unusually narrow table can use the panel's own scrollport instead of
@@ -8102,9 +8102,11 @@ html[data-theme="dark"] .shell .header-user-button span {
 }
 
 .cluster-node-identity .table-link {
+  display: block;
   width: fit-content;
   max-width: 100%;
   overflow: hidden;
+  text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -11010,7 +11012,8 @@ html[data-theme="dark"] .shell .sidebar .nav-item.nav-item-compact.active {
 
 /* Keep room both for the translated labels and for the fixed action widths. */
 .rules-table { min-width: 720px; }
-.cluster-node-table, .node-settings-table { min-width: 700px; }
+.cluster-node-table { min-width: 880px; }
+.node-settings-table { min-width: 700px; }
 .events-center-table, .log-table { min-width: 900px; }
 .scan-history-table, .findings-table, .quarantine-table { min-width: 820px; }
 
@@ -11297,6 +11300,21 @@ html[data-theme="dark"] .shell .sidebar .nav-item.nav-item-compact.active {
   border: 0;
 }
 
+.monitoring-archive-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.monitoring-archive-status .ghost-button {
+  margin-inline-start: auto;
+}
+
 .monitoring-range-details,
 .monitoring-header-panel .monitoring-request-note {
   margin: 8px 0 0;
@@ -11307,14 +11325,6 @@ html[data-theme="dark"] .shell .sidebar .nav-item.nav-item-compact.active {
   align-self: center;
   margin-inline-start: auto;
   color: var(--muted);
-}
-
-.monitoring-lower-grid > .monitoring-node-panel {
-  grid-column: auto;
-}
-
-.monitoring-lower-grid > .monitoring-node-panel:last-child:nth-child(odd) {
-  grid-column: 1 / -1;
 }
 
 .monitoring-history-workspace {

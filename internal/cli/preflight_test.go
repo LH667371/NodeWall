@@ -3,6 +3,7 @@ package cli
 import (
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -14,14 +15,10 @@ func healthyPreflightDeps() preflightDeps {
 		goos: "linux",
 		euid: func() int { return 0 },
 		readFile: func(path string) ([]byte, error) {
-			switch path {
-			case "/etc/os-release":
-				return []byte("ID=ubuntu\nVERSION_ID=24.04\nVERSION_CODENAME=noble\n"), nil
-			case "/proc/sys/kernel/osrelease":
-				return []byte("6.8.0-40-generic\n"), nil
-			default:
-				return nil, os.ErrNotExist
+			if path == "/proc/sys/kernel/osrelease" {
+				return []byte("5.4.278-1.el7.elrepo.x86_64\n"), nil
 			}
+			return nil, os.ErrNotExist
 		},
 		lookPath: func(name string) (string, error) { return "/usr/bin/" + name, nil },
 		runCommand: func(name string, _ ...string) (string, error) {
@@ -73,7 +70,7 @@ func TestPreflightHealthyHostCanInstall(t *testing.T) {
 	if !strings.Contains(text, "结论: 可以安装") {
 		t.Fatalf("preflight output did not contain success conclusion: %s", text)
 	}
-	for _, name := range []string{"Ubuntu 版本", "权限", "Linux 内核", "systemd", "端口", "网卡", "BPF/XDP", "iptables", "SSH 日志"} {
+	for _, name := range []string{"权限", "Linux 内核", "systemd", "端口", "网卡", "BPF/XDP", "iptables", "SSH 日志"} {
 		if !strings.Contains(text, name) {
 			t.Fatalf("preflight output did not contain %q: %s", name, text)
 		}
@@ -83,14 +80,10 @@ func TestPreflightHealthyHostCanInstall(t *testing.T) {
 func TestPreflightRejectsUnsupportedKernelAndInterface(t *testing.T) {
 	deps := healthyPreflightDeps()
 	deps.readFile = func(path string) ([]byte, error) {
-		switch path {
-		case "/etc/os-release":
-			return []byte("ID=ubuntu\nVERSION_ID=16.04\n"), nil
-		case "/proc/sys/kernel/osrelease":
+		if path == "/proc/sys/kernel/osrelease" {
 			return []byte("4.17.0-generic\n"), nil
-		default:
-			return nil, os.ErrNotExist
 		}
+		return nil, os.ErrNotExist
 	}
 	deps.discoverInterfaces = func() (models.InterfaceInventory, error) {
 		return models.InterfaceInventory{Interfaces: []models.DetectedInterface{{
@@ -111,7 +104,7 @@ func TestPreflightRejectsUnsupportedKernelAndInterface(t *testing.T) {
 		t.Fatal("unsupported host unexpectedly passed preflight")
 	}
 	summary := report.failureSummary()
-	for _, expected := range []string{"Ubuntu 版本", "Linux 内核", "网卡"} {
+	for _, expected := range []string{"Linux 内核", "网卡"} {
 		if !strings.Contains(summary, expected) {
 			t.Fatalf("failure summary %q did not contain %q", summary, expected)
 		}
@@ -138,26 +131,17 @@ func TestPreflightAllowsExistingAgentPortDuringReenrollment(t *testing.T) {
 	if report.failed() {
 		t.Fatalf("re-enrollment should allow the current agent port: %s", report.failureSummary())
 	}
-	if report.Checks[4].Status != preflightWarn {
-		t.Fatalf("expected port warning, got %#v", report.Checks[4])
+	portIndex := slices.IndexFunc(report.Checks, func(check preflightCheck) bool { return check.Name == "端口" })
+	if portIndex < 0 || report.Checks[portIndex].Status != preflightWarn {
+		t.Fatalf("expected port warning, got %#v", report.Checks)
 	}
 }
 
-func TestParseUbuntuVersion(t *testing.T) {
-	for _, test := range []struct {
-		value        string
-		major, minor int
-		ok           bool
-	}{
-		{value: "24.04", major: 24, minor: 4, ok: true},
-		{value: "18.04.7", major: 18, minor: 4, ok: true},
-		{value: "unknown", ok: false},
-		{value: "24", ok: false},
-	} {
-		major, minor, ok := parseUbuntuVersion(test.value)
-		if major != test.major || minor != test.minor || ok != test.ok {
-			t.Fatalf("parseUbuntuVersion(%q) = (%d, %d, %t), want (%d, %d, %t)", test.value, major, minor, ok, test.major, test.minor, test.ok)
-		}
+func TestPreflightRejectsNonLinuxServerInstall(t *testing.T) {
+	deps := healthyPreflightDeps()
+	deps.goos = "darwin"
+	if check := checkKernel(preflightOptions{InstallMode: "server-only"}, deps); check.Status != preflightFail {
+		t.Fatalf("non-Linux install unexpectedly passed the kernel check: %+v", check)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -182,13 +183,71 @@ func TestOfflineNodeCannotRetainEnforcedProtection(t *testing.T) {
 	state := store.New()
 	state.UpsertNode(context.Background(), models.Node{ID: "offline", LastSeenAt: time.Now().Add(-2 * time.Minute)})
 	h := newConsoleSyncHandler(t, state, "offline")
-	h.pageSnapshotCache = map[string]cachedPageSnapshot{"node-protection": {
+	h.pageSnapshotCache = map[string]cachedPageSnapshot{"node-protection:offline": {
 		fetchedAt: time.Now().Add(-time.Minute),
-		value:     map[string]any{"offline": map[string]any{"node_id": "offline", "protection_status": "enforced"}},
+		value: map[string]any{
+			"node_id": "offline", "protection_status": "enforced",
+			"dataplane_modes": map[string]string{"eth0": "generic"},
+		},
 	}}
-	result := h.protectionStreamSnapshot(context.Background())
-	if result["offline"].(map[string]any)["protection_status"] != "unavailable" {
-		t.Fatalf("offline node retained enforcement: %#v", result)
+	result := h.protectionStreamSnapshot(context.Background())["offline"].(map[string]any)
+	if result["protection_status"] != "unavailable" || result["dataplane_modes"] != nil {
+		t.Fatalf("offline node retained live firewall state: %#v", result)
+	}
+}
+
+func TestNodeProtectionHTTPAndStreamShareLiveDataplaneModes(t *testing.T) {
+	const nodeID = "agent"
+	dataplane := inventoryMockDataplane{
+		xdp.NewMockManager(),
+		[]models.DetectedInterface{
+			{Name: "em1", IsPhysical: true},
+			{Name: "em2", IsPhysical: true},
+			{Name: "em3", IsPhysical: true},
+			{Name: "em4", IsPhysical: true},
+		},
+	}
+	expected := map[string]string{"em1": "generic", "em2": "native", "em3": "iptables"}
+	for iface, mode := range expected {
+		if err := dataplane.Attach(iface, xdp.AttachMode(mode)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var probes atomic.Int32
+	routes := NewAgentHandler(nodeID, dataplane, memoryStateStore{}, time.Second, nil, nil).Routes()
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probes.Add(1)
+		routes.ServeHTTP(w, r)
+	}))
+	defer agent.Close()
+	state := store.New()
+	state.UpsertNode(t.Context(), models.Node{ID: nodeID, AgentURL: agent.URL})
+	h := newConsoleSyncHandler(t, state, nodeID)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nodes/agent/protection-status", nil)
+	h.Routes().ServeHTTP(rec, req)
+	var result struct {
+		DataplaneModes map[string]string `json:"dataplane_modes"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil || !maps.Equal(result.DataplaneModes, expected) {
+		t.Fatalf("HTTP did not report live attachments: %s, %v", rec.Body, err)
+	}
+	status := h.protectionStreamSnapshot(t.Context())[nodeID].(map[string]any)
+	modes, ok := status["dataplane_modes"].(map[string]string)
+	if !ok || !maps.Equal(modes, expected) || probes.Load() != 2 {
+		t.Fatalf("stream did not reuse the bounded HTTP probe: status=%#v requests=%d", status, probes.Load())
+	}
+	for iface := range expected {
+		if err := dataplane.Detach(iface); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.invalidateConsoleSnapshots()
+	status = h.protectionStreamSnapshot(t.Context())[nodeID].(map[string]any)
+	modes, ok = status["dataplane_modes"].(map[string]string)
+	if !ok || len(modes) != 0 || status["reachable"] != true {
+		t.Fatalf("reachable node without attachments did not report an empty mode map: %#v", status)
 	}
 }
 
@@ -433,6 +492,69 @@ func TestPageStreamsUseRealAgentRoutesAndShareHTTPInterfaceSummary(t *testing.T)
 	}
 	if phantomCalls.Load() != 0 || statsCalls.Load() != 1 {
 		t.Fatalf("HTTP and SSE did not share the collector: nonexistent route=%d counter probes=%d", phantomCalls.Load(), statsCalls.Load())
+	}
+}
+
+func TestFirewallDeletesReturnConfirmedRulesAndInvalidateSummary(t *testing.T) {
+	const iface = "nw-test0"
+	const base = "/nodes/agent/interfaces/" + iface
+	dataplane := xdp.NewMockManager()
+	agent := httptest.NewServer(NewAgentHandler("agent", dataplane, memoryStateStore{}, time.Second, nil, nil).Routes())
+	defer agent.Close()
+	state := store.New()
+	state.UpsertNode(t.Context(), models.Node{ID: "agent", AgentURL: agent.URL, LastSeenAt: time.Now()})
+	h := newConsoleSyncHandler(t, state, "agent")
+	routes := h.Routes()
+	call := func(method, path, payload string) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		routes.ServeHTTP(rec, httptest.NewRequest(method, base+path, strings.NewReader(payload)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s %s: %d %s", method, path, rec.Code, rec.Body.String())
+		}
+		return rec
+	}
+	call(http.MethodPost, "/allowlist", `{"cidr":"192.0.2.1/32"}`)
+	call(http.MethodPost, "/allowlist", `{"cidr":"192.0.2.2/32","comment":"keep this note"}`)
+	call(http.MethodPost, "/public-ports", `{"port":18080}`)
+	call(http.MethodGet, "/summary", "") // Populate the shared cache before deleting.
+
+	removed := call(http.MethodDelete, "/allowlist?cidr=192.0.2.1%2F32&direction=ingress", "")
+	var saved models.InterfacePolicy
+	if err := json.Unmarshal(removed.Body.Bytes(), &saved); err != nil {
+		t.Fatal(err)
+	}
+	if len(saved.Ingress.Rules) != 1 || saved.Ingress.Rules[0].CIDR != "192.0.2.2/32" || saved.Ingress.Rules[0].Comment != "keep this note" {
+		t.Fatalf("DELETE lost other rule data: %#v", saved.Ingress.Rules)
+	}
+	call(http.MethodDelete, "/allowlist?cidr=192.0.2.2%2F32&direction=ingress", "")
+	port := call(http.MethodDelete, "/public-ports/18080?protocol=tcp&direction=ingress", "")
+	revision, err := strconv.ParseUint(port.Header().Get("X-NodeWall-Revision"), 10, 64)
+	if err != nil {
+		t.Fatalf("no revision for confirmed delete: %v", err)
+	}
+	var summary struct {
+		Policy   models.InterfacePolicy `json:"policy"`
+		Revision uint64                 `json:"revision"`
+	}
+	if err := json.Unmarshal(call(http.MethodGet, "/summary", "").Body.Bytes(), &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary.Revision != revision || len(summary.Policy.Ingress.Rules) != 0 {
+		t.Fatalf("HTTP returned a stale summary: %#v", summary)
+	}
+	tcp := models.PortRule{Protocol: models.PortProtocolTCP, Port: 18080}
+	udp := models.PortRule{Protocol: models.PortProtocolUDP, Port: 18080}
+	if rules := summary.Policy.Ingress.PublicPortRules; containsPortRule(rules, tcp) || !containsPortRule(rules, udp) {
+		t.Fatalf("protocol-specific delete returned the wrong rules: %#v", rules)
+	}
+	stream := h.securityStreamSnapshotFor(t.Context(), "firewall", "agent", iface, models.DirectionIngress)
+	current := stream["nodes"].([]map[string]any)[0]["current"].(map[string]any)
+	if current["revision"] != revision || len(current["policy"].(models.InterfacePolicy).Ingress.Rules) != 0 {
+		t.Fatalf("SSE collector kept the removed rule: %#v", current)
+	}
+	if rules, err := dataplane.ListCIDRs(iface); err != nil || len(rules) != 0 {
+		t.Fatalf("Agent kept a removed CIDR: %v %v", rules, err)
 	}
 }
 

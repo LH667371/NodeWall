@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -128,17 +129,154 @@ func TestMonitoringStorageFailureDoesNotDisableConsole(t *testing.T) {
 	if err := os.WriteFile(path, []byte("fixture"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, models.SystemMetrics{
+			CapturedAt: time.Now().UTC(),
+			CPU:        models.CPUMetrics{UsagePercent: 12},
+			Memory:     models.MemoryMetrics{TotalBytes: 1024},
+		})
+	}))
+	defer agent.Close()
 	st := store.New()
+	st.UpsertNode(t.Context(), models.Node{ID: "a", AgentURL: agent.URL})
 	h, err := NewServerHandler(config.ServerConfig{MonitoringHistoryDir: path, MonitoringHistoryBytes: 1 << 20}, service.NewPolicyService(st), st)
 	if err != nil {
 		t.Fatal("auxiliary storage disabled management console:", err)
 	}
+	read := func(handler *ServerHandler) models.SystemMetricsHistory {
+		t.Helper()
+		response := httptest.NewRecorder()
+		handler.handleMonitoringHistory(response, httptest.NewRequest(http.MethodGet, "/monitoring/history?node=a", nil))
+		var history models.SystemMetricsHistory
+		if err := json.Unmarshal(response.Body.Bytes(), &history); err != nil || response.Code != http.StatusOK {
+			t.Fatalf("history returned %d: %v", response.Code, err)
+		}
+		return history
+	}
+	now := time.Now().UTC().Truncate(systemMetricsSampleInterval)
+	nodes := st.ListNodes(t.Context())
+	h.collectSystemMetrics(t.Context(), nodes, now.Add(-systemMetricsSampleInterval))
+	if history := read(h); history.StorageError == "" || history.ArchiveReadError != "" || len(history.Points) != 1 {
+		t.Fatalf("write failure hid live samples: %+v", history)
+	}
+	if err := os.Rename(path, path+".fixture"); err != nil {
+		t.Fatal(err)
+	}
+	h.collectSystemMetrics(t.Context(), nodes, now)
+	if history := read(h); history.StorageError != "" || len(history.Points) != 2 {
+		t.Fatalf("sampler did not recover storage without a restart: %+v", history)
+	}
+	restarted, err := NewServerHandler(config.ServerConfig{MonitoringHistoryDir: path, MonitoringHistoryBytes: 1 << 20}, service.NewPolicyService(st), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if history := read(restarted); len(history.Points) != 1 || !history.Points[0].Timestamp.Equal(now) || history.StorageError != "" {
+		t.Fatalf("the post-recovery sample was not saved: %+v", history)
+	}
+}
+
+func TestMonitoringShowsReadableHistoryWhenOneRecordIsDamaged(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	at := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Hour).Add(time.Minute)
+	var segment bytes.Buffer
+	encoder := json.NewEncoder(&segment)
+	for index := range 2 {
+		if index > 0 {
+			segment.WriteString("{damaged}\n")
+		}
+		point := models.SystemMetricPoint{NodeID: "retired", Timestamp: at.Add(time.Duration(index) * systemMetricsSampleInterval), CPUPercent: float64(10 + index)}
+		if err := encoder.Encode(point); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, at.Format("20060102T15.jsonl")), segment.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := store.New()
+	h, err := NewServerHandler(config.ServerConfig{MonitoringHistoryDir: dir, MonitoringHistoryBytes: 1 << 20}, service.NewPolicyService(state), state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	from, to := at.Format(time.RFC3339), at.Add(time.Minute).Format(time.RFC3339)
 	response := httptest.NewRecorder()
-	h.handleMonitoringHistory(response, httptest.NewRequest(http.MethodGet, "/monitoring/history", nil))
-	var history models.SystemMetricsHistory
-	_ = json.Unmarshal(response.Body.Bytes(), &history)
-	if response.Code != 200 || history.StorageError == "" {
-		t.Fatal("degraded persistence was hidden")
+	h.Routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/monitoring/history?node=retired&from="+from+"&to="+to, nil))
+	var result models.SystemMetricsHistory
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil || response.Code != http.StatusOK {
+		t.Fatalf("read retained node: %d (%v)", response.Code, err)
+	}
+	for _, view := range []models.SystemMetricsHistory{result, h.monitoringStreamSnapshot(ctx, "retired", 60, from, to)} {
+		if view.StorageError != "" || view.ArchiveReadError == "" || len(view.Points) != 2 || len(view.ArchiveNodes) != 1 || view.Points[1].CPUPercent != 11 {
+			t.Fatalf("a damaged row hid valid history or looked like a save failure: %+v", view)
+		}
+	}
+	if recent := h.monitoringStreamSnapshot(ctx, "retired", 900, "", ""); recent.StorageError != "" || recent.ArchiveReadError != "" {
+		t.Fatalf("an older damaged row affected the current range: %+v", recent)
+	}
+}
+
+func TestMonitoringReadsArchivedNodeAfterRemovalAndRestart(t *testing.T) {
+	ctx := t.Context()
+	state := store.New()
+	state.UpsertNode(ctx, models.Node{ID: "worker-a", Name: "Worker A"})
+	state.UpsertNode(ctx, models.Node{ID: "worker-b", Name: "Worker B"})
+	cfg := config.ServerConfig{NodeID: "manager", MonitoringHistoryDir: t.TempDir(), MonitoringHistoryBytes: 1 << 20}
+	first, err := NewServerHandler(cfg, service.NewPolicyService(state), state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now().UTC().Add(-25 * time.Hour).Truncate(systemMetricsSampleInterval)
+	for _, point := range []models.SystemMetricPoint{
+		{NodeID: "worker-a", NodeName: "Worker A", Timestamp: at, MemoryAvailableBytes: 128 << 20},
+		{NodeID: "worker-a", NodeName: "Worker A", Timestamp: at.Add(10 * time.Minute), MemoryAvailableBytes: 12 << 20},
+	} {
+		if err := first.metricsArchive.Append(point); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !state.DeleteNode(ctx, "worker-a") {
+		t.Fatal("fixture node was not removed")
+	}
+	restarted, err := NewServerHandler(cfg, service.NewPolicyService(state), state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes := restarted.Routes()
+	read := func(path string) models.SystemMetricsHistory {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		routes.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		var history models.SystemMetricsHistory
+		if err := json.Unmarshal(rec.Body.Bytes(), &history); err != nil || rec.Code != http.StatusOK {
+			t.Fatalf("history %s: %d %s (%v)", path, rec.Code, rec.Body.String(), err)
+		}
+		return history
+	}
+	latest := at.Add(10 * time.Minute)
+	recent := read("/monitoring/history?node=worker-a&range=900")
+	if recent.Points == nil || len(recent.Points) != 0 || len(recent.ArchiveNodes) != 1 {
+		t.Fatalf("recent window must keep the archive catalog with an empty sample array: %+v", recent)
+	}
+	source := recent.ArchiveNodes[0]
+	if source.Registered || source.NodeID != "worker-a" || source.Name != "Worker A" || !source.LastSampleAt.Equal(latest) || recent.ArchiveNodeID != "manager" {
+		t.Fatalf("retained node metadata is incorrect: %+v", source)
+	}
+	from := latest.Add(-time.Hour).Format(time.RFC3339)
+	to := latest.Format(time.RFC3339)
+	history := read("/monitoring/history?node=worker-a&from=" + from + "&to=" + to)
+	stream := restarted.monitoringStreamSnapshot(ctx, "worker-a", 3600, from, to)
+	for _, result := range []models.SystemMetricsHistory{history, stream} {
+		if len(result.Points) != 2 || result.Points[1].MemoryAvailableBytes != 12<<20 || len(result.Nodes) != 1 || result.Nodes[0].NodeID != "worker-a" {
+			t.Fatalf("the last hour of real samples is missing: %+v", result)
+		}
+	}
+	if nodes := restarted.service.ListNodes(ctx); len(nodes) != 1 || nodes[0].ID != "worker-b" {
+		t.Fatalf("the archive changed live cluster membership: %+v", nodes)
+	}
+	unknown := httptest.NewRecorder()
+	routes.ServeHTTP(unknown, httptest.NewRequest(http.MethodGet, "/monitoring/history?node=unknown", nil))
+	if unknown.Code != http.StatusNotFound {
+		t.Fatalf("unknown node: %d %s", unknown.Code, unknown.Body.String())
 	}
 }
 

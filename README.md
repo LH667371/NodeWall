@@ -81,7 +81,7 @@ The generated XDP object is expected at `bpf/gen/xdpacl_bpfel.o`.
 
 ## Build Notes
 
-The project targets host Go `1.27.3`.
+The project uses the Go toolchain declared in `go.mod`.
 
 `make generate` now supports two paths:
 
@@ -107,8 +107,8 @@ server continues to serve the built-in static UI from `web/`.
 
 `make dev-real` runs the real dataplane path and is intended for Linux hosts
 with the generated BPF object available and sufficient privileges for XDP and
-TC attach/detach. Native XDP handles ingress; the same BPF object attaches a
-TC egress program when outbound enforcement is enabled.
+TC attach/detach. The agent selects native or generic XDP for ingress using the
+kernel and driver capabilities. The same BPF object handles TC egress.
 
 Useful commands:
 
@@ -123,8 +123,8 @@ Environment examples for both modes live in `examples/dev.env.example`.
 
 ## Install preflight
 
-Run the preflight before installation to check the Ubuntu release, root
-privileges, kernel, systemd, service ports, the selected NIC, BPF/XDP, and
+Run the preflight before installation to check root privileges, the running
+Linux kernel, systemd, service ports, the selected NIC, BPF/XDP, and
 iptables:
 
 ```sh
@@ -132,13 +132,18 @@ sudo ./bin/nodewall preflight --default-interface ens18
 ```
 
 The command prints one result per check and exits unsuccessfully when a hard
-failure is found. Ubuntu 18.04 is the minimum release checked by the installer;
-non-Ubuntu distributions receive a warning while their kernel and dataplane
-dependencies are still checked. SSH protection uses `/var/log/auth.log`,
+failure is found. Dataplane compatibility is checked against the running kernel
+and the selected backend's requirements. SSH protection uses `/var/log/auth.log`,
 `/var/log/secure`, or journald when the traditional files are absent.
 `nodewall install` runs the same preflight
 before writing installation files or systemd units. `--enable-services=false`
 skips only the live systemd check.
+
+Linux 4.18 is the minimum version checked for XDP/TC. The running kernel must
+also be able to load the packaged BPF object and attach it to the selected
+interface. During boot, the agent restores the saved policy for each configured
+interface and retries if its network device has yet to appear. The health
+endpoint reports incomplete restorations while the management API is available.
 
 ## Packaging
 
@@ -165,11 +170,17 @@ make package-update
 
 Both commands build the web assets and compile the current Go sources. If the
 locked web dependencies are missing, the script runs `npm ci` first.
+Packaging checks Node.js before preparing ClamAV assets. It uses Node.js
+`^20.19.0` or `>=22.12.0` from PATH, or selects the installed nvm version from
+`.nvmrc`. To install that version, run `nvm install` from the repository root.
 `make package-offline` uses Docker and network access to check the `main`,
 `daily`, and `bytecode` databases on every run. It downloads available updates,
 verifies all three CVD signatures, and reuses the verified engine and source
 cache. If the database refresh or verification fails, packaging stops and the
 previous database cache is preserved.
+Completed engine builds are cached independently from database refreshes. On
+a new builder, set `NODEWALL_CLAMAV_ENGINE_SEED_DIR` to the verified `clamav/`
+directory from an offline archive with the same engine version to reuse it.
 `make package-archive` remains an alias for `make package-offline`;
 `make package` still produces standalone binaries without ClamAV assets.
 
@@ -296,7 +307,24 @@ overrides. If the default `0.0.0.0:8086` or `127.0.0.1:9080` ports are busy,
 set `NODEWALL_SERVER_ADDR`, `NODEWALL_AGENT_ADDR`, and `NODEWALL_AGENT_URL`
 there before restarting the services.
 
+## Off-host Monitoring History
+
+Each manager collects node metrics every 15 seconds and writes them to
+`NODEWALL_MONITORING_HISTORY_DIR`. History is kept for up to seven days within
+the default 512 MiB quota, configurable through `NODEWALL_MONITORING_HISTORY_MIB`.
+Resource Monitoring → History keeps retired nodes selectable until their archive
+expires and can replay the hour ending at their last archived sample.
+
+For history access after the primary Web host fails, enable a standby manager on
+another host. The standby collects its own samples and copies the primary's two
+most recent minutes of completed samples during its regular sync.
+
 ## Access Control And Password Login
+
+Administrators can issue a single-use enrollment command from Node Management.
+New nodes enroll as agents by default. Grant standby manager access only to
+nodes trusted to hold the cluster encryption key and credential snapshot.
+Previously enrolled standby managers continue syncing through their node credentials.
 
 Production-style deployments can now protect the web console with:
 

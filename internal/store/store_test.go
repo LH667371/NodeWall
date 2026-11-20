@@ -35,3 +35,23 @@ func TestFailedPolicyPersistenceKeepsLastDurablePolicy(t *testing.T) {
 		t.Fatalf("undurable policy became visible: %#v %v", actual, err)
 	}
 }
+
+func TestRestoredPolicyHasANewerVersionThanTheRevertedPolicy(t *testing.T) {
+	ctx := t.Context()
+	state := New()
+	const node, iface = "node-a", "eth0"
+	before := state.PutPolicy(ctx, models.InterfacePolicy{NodeID: node, Interface: iface, PublicPorts: []uint16{22}})
+	if err := state.BeginPolicyUpdate(ctx, node, iface); err != nil {
+		t.Fatal(err)
+	}
+	draft := before
+	draft.PublicPorts = nil
+	reverted := state.PutPolicy(ctx, draft)
+	if err := state.FinishPolicyUpdate(ctx, node, iface, true); err != nil {
+		t.Fatal(err)
+	}
+	actual, err := state.GetPolicy(ctx, node, iface)
+	if err != nil || !actual.UpdatedAt.After(reverted.UpdatedAt) || len(actual.PublicPorts) != 1 || actual.PublicPorts[0] != 22 {
+		t.Fatalf("restoration did not publish the previous rules as a new version: %#v %v", actual, err)
+	}
+}

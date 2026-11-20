@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,7 +13,10 @@ import (
 	"strings"
 	"time"
 
+	"nodewall/internal/api"
 	"nodewall/internal/config"
+	"nodewall/internal/models"
+	"nodewall/internal/monitoring"
 	"nodewall/internal/nodeauth"
 	"nodewall/internal/securestore"
 	"nodewall/internal/store"
@@ -24,7 +29,7 @@ const standbySyncInterval = 15 * time.Second
 // active manager is reachable. If the active manager goes offline, the local
 // server keeps the last complete snapshot and can still serve the console and
 // proxy the enrolled agents without a promotion step.
-func runStandbySync(ctx context.Context, cfg config.ServerConfig, state *store.Store, credentials *nodeauth.Registry) {
+func runStandbySync(ctx context.Context, cfg config.ServerConfig, state *store.Store, credentials *nodeauth.Registry, handler *api.ServerHandler) {
 	managerURL := strings.TrimRight(strings.TrimSpace(cfg.ManagerURL), "/")
 	if managerURL == "" || credentials == nil {
 		return
@@ -62,6 +67,11 @@ func runStandbySync(ctx context.Context, cfg config.ServerConfig, state *store.S
 		if err := syncStandbySnapshot(syncCtx, client, managerURL, cfg.NodeID, token, cfg.AuthFile, cfg.ClusterKeyFile, state, credentials); err != nil {
 			log.Printf("warning: standby manager sync failed: %v", err)
 		}
+		if cfg.MonitoringHistoryDir != "" && syncCtx.Err() == nil {
+			if err := syncStandbyMonitoring(syncCtx, client, managerURL, cfg.NodeID, token, handler); err != nil {
+				log.Printf("warning: standby monitoring sync failed: %v", err)
+			}
+		}
 	}
 	sync()
 	ticker := time.NewTicker(standbySyncInterval)
@@ -76,15 +86,19 @@ func runStandbySync(ctx context.Context, cfg config.ServerConfig, state *store.S
 	}
 }
 
+func requestStandbyBootstrap(ctx context.Context, client *http.Client, managerURL, nodeID, token, kind string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, managerURL+"/join/bootstrap/"+kind, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set(nodeauth.NodeHeader, nodeID)
+	req.Header.Set("Authorization", "Bearer "+token)
+	return client.Do(req)
+}
+
 func syncStandbySnapshot(ctx context.Context, client *http.Client, managerURL, nodeID, token, authFile, clusterKeyFile string, state *store.Store, credentials *nodeauth.Registry) error {
 	get := func(kind string) ([]byte, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, managerURL+"/join/bootstrap/"+kind, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set(nodeauth.NodeHeader, nodeID)
-		req.Header.Set("Authorization", "Bearer "+token)
-		resp, err := client.Do(req)
+		resp, err := requestStandbyBootstrap(ctx, client, managerURL, nodeID, token, kind)
 		if err != nil {
 			return nil, err
 		}
@@ -124,6 +138,32 @@ func syncStandbySnapshot(ctx context.Context, client *http.Client, managerURL, n
 		return fmt.Errorf("write standby auth store: %w", err)
 	}
 	return nil
+}
+
+func syncStandbyMonitoring(ctx context.Context, client *http.Client, managerURL, nodeID, token string, handler *api.ServerHandler) error {
+	resp, err := requestStandbyBootstrap(ctx, client, managerURL, nodeID, token, "monitoring")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusNoContent {
+		return nil // Old managers and managers without an archive still work.
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("bootstrap monitoring failed: %s", resp.Status)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, monitoring.StandbyCopyMaxBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(data) > monitoring.StandbyCopyMaxBytes {
+		return errors.New("standby monitoring response exceeds the size limit")
+	}
+	var samples []models.SystemMetricPoint
+	if err := json.Unmarshal(data, &samples); err != nil {
+		return fmt.Errorf("decode standby monitoring samples: %w", err)
+	}
+	return handler.ImportMonitoringHistory(ctx, samples)
 }
 
 func writeStandbyFile(path string, data []byte, mode os.FileMode) error {

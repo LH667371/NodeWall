@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/x509"
+	_ "embed"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -24,6 +25,14 @@ import (
 )
 
 const enrollmentTTL = 20 * time.Minute
+
+//go:embed node_enrollment_download.sh
+var enrollmentDownloadShell string
+
+type enrollmentTicket struct {
+	ExpiresAt time.Time
+	Standby   bool
+}
 
 const defaultJoinBinaryPath = "/opt/nodewall/bin/nodewall"
 
@@ -91,33 +100,27 @@ func (h *ServerHandler) handleEnrollmentTicket(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusBadRequest, errors.New("node enrollment requires HTTPS"))
 		return
 	}
-	if h.nodeCredentials == nil {
+	if h.nodeCredentials == nil || h.auth == nil || !h.auth.enabled {
 		writeError(w, http.StatusServiceUnavailable, errors.New("node enrollment is unavailable in demo mode"))
 		return
+	}
+	var options struct {
+		Standby bool `json:"standby"`
+	}
+	if r.Body != nil {
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&options); err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
 	}
 	token, err := nodeauth.NewToken()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	expires := time.Now().Add(enrollmentTTL)
-	h.enrollmentMu.Lock()
-	if h.enrollmentTickets == nil {
-		h.enrollmentTickets = make(map[string]time.Time)
-	}
-	for key, expiry := range h.enrollmentTickets {
-		if time.Now().After(expiry) {
-			delete(h.enrollmentTickets, key)
-		}
-	}
-	if len(h.enrollmentTickets) >= 128 {
-		h.enrollmentMu.Unlock()
-		writeError(w, http.StatusTooManyRequests, errors.New("too many pending enrollment commands"))
-		return
-	}
-	h.enrollmentTickets[token] = expires
-	h.enrollmentMu.Unlock()
-	pin, err := h.managerCertificatePin()
+	certificate, pin, err := h.managerEnrollmentCertificate()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -126,21 +129,40 @@ func (h *ServerHandler) handleEnrollmentTicket(w http.ResponseWriter, r *http.Re
 	scriptRequest := r.Clone(r.Context())
 	scriptRequest.Method = http.MethodGet
 	scriptRequest.URL = &url.URL{Path: "/join/script", RawQuery: "token=" + url.QueryEscape(token)}
-	script, err := h.buildJoinScript(scriptRequest, token, pin)
+	tlsSetup := joinCurlSetupScript(certificate, pin)
+	script, err := h.buildJoinScript(scriptRequest, token, tlsSetup, options.Standby)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	scriptSum := sha256.Sum256([]byte(script))
 	scriptSHA256 := hex.EncodeToString(scriptSum[:])
-	command := scriptHashJoinCommand(scriptURL, scriptSHA256)
+	command := scriptHashJoinCommand(scriptURL, scriptSHA256, tlsSetup)
+	now := time.Now()
+	ticket := enrollmentTicket{ExpiresAt: now.Add(enrollmentTTL), Standby: options.Standby}
+	h.enrollmentMu.Lock()
+	if h.enrollmentTickets == nil {
+		h.enrollmentTickets = make(map[string]enrollmentTicket)
+	}
+	for key, pending := range h.enrollmentTickets {
+		if !now.Before(pending.ExpiresAt) {
+			delete(h.enrollmentTickets, key)
+		}
+	}
+	if len(h.enrollmentTickets) >= 128 {
+		h.enrollmentMu.Unlock()
+		writeError(w, http.StatusTooManyRequests, errors.New("too many pending enrollment commands"))
+		return
+	}
+	h.enrollmentTickets[token] = ticket
+	h.enrollmentMu.Unlock()
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"url":           scriptURL,
 		"pin":           pin,
 		"script_sha256": scriptSHA256,
 		"command":       command,
-		"expires_at":    expires,
+		"expires_at":    ticket.ExpiresAt,
 	})
 }
 
@@ -152,90 +174,95 @@ func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
-// scriptHashJoinCommand keeps the copied command short while still protecting
-// the root-executed script. The SHA-256 value comes from the authenticated
-// enrollment response, so an on-path attacker cannot replace the script after
-// the initial curl uses -k to bootstrap an old TLS client.
-func scriptHashJoinCommand(scriptURL, scriptSHA256 string) string {
+// Authenticate the manager before transmitting the ticket, then verify the
+// script against the digest supplied to the administrator.
+func scriptHashJoinCommand(scriptURL, scriptSHA256, tlsSetup string) string {
 	inner := strings.Join([]string{
 		"set -euo pipefail",
 		"JOIN_TMP=$(mktemp -d)",
-		`trap 'rm -f "$JOIN_TMP/join.sh"; rmdir "$JOIN_TMP"' EXIT`,
+		`trap 'rm -f "$JOIN_TMP/join.sh" "$JOIN_TMP/manager.crt"; rmdir "$JOIN_TMP"' EXIT`,
+		tlsSetup,
 		"printf '%s\\n' '[nodewall] downloading enrollment script' >&2",
-		"curl -kfsSL --connect-timeout 10 --max-time 120 " + shellQuote(scriptURL) + " -o \"$JOIN_TMP/join.sh\"",
+		"join_download " + shellQuote(scriptURL) + " \"$JOIN_TMP/join.sh\"",
 		"printf '%s\\n' '[nodewall] verifying enrollment script' >&2",
 		"printf '%s  %s\\n' " + shellQuote(scriptSHA256) + " \"$JOIN_TMP/join.sh\" | sha256sum -c -",
 		"printf '%s\\n' '[nodewall] starting NodeWall enrollment' >&2",
 		"bash \"$JOIN_TMP/join.sh\"",
-	}, "; ")
+	}, "\n")
 	return "bash -c " + shellQuote(inner)
 }
 
-// joinCurlSetupScript keeps the generated installer secure on hosts whose curl
-// predates --pinnedpubkey. It is inserted after JOIN_TMP is created and selects
-// either curl pinning or an OpenSSL-verified HTTP fallback.
-func joinCurlSetupScript(baseURL, pin, ticket, binarySHA256 string) string {
-	if pin == "" {
-		return "progress 'checking curl capabilities'\n" +
-			"CURL_ARGS=(-kfsSL --connect-timeout 10 --max-time 300)\n" +
-			"CURL_CERT_MODE=curl\n" +
-			"NODEWALL_BINARY_SHA256=" + shellQuote(binarySHA256) + "\n"
-	}
-	certURL := baseURL + "/join/tls-cert?token=" + url.QueryEscape(ticket)
+// Use the certificate obtained through the administrator's session for all
+// enrollment downloads, including hosts with legacy curl/NSS.
+func joinCurlSetupScript(certificate []byte, pin string) string {
 	return "MANAGER_PIN=" + shellQuote(pin) + "\n" +
-		"NODEWALL_BINARY_SHA256=" + shellQuote(binarySHA256) + "\n" +
-		"progress 'checking curl capabilities'\n" +
-		"CURL_HELP=$(curl --help all 2>&1 || true)\n" +
-		"CURL_VERSION=$(curl --version 2>&1 || true)\n" +
-		"if [[ \"$CURL_HELP\" == *'--pinnedpubkey'* && \"$CURL_VERSION\" != *'NSS/'* ]]; then\n" +
-		"  CURL_ARGS=(-kfsSL --connect-timeout 10 --max-time 300 --pinnedpubkey \"$MANAGER_PIN\")\n" +
-		"  CURL_CERT_MODE=curl\n" +
-		"else\n" +
-		"  printf '%s\\n' '[nodewall] curl lacks --pinnedpubkey; using the OpenSSL-verified legacy download path' >&2\n" +
-		"  curl -kfsSL --connect-timeout 10 --max-time 60 " + shellQuote(certURL) + " -o \"$JOIN_TMP/manager.crt\"\n" +
-		"  openssl x509 -in \"$JOIN_TMP/manager.crt\" -pubkey -noout > \"$JOIN_TMP/public.pem\"\n" +
-		"  if ! openssl pkey -pubin -in \"$JOIN_TMP/public.pem\" -pubout -outform DER -out \"$JOIN_TMP/public.der\" 2>/dev/null; then\n" +
-		"    openssl rsa -pubin -in \"$JOIN_TMP/public.pem\" -pubout -outform DER -out \"$JOIN_TMP/public.der\" 2>/dev/null\n" +
-		"  fi\n" +
-		"  ACTUAL_PIN=\"sha256//$(openssl dgst -sha256 -binary \"$JOIN_TMP/public.der\" | openssl base64 | tr -d '\\r\\n')\"\n" +
-		"  if [[ \"$ACTUAL_PIN\" != \"$MANAGER_PIN\" ]]; then\n" +
-		"    echo 'manager certificate pin mismatch' >&2\n" +
-		"    exit 1\n" +
-		"  fi\n" +
-		"  printf '%s\\n' '[nodewall] manager certificate pin verified' >&2\n" +
-		"  CURL_ARGS=(-kfsSL --connect-timeout 10 --max-time 300)\n" +
-		"  CURL_CERT_MODE=legacy\n" +
-		"fi\n"
+		"printf '%s' " + shellQuote(base64.StdEncoding.EncodeToString(certificate)) + " | base64 -d > \"$JOIN_TMP/manager.crt\"\n" +
+		enrollmentDownloadShell
 }
 
-func (h *ServerHandler) managerCertificatePin() (string, error) {
+func (h *ServerHandler) managerEnrollmentCertificate() ([]byte, string, error) {
 	data, err := os.ReadFile(h.tlsCertFile)
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
-	block, _ := pem.Decode(data)
-	if block == nil {
-		return "", errors.New("manager certificate is invalid")
+	var certificates []byte
+	var leaf *x509.Certificate
+	for {
+		block, rest := pem.Decode(data)
+		if block == nil {
+			break
+		}
+		data = rest
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		if leaf == nil {
+			leaf, err = x509.ParseCertificate(block.Bytes)
+			if err != nil {
+				return nil, "", err
+			}
+		}
+		certificates = append(certificates, pem.EncodeToMemory(block)...)
 	}
-	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return "", err
+	if leaf == nil {
+		return nil, "", errors.New("manager certificate is invalid")
 	}
-	sum := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
-	return "sha256//" + base64.StdEncoding.EncodeToString(sum[:]), nil
+	sum := sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
+	return certificates, "sha256//" + base64.StdEncoding.EncodeToString(sum[:]), nil
 }
 
-func (h *ServerHandler) joinAuthorized(w http.ResponseWriter, r *http.Request) bool {
-	if h.nodeCredentials == nil {
-		return true
-	}
-	if h.nodeCredentials.Authenticate(r.Header.Get(nodeauth.NodeHeader), nodeauth.Bearer(r.Header.Get("Authorization"))) {
-		return true
-	}
+func (h *ServerHandler) activeEnrollmentTicket(token string) (enrollmentTicket, bool) {
 	h.enrollmentMu.Lock()
-	expires, ok := h.enrollmentTickets[r.URL.Query().Get("token")]
-	h.enrollmentMu.Unlock()
-	if ok && time.Now().Before(expires) {
+	defer h.enrollmentMu.Unlock()
+	ticket, ok := h.enrollmentTickets[token]
+	return ticket, ok && time.Now().Before(ticket.ExpiresAt)
+}
+
+func (h *ServerHandler) enrolledNode(r *http.Request) (nodeauth.Credential, bool) {
+	if r.TLS == nil || h.nodeCredentials == nil {
+		return nodeauth.Credential{}, false
+	}
+	return h.nodeCredentials.AuthenticatedCredential(strings.TrimSpace(r.Header.Get(nodeauth.NodeHeader)), nodeauth.Bearer(r.Header.Get("Authorization")))
+}
+
+func (h *ServerHandler) standbyAuthorized(w http.ResponseWriter, r *http.Request) bool {
+	credential, ok := h.enrolledNode(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, errors.New("enrolled HTTPS node credential required"))
+		return false
+	}
+	if !credential.CanSyncStandby() {
+		writeError(w, http.StatusForbidden, errors.New("node is not authorized as a standby manager"))
+		return false
+	}
+	return true
+}
+
+// Only installation assets and version checks accept short-lived tickets.
+func (h *ServerHandler) joinDownloadAuthorized(w http.ResponseWriter, r *http.Request) bool {
+	_, enrolled := h.enrolledNode(r)
+	_, ticket := h.activeEnrollmentTicket(r.URL.Query().Get("token"))
+	if enrolled || (r.TLS != nil && h.nodeCredentials != nil && ticket) {
 		return true
 	}
 	writeError(w, http.StatusUnauthorized, errors.New("enrollment command expired; generate a new command in node management"))
@@ -257,32 +284,47 @@ func (h *ServerHandler) handleNodeEnrollment(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	ticket := nodeauth.Bearer(r.Header.Get("Authorization"))
+	proof := nodeauth.Bearer(r.Header.Get("Authorization"))
 	h.enrollmentMu.Lock()
 	defer h.enrollmentMu.Unlock()
-	expires, ok := h.enrollmentTickets[ticket]
-	if !ok || time.Now().After(expires) {
+	ticket, ok := h.enrollmentTickets[proof]
+	if !ok || !time.Now().Before(ticket.ExpiresAt) {
 		writeError(w, http.StatusUnauthorized, errors.New("enrollment credential is expired or already used"))
 		return
 	}
-	if c.NodeID == h.nodeID {
+	current, exists := h.nodeCredentials.Get(c.NodeID)
+	if c.NodeID == h.nodeID || (exists && !nodeauth.EqualToken(c.Token, current.Token)) {
 		writeJSON(w, http.StatusConflict, map[string]any{
-			"error":             "node ID is reserved by the manager",
+			"error":             "node ID already belongs to a registered node",
 			"code":              "NODE_ID_CONFLICT",
 			"suggested_node_id": h.suggestEnrollmentNodeID(c),
 		})
 		return
 	}
+	// Only the issuer can authorize standby access. Verified re-enrollment
+	// retains a working standby's existing authorization.
+	standby := ticket.Standby || (exists && current.CanSyncStandby())
+	c.Standby = &standby
 	if err := h.nodeCredentials.Put(c); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	u, _ := url.Parse(c.AgentURL)
 	if err := h.store.UpsertNodeChecked(r.Context(), models.Node{ID: c.NodeID, Name: c.NodeID, AgentURL: strings.TrimRight(c.AgentURL, "/"), AdvertiseIP: u.Hostname(), AgentHTTPAddr: u.Host, LastSeenAt: time.Now().UTC()}); err != nil {
+		var rollbackErr error
+		if exists {
+			rollbackErr = h.nodeCredentials.Put(current)
+		} else {
+			rollbackErr = h.nodeCredentials.Revoke(c.NodeID)
+		}
+		if rollbackErr != nil {
+			delete(h.enrollmentTickets, proof)
+			err = errors.Join(err, fmt.Errorf("restore enrollment credential: %w", rollbackErr))
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	delete(h.enrollmentTickets, ticket)
+	delete(h.enrollmentTickets, proof)
 	go h.reconcileEnrollmentPolicies()
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusCreated, map[string]string{"status": "enrolled"})
@@ -342,11 +384,7 @@ func (h *ServerHandler) handleJoinHeartbeat(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusServiceUnavailable, errors.New("node heartbeat unavailable"))
 		return
 	}
-	if !h.joinAuthorized(w, r) {
-		return
-	}
-	nodeID := strings.TrimSpace(r.Header.Get(nodeauth.NodeHeader))
-	credential, ok := h.nodeCredentials.Get(nodeID)
+	credential, ok := h.enrolledNode(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, errors.New("node enrollment required"))
 		return
@@ -372,6 +410,10 @@ func (h *ServerHandler) handleJoinHeartbeat(w http.ResponseWriter, r *http.Reque
 	if agentHTTPAddr == "" {
 		agentHTTPAddr = endpoint.Host
 	}
+	serverHTTPAddr := ""
+	if refreshed.CanSyncStandby() {
+		serverHTTPAddr = normalizeNodeHTTPAddr(heartbeat.ServerHTTPAddr, endpoint.Hostname())
+	}
 	name := strings.TrimSpace(heartbeat.NodeName)
 	if name == "" {
 		name = credential.NodeID
@@ -382,7 +424,7 @@ func (h *ServerHandler) handleJoinHeartbeat(w http.ResponseWriter, r *http.Reque
 		AgentURL:       credential.AgentURL,
 		AdvertiseIP:    endpoint.Hostname(),
 		AgentHTTPAddr:  agentHTTPAddr,
-		ServerHTTPAddr: normalizeNodeHTTPAddr(heartbeat.ServerHTTPAddr, endpoint.Hostname()),
+		ServerHTTPAddr: serverHTTPAddr,
 		PackageVersion: strings.TrimSpace(heartbeat.PackageVersion),
 		LastSeenAt:     time.Now().UTC(),
 	}
@@ -422,7 +464,7 @@ func refreshHeartbeatCredential(registry *nodeauth.Registry, current nodeauth.Cr
 	next := current
 	next.AgentURL = origin
 	next.Certificate = certificate
-	if err := registry.Put(next); err != nil {
+	if err := registry.Refresh(next); err != nil {
 		return current, fmt.Errorf("refresh agent credential: %w", err)
 	}
 	return next, nil

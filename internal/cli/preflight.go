@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
-	"strconv"
 	"strings"
 
 	assets "nodewall"
@@ -22,12 +21,10 @@ import (
 )
 
 const (
-	preflightPass      = "通过"
-	preflightWarn      = "警告"
-	preflightFail      = "失败"
-	preflightSkip      = "跳过"
-	minimumUbuntuMajor = 18
-	minimumUbuntuMinor = 4
+	preflightPass = "通过"
+	preflightWarn = "警告"
+	preflightFail = "失败"
+	preflightSkip = "跳过"
 )
 
 type preflightCheck struct {
@@ -105,7 +102,7 @@ type preflightOptions struct {
 
 // preflightDeps keeps host probes injectable. The production path uses the
 // real operating-system calls, while unit tests can exercise the decision
-// logic without requiring an Ubuntu host, systemd, or BPF privileges.
+// logic without requiring a Linux host, systemd, or BPF privileges.
 type preflightDeps struct {
 	goos               string
 	euid               func() int
@@ -260,7 +257,6 @@ func checkPreflight(opts preflightOptions, deps preflightDeps) preflightReport {
 	}
 	report := preflightReport{Dataplane: dataplane}
 	report.Checks = append(report.Checks,
-		checkUbuntu(deps),
 		checkPermission(deps),
 		checkKernel(opts, deps),
 		checkSystemd(opts, deps),
@@ -273,74 +269,6 @@ func checkPreflight(opts preflightOptions, deps preflightDeps) preflightReport {
 	return report
 }
 
-func checkUbuntu(deps preflightDeps) preflightCheck {
-	data, err := deps.readFile("/etc/os-release")
-	if err != nil {
-		return preflightCheck{Name: "Ubuntu 版本", Status: preflightFail, Detail: fmt.Sprintf("无法读取 /etc/os-release: %v", err)}
-	}
-	values := parseOSRelease(data)
-	id := strings.ToLower(values["ID"])
-	version := values["VERSION_ID"]
-	if id != "ubuntu" {
-		if id == "" {
-			return preflightCheck{Name: "Ubuntu 版本", Status: preflightFail, Detail: "未识别到 Linux 发行版 ID"}
-		}
-		return preflightCheck{Name: "Ubuntu 版本", Status: preflightWarn, Detail: fmt.Sprintf("当前为 %s %s；项目未对该发行版做 Ubuntu 版本承诺", id, version)}
-	}
-	major, minor, ok := parseUbuntuVersion(version)
-	if !ok {
-		return preflightCheck{Name: "Ubuntu 版本", Status: preflightFail, Detail: fmt.Sprintf("VERSION_ID=%q 无法解析", version)}
-	}
-	if major < minimumUbuntuMajor || (major == minimumUbuntuMajor && minor < minimumUbuntuMinor) {
-		return preflightCheck{Name: "Ubuntu 版本", Status: preflightFail, Detail: fmt.Sprintf("Ubuntu %d.%02d 低于最低支持版本 18.04", major, minor)}
-	}
-	detail := "Ubuntu " + version
-	if codename := strings.TrimSpace(values["VERSION_CODENAME"]); codename != "" {
-		detail += " (" + codename + ")"
-	}
-	return preflightCheck{Name: "Ubuntu 版本", Status: preflightPass, Detail: detail}
-}
-
-func parseOSRelease(data []byte) map[string]string {
-	values := make(map[string]string)
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		key = strings.TrimSpace(key)
-		value = strings.TrimSpace(value)
-		value = strings.Trim(value, "\"")
-		value = strings.Trim(value, "'")
-		values[key] = value
-	}
-	return values
-}
-
-func parseUbuntuVersion(value string) (int, int, bool) {
-	parts := strings.Split(strings.TrimSpace(value), ".")
-	if len(parts) < 2 {
-		return 0, 0, false
-	}
-	major, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return 0, 0, false
-	}
-	minorText := parts[1]
-	if len(minorText) > 2 {
-		minorText = minorText[:2]
-	}
-	minor, err := strconv.Atoi(minorText)
-	if err != nil {
-		return 0, 0, false
-	}
-	return major, minor, true
-}
-
 func checkPermission(deps preflightDeps) preflightCheck {
 	if deps.euid() != 0 {
 		return preflightCheck{Name: "权限", Status: preflightFail, Detail: "必须使用 root 运行；请使用 sudo"}
@@ -349,6 +277,9 @@ func checkPermission(deps preflightDeps) preflightCheck {
 }
 
 func checkKernel(opts preflightOptions, deps preflightDeps) preflightCheck {
+	if deps.goos != "linux" {
+		return preflightCheck{Name: "Linux 内核", Status: preflightFail, Detail: "NodeWall 只能安装在 Linux 主机上"}
+	}
 	if opts.InstallMode == "server-only" {
 		return preflightCheck{Name: "Linux 内核", Status: preflightSkip, Detail: "server-only 模式不运行本机数据面"}
 	}

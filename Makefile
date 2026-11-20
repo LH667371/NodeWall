@@ -5,7 +5,7 @@ GOCACHE ?= $(CURDIR)/.gocache
 GOPATH ?= $(CURDIR)/.gopath
 GOENV ?= off
 CONTAINER_RUNTIME ?=
-NODEWALL_BPF_IMAGE ?= nodewall-bpf-gen:go1.27.3
+NODEWALL_BPF_IMAGE ?= nodewall-bpf-gen:go1.27.4
 GO_RUN = env GOCACHE=$(GOCACHE) GOPATH=$(GOPATH) GOENV=$(GOENV) $(GO)
 
 .PHONY: generate generate-hostlinux build package package-offline package-update run-agent run-server dev dev-real deploy cleanup test clean help

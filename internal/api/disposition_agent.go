@@ -28,7 +28,7 @@ func (h *AgentHandler) handleListTemporaryBlocks(w http.ResponseWriter, r *http.
 
 func (h *AgentHandler) handleCreateTemporaryBlock(w http.ResponseWriter, r *http.Request) {
 	iface := r.PathValue("iface")
-	if err := h.pruneExpiredDispositions(r.Context(), iface); err != nil {
+	if err := h.pruneExpiredDispositionsLocked(r.Context(), iface); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -113,7 +113,7 @@ func (h *AgentHandler) handleCreateTemporaryBlock(w http.ResponseWriter, r *http
 
 func (h *AgentHandler) handleDeleteTemporaryBlock(w http.ResponseWriter, r *http.Request) {
 	iface := r.PathValue("iface")
-	if err := h.pruneExpiredDispositions(r.Context(), iface); err != nil {
+	if err := h.pruneExpiredDispositionsLocked(r.Context(), iface); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -190,7 +190,7 @@ func (h *AgentHandler) handleListRateLimits(w http.ResponseWriter, r *http.Reque
 
 func (h *AgentHandler) handleCreateRateLimit(w http.ResponseWriter, r *http.Request) {
 	iface := r.PathValue("iface")
-	if err := h.pruneExpiredDispositions(r.Context(), iface); err != nil {
+	if err := h.pruneExpiredDispositionsLocked(r.Context(), iface); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -290,7 +290,7 @@ func (h *AgentHandler) handleCreateRateLimit(w http.ResponseWriter, r *http.Requ
 
 func (h *AgentHandler) handleDeleteRateLimit(w http.ResponseWriter, r *http.Request) {
 	iface := r.PathValue("iface")
-	if err := h.pruneExpiredDispositions(r.Context(), iface); err != nil {
+	if err := h.pruneExpiredDispositionsLocked(r.Context(), iface); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -375,6 +375,16 @@ func extractIPv4Candidate(value string) string {
 }
 
 func (h *AgentHandler) pruneExpiredDispositions(ctx context.Context, iface string) error {
+	h.policyMu.Lock()
+	defer h.policyMu.Unlock()
+	return h.pruneExpiredDispositionsLocked(ctx, iface)
+}
+
+func (h *AgentHandler) pruneExpiredDispositionsLocked(ctx context.Context, iface string) error {
+	return h.pruneInterfaceDispositions(ctx, iface, h.interfaceRestoreError(iface) == nil)
+}
+
+func (h *AgentHandler) pruneInterfaceDispositions(ctx context.Context, iface string, updateDataplane bool) error {
 	runtime := h.ensureRuntime(iface)
 	changed := false
 	for _, direction := range []models.PolicyDirection{models.DirectionIngress, models.DirectionEgress} {
@@ -387,8 +397,10 @@ func (h *AgentHandler) pruneExpiredDispositions(ctx context.Context, iface strin
 				continue
 			}
 			changed = true
-			if err := h.removeTemporaryBlock(iface, runtime, block, blocks); err != nil {
-				return err
+			if updateDataplane {
+				if err := h.removeTemporaryBlock(iface, runtime, block, blocks); err != nil {
+					return err
+				}
 			}
 		}
 		limits := make([]models.RateLimitRule, 0, len(selected.RateLimits))
@@ -406,6 +418,11 @@ func (h *AgentHandler) pruneExpiredDispositions(ctx context.Context, iface strin
 	}
 	if changed {
 		h.setRuntime(iface, runtime)
+		// Startup has no live maps to edit. Save the resulting policy only
+		// after the startup reconciliation has restored it.
+		if !updateDataplane {
+			return nil
+		}
 		if runtime.Attached {
 			if err := h.xdp.ReplaceRateLimitRules(iface, runtime.RateLimits); err != nil {
 				return err

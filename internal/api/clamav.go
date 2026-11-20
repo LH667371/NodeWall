@@ -13,7 +13,11 @@ func (h *ServerHandler) clamAVAuthorized(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, errors.New("ClamAV synchronization requires HTTPS"))
 		return false
 	}
-	return h.joinAuthorized(w, r)
+	if _, ok := h.enrolledNode(r); !ok {
+		writeError(w, http.StatusUnauthorized, errors.New("enrolled HTTPS node credential required"))
+		return false
+	}
+	return true
 }
 
 func (h *ServerHandler) handleJoinClamAVManifest(w http.ResponseWriter, r *http.Request) {

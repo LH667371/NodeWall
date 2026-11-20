@@ -158,7 +158,7 @@ const resourceCards = computed(() => [
 ].map((item) => ({ ...item, points: resourceHistory.value.map((sample) => ({ key: sample.timestamp, value: sample[item.key] })) })));
 
 const events = computed(() => props.store.eventRows
-  .filter(item => (props.store.state.overviewScope !== "node" || item.node === props.store.state.nodeId)
+  .filter(item => item.status !== "info" && (props.store.state.overviewScope !== "node" || item.node === props.store.state.nodeId)
     && (eventFilter.value === "all" || item.sourceKey === eventFilter.value))
   .slice(0, 5));
 const recentNewEvents = computed(() => {

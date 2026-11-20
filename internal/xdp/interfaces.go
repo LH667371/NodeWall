@@ -1,6 +1,8 @@
 package xdp
 
 import (
+	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
@@ -12,6 +14,23 @@ import (
 
 	"nodewall/internal/models"
 )
+
+// ErrInterfaceNotPresent is returned before any attach attempt when a
+// successful link inventory does not contain the requested interface.
+var ErrInterfaceNotPresent = errors.New("network interface is not present")
+
+func lookupInterface(name string) (*net.Interface, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	for _, iface := range ifaces {
+		if iface.Name == name {
+			return &iface, nil
+		}
+	}
+	return nil, fmt.Errorf("%w: %s", ErrInterfaceNotPresent, name)
+}
 
 func DetectHostInterfaces() (models.InterfaceInventory, error) {
 	ifaces, err := net.Interfaces()

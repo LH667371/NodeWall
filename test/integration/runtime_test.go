@@ -25,6 +25,7 @@ import (
 
 	"nodewall/internal/nodeauth"
 	nodeRuntime "nodewall/internal/runtime"
+	"nodewall/internal/securestore"
 	"nodewall/internal/security"
 	"nodewall/internal/transporttls"
 )
@@ -52,6 +53,11 @@ func TestRuntimeProcess(t *testing.T) {
 // No test process attaches a NIC or modifies sshd/netfilter configuration.
 func TestSecureMultiNodeRuntime(t *testing.T) {
 	managerDir, remoteDir := t.TempDir(), t.TempDir()
+	keyPath := filepath.Join(managerDir, "cluster.key")
+	t.Setenv("NODEWALL_CLUSTER_KEY_FILE", keyPath)
+	if _, err := securestore.EnsureKey(keyPath); err != nil {
+		t.Fatal(err)
+	}
 	managerAddr, agentAddr, remoteAddr := unusedAddress(t), unusedAddress(t), unusedAddress(t)
 	udpListener, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -78,6 +84,7 @@ func TestSecureMultiNodeRuntime(t *testing.T) {
 			"TLS_CA": managerCert, "TLS_INSECURE_SKIP_VERIFY": "false",
 			"AGENT_TOKEN_FILE":      filepath.Join(dir, "agent-token"),
 			"NODE_CREDENTIALS_FILE": filepath.Join(managerDir, "credentials.json"),
+			"CLUSTER_KEY_FILE":      keyPath,
 			"AGENT_ADDR":            listen, "AGENT_HTTP_ADDR": listen, "AGENT_URL": "https://" + listen,
 			"AGENT_STATE":            filepath.Join(dir, "agent-state.json"),
 			"SERVER_STATE":           filepath.Join(dir, "server-state.json"),
@@ -151,10 +158,21 @@ func TestSecureMultiNodeRuntime(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatal("local node token was rejected")
 	}
-	// The API package covers successful sign-in and CSRF with server-owned
-	// fixtures. Use a loopback server here for the node-to-node TLS checks,
-	// keeping them independent of the human challenge.
+	// Authenticated ticket issuance is covered by the API tests. Seed the
+	// enrolled credential before running the node-to-node TLS checks with a
+	// loopback server independent of the human challenge.
 	stopServer()
+	registry, err := nodeauth.Open(filepath.Join(managerDir, "credentials.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	remotePEM, err := os.ReadFile(remoteCert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Put(nodeauth.Credential{NodeID: "remote-node", AgentURL: "https://" + remoteAddr, Token: remoteToken, Certificate: string(remotePEM)}); err != nil {
+		t.Fatal(err)
+	}
 	startRuntime(t, "server", append(serverEnv, "NODEWALL_AUTH_ENABLED=false"), managerDir)
 	waitEndpoint(t, client, "https://"+managerAddr+"/nodes", http.StatusOK)
 	enrollmentRequest, _ := http.NewRequest(http.MethodPost, "https://"+managerAddr+"/nodes/enrollment", bytes.NewBufferString(`{}`))
@@ -163,28 +181,9 @@ func TestSecureMultiNodeRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var ticket struct {
-		URL string `json:"url"`
-	}
-	_ = json.NewDecoder(resp.Body).Decode(&ticket)
 	resp.Body.Close()
-	if resp.StatusCode != 201 {
-		t.Fatalf("ticket creation returned %d", resp.StatusCode)
-	}
-	ticketURL, _ := url.Parse(ticket.URL)
-	remotePEM, _ := os.ReadFile(remoteCert)
-	body, _ := json.Marshal(nodeauth.Credential{NodeID: "remote-node", AgentURL: "https://" + remoteAddr, Token: remoteToken, Certificate: string(remotePEM)})
-	req, _ = http.NewRequest(http.MethodPost, "https://"+managerAddr+"/join/enroll", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+ticketURL.Query().Get("token"))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err = client.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != 201 {
-		t.Fatalf("enrollment returned %d: %s", resp.StatusCode, data)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("ticket issuance with console auth disabled returned %d", resp.StatusCode)
 	}
 	reportAfter := time.Now()
 	remoteEnv := baseEnv(remoteDir, "remote-node", remoteAddr, remoteCert, remoteKey)
@@ -219,7 +218,7 @@ func TestSecureMultiNodeRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, _ = io.ReadAll(resp.Body)
+	data, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if !bytes.Contains(data, []byte("remote-node")) || bytes.Contains(data, []byte(remoteToken)) {
 		t.Fatal("node list lost enrollment or exposed a credential")
@@ -230,7 +229,7 @@ func TestSecureMultiNodeRuntime(t *testing.T) {
 	if err := os.WriteFile(scanPath, []byte("<?php eval(base64_decode($_POST['x'])); ?>"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	body, _ = json.Marshal(map[string]string{"path": scanPath})
+	body, _ := json.Marshal(map[string]string{"path": scanPath})
 	scanRequest, _ := http.NewRequest(http.MethodPost, "https://"+managerAddr+"/nodes/remote-node/security/scan", bytes.NewReader(body))
 	scanRequest.Header.Set("Content-Type", "application/json")
 	resp, err = client.Do(scanRequest)

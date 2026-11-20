@@ -6,9 +6,9 @@ import InfoTip from "@/components/InfoTip.vue";
 import InlineSelect from "@/components/InlineSelect.vue";
 import MonitoringChart from "@/components/MonitoringChart.vue";
 import MonitoringHistory from "@/components/MonitoringHistory.vue";
-import { acceleratorReading, buildDeviceChart, cpuCoreGroups, numericMetric } from "@/lib/monitoringSeries";
+import { acceleratorReading, buildDeviceChart, cpuCoreGroups, lastMonitoringHour, monitoringNodeCatalog, numericMetric } from "@/lib/monitoringSeries";
 import TablePagination from "@/components/TablePagination.vue";
-import { formatDateTimeLocalValue, formatTime as formatClockTime, timeState, timeZoneOptions, zonedDateTimeToDate } from "@/lib/time";
+import { formatDateTime, formatDateTimeLocalValue, formatTime as formatClockTime, timeState, timeZoneOptions, zonedDateTimeToDate } from "@/lib/time";
 
 const props = defineProps({
   store: { type: Object, required: true },
@@ -27,8 +27,7 @@ const dateError = ref("");
 const emptyHistory = { points: [], nodes: [], range_seconds: defaultRangeSeconds };
 const data = computed(() => props.store.state.monitoringHistory || emptyHistory);
 const historyError = computed(() => props.store.state.monitoringHistoryError);
-const loading = computed(() => !historyError.value
-  && (!props.store.state.monitoringHistory || (data.value.sampled_at && !lastUpdatedAt.value && !points.value.length)));
+const loading = computed(() => !historyError.value && !props.store.state.monitoringHistory);
 const nodePage = ref(0);
 const nodePageSize = ref(10);
 const processPage = ref(0);
@@ -65,7 +64,7 @@ const nodes = computed(() => {
 });
 const nodePoints = computed(() => data.value.node_points || {});
 const chartInterval = computed(() => Number(data.value.sample_interval_seconds) || 5);
-const lastUpdatedAt = computed(() => Date.parse(data.value.sampled_at) > 0
+const lastUpdatedAt = computed(() => !activeNodeId.value && Date.parse(data.value.sampled_at) > 0
   ? data.value.sampled_at : points.value.at(-1)?.timestamp);
 const latest = computed(() => points.value[points.value.length - 1] || {});
 const sampleLabel = computed(() => t("monitoringSamples", { count: points.value.length }));
@@ -83,10 +82,18 @@ const rangeOptions = computed(() => [
   { value: 7 * 24 * 60 * 60, label: t("monitoringRange7d") },
   { value: -1, label: t("monitoringRangeCustom") },
 ]);
-const nodeOptions = computed(() => {
-  const source = (props.store.state.nodes || []).length ? props.store.state.nodes : nodes.value;
-  return source.map((item) => ({ value: item.node_id || item.id, label: nodeName(item) })).filter((item) => item.value);
+const nodeCatalog = computed(() => {
+  const registered = props.store.state.nodesLoaded ? props.store.state.nodes : nodes.value;
+  return monitoringNodeCatalog(registered || [], props.store.state.monitoringArchiveNodes || []);
 });
+const nodeOptions = computed(() => nodeCatalog.value.map((item) => ({
+  value: item.node_id,
+  label: item.registered ? item.name : t("monitoringArchivedNode", { name: item.name }),
+})));
+const archiveNode = computed(() => nodeCatalog.value.find((item) => item.node_id === activeNodeId.value && item.last_sample_at));
+const archiveHost = computed(() => nodeCatalog.value.find((item) => item.node_id === data.value.archive_node_id)?.name || data.value.archive_node_id);
+const replayWindow = computed(() => lastMonitoringHour(archiveNode.value?.last_sample_at, Number(data.value.retention_seconds) || defaultRetentionSeconds));
+const archiveIsStale = computed(() => Date.now() - Date.parse(archiveNode.value?.last_sample_at) > 45_000);
 const nodeChartEntries = computed(() => {
   const ids = new Set([
     ...nodes.value.map((item) => item.node_id).filter(Boolean),
@@ -373,6 +380,7 @@ const logicalCPUChart = computed(() => cpuDetail.value === "cores"
 const logicalIowaitChart = computed(() => cpuDetail.value === "cores"
   ? deviceChart("logical_cpus", [{ key: "iowait_percent", label: t("monitoringCPUIowait") }], selectedCoreIDs.value)
   : { points: [], series: [] });
+const showAccelerators = computed(() => activeView.value === "resources" || activeView.value === "system");
 const acceleratorUsageChart = computed(() => deviceChart("accelerators", [{ key: "utilization_percent", label: t("monitoringAcceleratorUtilization") }]));
 const acceleratorMemoryChart = computed(() => deviceChart("accelerators", [{ key: "memory_used_bytes", label: t("monitoringAcceleratorMemory") }]));
 watch(activeNodeId, () => { cpuCorePage.value = 0; });
@@ -547,6 +555,14 @@ function applyDates() {
   };
 }
 
+function showLastRecordedHour() {
+  if (!replayWindow.value) return;
+  activeView.value = "history";
+  rangeSeconds.value = -1;
+  appliedRange.value = replayWindow.value;
+  showAppliedDates();
+}
+
 function formatScalar(value) {
   const number = Math.max(0, Number(value) || 0);
   return number.toFixed(number >= 10 ? 0 : 2).replace(/\.0+$/, "");
@@ -644,9 +660,7 @@ function changeNodeFilter(value) {
     showCluster();
     return;
   }
-  const source = (props.store.state.nodes || []).length ? props.store.state.nodes : nodes.value;
-  const node = source.find((item) => (item.node_id || item.id) === value);
-  if (node) selectNode({ ...node, node_id: node.node_id || node.id });
+  selectNode(nodeCatalog.value.find((item) => item.node_id === value));
 }
 
 function showCluster() {
@@ -656,15 +670,6 @@ function showCluster() {
 
 watch([activeNodeId, appliedRange], syncMonitoringStream);
 watch(() => timeState.timeZone, () => { if (showDateFields.value) showAppliedDates(); });
-watch(() => props.store.state.nodes, (nextNodes) => {
-  if (scope.value !== "node" || !selectedNodeId.value) return;
-  const stillExists = (nextNodes || []).some((item) => item?.id === selectedNodeId.value);
-  if (stillExists) return;
-  // A node can disappear from another browser while this page is open. Move
-  // back to the cluster view instead of keeping an empty, deleted-node query.
-  scope.value = "cluster";
-  selectedNodeId.value = "";
-}, { deep: true });
 
 onMounted(() => {
   syncMonitoringStream();
@@ -677,7 +682,6 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="page-grid monitoring-page">
-    <p v-if="data.storage_error" class="panel panel-span-12 security-note" role="alert">{{ t("monitoringStorageError") }}: {{ data.storage_error }}</p>
     <article class="panel panel-span-12 monitoring-header-panel">
       <div class="monitoring-view-tabs" role="tablist" :aria-label="t('monitoringTitle')">
         <button
@@ -720,7 +724,16 @@ onBeforeUnmount(() => {
         </div>
         <p v-if="showDateFields" id="monitoring-range-details" class="monitoring-range-details">{{ dateTimeZone }} · {{ t("monitoringCustomRangeHint") }}</p>
       </div>
+      <div v-if="archiveNode || (activeView === 'history' && archiveHost)" class="monitoring-archive-status">
+        <span v-if="archiveHost">{{ t("monitoringArchiveHost", { name: archiveHost }) }}</span>
+        <span v-if="archiveNode">{{ t("monitoringArchiveLastSample", { time: formatDateTime(archiveNode.last_sample_at, store.state.locale) }) }}</span>
+        <span v-if="archiveIsStale && archiveNode?.registered" class="tag">{{ t("monitoringArchiveStale") }}</span>
+        <button v-if="replayWindow" type="button" class="ghost-button" @click="showLastRecordedHour">{{ t("monitoringReplayLastHour") }}</button>
+      </div>
       <p v-if="dateError || historyError" class="monitoring-request-note" role="alert">{{ dateError || historyError }}</p>
+      <p v-if="data.storage_error || data.archive_read_error" class="monitoring-request-note" role="status">
+        {{ t(data.storage_error ? "monitoringStorageError" : "monitoringArchiveReadError") }}
+      </p>
     </article>
 
     <article v-if="scope === 'cluster' && activeView === 'overview'" class="panel panel-span-12 monitoring-node-panel monitoring-node-resource-panel">
@@ -1068,7 +1081,7 @@ onBeforeUnmount(() => {
         <TablePagination v-model:page="filesystemPage" v-model:page-size="filesystemPageSize" :total="filesystems.length" />
       </article>
 
-      <article v-if="activeView === 'io' || activeView === 'system'" class="panel panel-span-12 monitoring-node-panel">
+      <article v-if="activeView === 'io' || activeView === 'system'" class="panel monitoring-node-panel">
         <div class="panel-head">
           <div>
             <p>{{ t("monitoringDisk") }}</p>
@@ -1110,7 +1123,7 @@ onBeforeUnmount(() => {
         <TablePagination v-model:page="diskPage" v-model:page-size="diskPageSize" :total="diskDevices.length" />
       </article>
 
-      <article v-if="activeView === 'io' || activeView === 'system'" class="panel panel-span-12 monitoring-node-panel">
+      <article v-if="activeView === 'io' || activeView === 'system'" class="panel monitoring-node-panel">
         <div class="panel-head">
           <div>
             <p>{{ t("monitoringNetwork") }}</p>
@@ -1148,15 +1161,17 @@ onBeforeUnmount(() => {
         <TablePagination v-model:page="networkInterfacePage" v-model:page-size="networkInterfacePageSize" :total="networkInterfaces.length" />
       </article>
 
-      <article v-if="(activeView === 'resources' || activeView === 'system') && acceleratorUsageChart.series.length" class="panel panel-span-6 monitoring-chart-panel">
-        <div class="panel-head compact"><h3>{{ t("monitoringAcceleratorUtilization") }}</h3></div>
-        <MonitoringChart :sample-interval="chartInterval" :points="acceleratorUsageChart.points" :series="acceleratorUsageChart.series" :max-value="100" />
-      </article>
-      <article v-if="(activeView === 'resources' || activeView === 'system') && acceleratorMemoryChart.series.length" class="panel panel-span-6 monitoring-chart-panel">
-        <div class="panel-head compact"><h3>{{ t("monitoringAcceleratorMemory") }}</h3></div>
-        <MonitoringChart :sample-interval="chartInterval" :points="acceleratorMemoryChart.points" :series="acceleratorMemoryChart.series" unit="bytes" />
-      </article>
-      <article v-if="activeView === 'resources' || activeView === 'system'" class="panel panel-span-12 monitoring-node-panel">
+      <div v-if="showAccelerators && (acceleratorUsageChart.series.length || acceleratorMemoryChart.series.length)" class="monitoring-accelerator-charts">
+        <article v-if="acceleratorUsageChart.series.length" class="panel monitoring-chart-panel">
+          <div class="panel-head compact"><h3>{{ t("monitoringAcceleratorUtilization") }}</h3></div>
+          <MonitoringChart :sample-interval="chartInterval" :points="acceleratorUsageChart.points" :series="acceleratorUsageChart.series" :max-value="100" />
+        </article>
+        <article v-if="acceleratorMemoryChart.series.length" class="panel monitoring-chart-panel">
+          <div class="panel-head compact"><h3>{{ t("monitoringAcceleratorMemory") }}</h3></div>
+          <MonitoringChart :sample-interval="chartInterval" :points="acceleratorMemoryChart.points" :series="acceleratorMemoryChart.series" unit="bytes" />
+        </article>
+      </div>
+      <article v-if="showAccelerators" class="panel monitoring-node-panel">
         <div class="panel-head">
           <div>
             <p>{{ t("monitoringAccelerator") }}</p>

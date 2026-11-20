@@ -262,6 +262,29 @@ func (s *PolicyService) UpdatePolicyAndApply(ctx context.Context, policy models.
 
 var ErrPolicyChanged = errors.New("policy changed since it was loaded")
 
+// SavePolicySnapshotIfCurrent persists metadata or reconciled Agent state
+// without reapplying the dataplane. Readers must not block on an Agent apply
+// or replace a policy while an apply or trial owns its recovery record.
+func (s *PolicyService) SavePolicySnapshotIfCurrent(ctx context.Context, policy models.InterfacePolicy) (models.InterfacePolicy, error) {
+	lock, _ := s.applyLocks.LoadOrStore(policy.NodeID+"/"+policy.Interface, &sync.Mutex{})
+	mutex := lock.(*sync.Mutex)
+	locked := mutex.TryLock()
+	if locked {
+		defer mutex.Unlock()
+	}
+	current, _ := s.GetPolicy(ctx, policy.NodeID, policy.Interface)
+	if err := ctx.Err(); err != nil {
+		return current, err
+	}
+	if !locked || !current.UpdatedAt.Equal(policy.UpdatedAt) {
+		return current, ErrPolicyChanged
+	}
+	if _, pending := s.store.PendingPolicyUpdate(policy.NodeID, policy.Interface); pending {
+		return current, ErrPolicyChanged
+	}
+	return s.store.PutPolicyChecked(ctx, policy)
+}
+
 // UpdatePolicyAndApplyIfCurrent protects a complete policy submitted by a Web
 // form from replacing a newer save. Check inside the apply lock so two requests
 // cannot both pass the comparison before either policy becomes durable.

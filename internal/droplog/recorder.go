@@ -3,6 +3,7 @@ package droplog
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"nodewall/internal/models"
+	"nodewall/internal/securestore"
 	"nodewall/internal/xdp"
 )
 
@@ -22,11 +24,16 @@ type Recorder struct {
 	statePath string
 	settings  models.DropLogSettings
 	lastSeen  map[string]uint64
+	epochs    map[string]string
+	packetMu  sync.Mutex
+	packets   map[packetAuditKey]models.DropLogRecord
+	auditOn   bool
 }
 
 type persistedState struct {
 	Settings models.DropLogSettings `json:"settings"`
 	LastSeen map[string]uint64      `json:"last_seen"`
+	Epochs   map[string]string      `json:"counter_epochs,omitempty"`
 }
 
 func New(logDir, statePath string, defaults models.DropLogSettings) (*Recorder, error) {
@@ -35,9 +42,12 @@ func New(logDir, statePath string, defaults models.DropLogSettings) (*Recorder, 
 		statePath: statePath,
 		settings:  normalizeSettings(defaults),
 		lastSeen:  make(map[string]uint64),
+		epochs:    make(map[string]string),
 	}
-	if err := r.load(); err != nil {
-		return nil, err
+	err := r.load()
+	r.auditOn = r.settings.Enabled
+	if err != nil {
+		return r, fmt.Errorf("load drop log state %s: %w", statePath, err)
 	}
 	return r, nil
 }
@@ -53,6 +63,12 @@ func (r *Recorder) UpdateSettings(settings models.DropLogSettings) error {
 	defer r.mu.Unlock()
 	r.settings = normalizeSettings(settings)
 	r.logDir = r.settings.LogDir
+	r.packetMu.Lock()
+	r.auditOn = r.settings.Enabled
+	if !r.auditOn {
+		clear(r.packets)
+	}
+	r.packetMu.Unlock()
 	return r.saveLocked()
 }
 
@@ -65,45 +81,77 @@ func (r *Recorder) Flush(dp xdp.Dataplane) error {
 		return r.saveLocked()
 	}
 	now := time.Now().UTC()
-	for _, iface := range dp.Interfaces() {
-		items, err := dp.ReadDropLogs(iface, 256)
-		if err != nil {
-			if xdp.IsNotAttached(err) {
-				continue
-			}
-			return err
-		}
-		for _, item := range items {
-			key := counterKey(iface, item)
-			prev := r.lastSeen[key]
-			current := itemCount(item)
-			if current <= prev {
-				continue
-			}
-			delta := current - prev
-			record := models.DropLogRecord{
-				Timestamp:  now,
-				Interface:  iface,
-				Direction:  models.DirectionIngress,
-				SourceIP:   item.SourceIP,
-				SourceCIDR: item.SourceCIDR,
-				Port:       item.Port,
-				Reason:     item.Reason,
-				Count:      delta,
-			}
-			if item.Drops > 0 {
-				record.Drops = delta
-			}
-			if err := appendJSONL(filepath.Join(r.logDir, fileNameFor(now)), record); err != nil {
-				return err
-			}
-			r.lastSeen[key] = current
-		}
-	}
-	if err := pruneFiles(r.logDir, settings.RetentionDays, now); err != nil {
+	if err := r.flushPackets(now); err != nil {
 		return err
 	}
-	return r.saveLocked()
+	directions := []models.PolicyDirection{models.DirectionIngress}
+	directional, hasDirection := dp.(xdp.DirectionalStats)
+	if hasDirection {
+		directions = append(directions, models.DirectionEgress)
+	}
+	var readErrors []error
+	for _, iface := range dp.Interfaces() {
+		for _, direction := range directions {
+			var items []models.InterceptLogEntry
+			var err error
+			if direction == models.DirectionEgress {
+				items, err = directional.ReadDirectionDropLogs(iface, direction, 256)
+			} else {
+				items, err = dp.ReadDropLogs(iface, 256)
+			}
+			if err != nil {
+				if !xdp.IsNotAttached(err) {
+					readErrors = append(readErrors, fmt.Errorf("read %s firewall counters for %s: %w", direction, iface, err))
+				}
+				continue
+			}
+			if err := r.persistCounters(now, iface, direction, items); err != nil {
+				return errors.Join(errors.Join(readErrors...), err, r.saveLocked())
+			}
+		}
+	}
+	return errors.Join(errors.Join(readErrors...), pruneFiles(r.logDir, settings.RetentionDays, now), r.saveLocked())
+}
+
+func (r *Recorder) persistCounters(now time.Time, iface string, direction models.PolicyDirection, items []models.InterceptLogEntry) error {
+	path := filepath.Join(r.logDir, fileNameFor(now))
+	for _, item := range items {
+		key := counterKey(iface, direction, item)
+		prev := r.lastSeen[key]
+		current := itemCount(item)
+		sameCounter := r.epochs[key] == item.CounterEpoch
+		if current == 0 || (sameCounter && current == prev) {
+			continue
+		}
+		delta := current
+		if sameCounter && current > prev {
+			delta -= prev
+		}
+		record := models.DropLogRecord{
+			Timestamp:  now,
+			Interface:  iface,
+			Direction:  direction,
+			SourceIP:   item.SourceIP,
+			SourceCIDR: item.SourceCIDR,
+			Port:       item.Port,
+			Reason:     item.Reason,
+			Count:      delta,
+			Traffic:    item.Traffic,
+		}
+		if item.Drops > 0 {
+			record.Drops = delta
+		}
+		if err := appendJSONL(path, record); err != nil {
+			return err
+		}
+		r.lastSeen[key] = current
+		if item.CounterEpoch != "" {
+			r.epochs[key] = item.CounterEpoch
+		} else {
+			delete(r.epochs, key)
+		}
+	}
+	return nil
 }
 
 func (r *Recorder) Recent(limit int) ([]models.DropLogRecord, error) {
@@ -163,6 +211,10 @@ func (r *Recorder) Clear() error {
 		}
 	}
 	r.lastSeen = make(map[string]uint64)
+	clear(r.epochs)
+	r.packetMu.Lock()
+	clear(r.packets)
+	r.packetMu.Unlock()
 	return r.saveLocked()
 }
 
@@ -184,15 +236,19 @@ func (r *Recorder) Run(ctx context.Context, dp xdp.Dataplane) {
 }
 
 func (r *Recorder) load() error {
-	data, err := os.ReadFile(r.statePath)
+	var state persistedState
+	_, _, _, err := securestore.ReadValid(r.statePath, func(data []byte) error {
+		var candidate persistedState
+		if err := json.Unmarshal(data, &candidate); err != nil {
+			return err
+		}
+		state = candidate
+		return nil
+	})
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
-		return err
-	}
-	var state persistedState
-	if err := json.Unmarshal(data, &state); err != nil {
 		return err
 	}
 	if state.Settings.LogDir != "" {
@@ -202,49 +258,25 @@ func (r *Recorder) load() error {
 	if state.LastSeen != nil {
 		r.lastSeen = state.LastSeen
 	}
+	if state.Epochs != nil {
+		r.epochs = state.Epochs
+	}
 	return nil
 }
 
 func (r *Recorder) saveLocked() error {
-	if err := os.MkdirAll(filepath.Dir(r.statePath), 0o755); err != nil {
-		return err
-	}
 	if err := os.MkdirAll(r.logDir, 0o755); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(persistedState{
 		Settings: r.settings,
 		LastSeen: r.lastSeen,
+		Epochs:   r.epochs,
 	}, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(r.statePath), filepath.Base(r.statePath)+".tmp.*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	cleanup := true
-	defer func() {
-		_ = tmp.Close()
-		if cleanup {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-	if _, err := tmp.Write(data); err != nil {
-		return err
-	}
-	if err := tmp.Chmod(0o644); err != nil {
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, r.statePath); err != nil {
-		return err
-	}
-	cleanup = false
-	return nil
+	return securestore.WritePlain(r.statePath, data, 0o644)
 }
 
 func normalizeSettings(settings models.DropLogSettings) models.DropLogSettings {
@@ -266,8 +298,12 @@ func normalizeSettings(settings models.DropLogSettings) models.DropLogSettings {
 	return settings
 }
 
-func counterKey(iface string, item models.InterceptLogEntry) string {
+func counterKey(iface string, direction models.PolicyDirection, item models.InterceptLogEntry) string {
 	key := fmt.Sprintf("%s|%s|%d|%s", iface, item.SourceIP+item.SourceCIDR, item.Port, item.Reason)
+	// Preserve ingress checkpoints written before egress was archived.
+	if direction == models.DirectionEgress {
+		key += "|egress"
+	}
 	if item.Drops == 0 && item.Count > 0 {
 		key += "|observed"
 	}

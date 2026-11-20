@@ -3,7 +3,6 @@ package xdp
 import (
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"sort"
 	"sync"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/rlimit"
 
 	"nodewall/internal/models"
 )
@@ -69,7 +69,7 @@ func (m *Manager) Attach(ifaceName string, mode AttachMode) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	iface, err := net.InterfaceByName(ifaceName)
+	iface, err := lookupInterface(ifaceName)
 	if err != nil {
 		return fmt.Errorf("resolve interface %q: %w", ifaceName, err)
 	}
@@ -1328,9 +1328,18 @@ func (m *Manager) loadState(ifaceName string, ifaceIndex int, mode AttachMode) (
 		return nil, fmt.Errorf("load collection spec: %w", err)
 	}
 
+	// The agent can manage the host even when it boots into a kernel without
+	// eBPF. Keep this process limit and capability check on the attach path.
+	memlockErr := rlimit.RemoveMemlock()
 	coll, err := ebpf.NewCollection(spec)
 	if err != nil {
-		return nil, fmt.Errorf("load collection: %w", err)
+		if errors.Is(err, syscall.ENOSYS) {
+			err = fmt.Errorf("BPF syscall unavailable on the running kernel: %w", err)
+		}
+		if memlockErr != nil {
+			err = errors.Join(err, fmt.Errorf("prepare BPF memlock: %w", memlockErr))
+		}
+		return nil, fmt.Errorf("load XDP collection: %w", err)
 	}
 
 	state := &interfaceState{

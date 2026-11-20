@@ -8,7 +8,7 @@ export GOPATH="${GOPATH:-$PWD/.gopath}"
 export GOENV="${GOENV:-off}"
 
 host_os="$(uname -s)"
-image="${NODEWALL_BPF_IMAGE:-nodewall-bpf-gen:go1.27.3}"
+image="${NODEWALL_BPF_IMAGE:-nodewall-bpf-gen:go1.27.4}"
 runtime="${CONTAINER_RUNTIME:-}"
 
 if [[ "$host_os" == "Linux" ]]; then

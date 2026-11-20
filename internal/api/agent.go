@@ -84,7 +84,9 @@ type AgentHandler struct {
 	geoipDB                    *geoip.CountryDB
 	dnsResolver                *dnsresolve.Resolver
 	runtimeMu                  sync.RWMutex
+	stateSaveMu                sync.Mutex
 	runtimes                   map[string]models.InterfaceRuntime
+	interfaceRestoreErrors     map[string]error
 	sshProtectionMu            sync.RWMutex
 	sshProtectionSettings      models.SSHProtectionSettings
 	sshProtectionStore         SSHProtectionSettingsStore
@@ -214,6 +216,14 @@ func NewAgentHandler(nodeID string, xdpManager xdp.Dataplane, state AgentStateSt
 
 func (h *AgentHandler) Routes() http.Handler {
 	mux := http.NewServeMux()
+	// Serialize policy changes with startup recovery and trial rollback.
+	policyWrite := func(pattern string, handler http.HandlerFunc) {
+		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+			h.policyMu.Lock()
+			defer h.policyMu.Unlock()
+			handler(w, r)
+		})
+	}
 	mux.HandleFunc("GET /health", h.handleHealth)
 	mux.HandleFunc("GET /clamav/manifest", h.handleClamAVManifest)
 	mux.HandleFunc("GET /clamav/{kind}/{name}", h.handleClamAVFile)
@@ -245,45 +255,45 @@ func (h *AgentHandler) Routes() http.Handler {
 	mux.HandleFunc("PUT /ssh-protection/authentication", h.handleSSHAuthenticationPolicy)
 	mux.HandleFunc("POST /ssh-protection/integrity/baseline", h.handleSSHIntegrityBaseline)
 	mux.HandleFunc("POST /ssh-protection/integrity/verify", h.handleSSHIntegrityVerify)
-	mux.HandleFunc("DELETE /ssh-protection/blocks/{id}", h.handleDeleteSSHProtectionBlock)
+	policyWrite("DELETE /ssh-protection/blocks/{id}", h.handleDeleteSSHProtectionBlock)
 	mux.HandleFunc("GET /interfaces", h.handleInterfaces)
 	mux.HandleFunc("GET /settings/logging", h.handleGetLoggingSettings)
-	mux.HandleFunc("PUT /settings/logging", h.handleUpdateLoggingSettings)
+	policyWrite("PUT /settings/logging", h.handleUpdateLoggingSettings)
 	mux.HandleFunc("GET /logs/drop", h.handleRecentDropLogs)
 	mux.HandleFunc("DELETE /logs/drop", h.handleClearDropLogs)
 	mux.HandleFunc("GET /interfaces/{iface}/temporary-blocks", h.handleListTemporaryBlocks)
-	mux.HandleFunc("POST /interfaces/{iface}/temporary-blocks", h.handleCreateTemporaryBlock)
-	mux.HandleFunc("DELETE /interfaces/{iface}/temporary-blocks/{id}", h.handleDeleteTemporaryBlock)
+	policyWrite("POST /interfaces/{iface}/temporary-blocks", h.handleCreateTemporaryBlock)
+	policyWrite("DELETE /interfaces/{iface}/temporary-blocks/{id}", h.handleDeleteTemporaryBlock)
 	mux.HandleFunc("GET /interfaces/{iface}/rate-limits", h.handleListRateLimits)
-	mux.HandleFunc("POST /interfaces/{iface}/rate-limits", h.handleCreateRateLimit)
-	mux.HandleFunc("DELETE /interfaces/{iface}/rate-limits/{id}", h.handleDeleteRateLimit)
+	policyWrite("POST /interfaces/{iface}/rate-limits", h.handleCreateRateLimit)
+	policyWrite("DELETE /interfaces/{iface}/rate-limits/{id}", h.handleDeleteRateLimit)
 	mux.HandleFunc("GET /interfaces/{iface}/insights", h.handleInsights)
 	mux.HandleFunc("GET /interfaces/{iface}/drop-logs", h.handleDropLogs)
 	mux.HandleFunc("POST /interfaces/{iface}/attach", h.handleAttach)
-	mux.HandleFunc("POST /interfaces/{iface}/detach", h.handleDetach)
-	mux.HandleFunc("POST /interfaces/{iface}/bypass", h.handleAddBypass)
-	mux.HandleFunc("DELETE /interfaces/{iface}/bypass/{cidr}", h.handleDeleteBypass)
+	policyWrite("POST /interfaces/{iface}/detach", h.handleDetach)
+	policyWrite("POST /interfaces/{iface}/bypass", h.handleAddBypass)
+	policyWrite("DELETE /interfaces/{iface}/bypass/{cidr}", h.handleDeleteBypass)
 	mux.HandleFunc("GET /interfaces/{iface}/bypass", h.handleListBypass)
-	mux.HandleFunc("POST /interfaces/{iface}/block", h.handleAddBlock)
-	mux.HandleFunc("DELETE /interfaces/{iface}/block/{cidr}", h.handleDeleteBlock)
+	policyWrite("POST /interfaces/{iface}/block", h.handleAddBlock)
+	policyWrite("DELETE /interfaces/{iface}/block/{cidr}", h.handleDeleteBlock)
 	mux.HandleFunc("GET /interfaces/{iface}/block", h.handleListBlock)
-	mux.HandleFunc("POST /interfaces/{iface}/allowlist", h.handleAddAllowlist)
-	mux.HandleFunc("DELETE /interfaces/{iface}/allowlist/{cidr}", h.handleDeleteAllowlist)
+	policyWrite("POST /interfaces/{iface}/allowlist", h.handleAddAllowlist)
+	policyWrite("DELETE /interfaces/{iface}/allowlist/{cidr}", h.handleDeleteAllowlist)
 	mux.HandleFunc("GET /interfaces/{iface}/allowlist", h.handleListAllowlist)
-	mux.HandleFunc("POST /interfaces/{iface}/icmp-allowlist", h.handleAddICMPAllowlist)
-	mux.HandleFunc("DELETE /interfaces/{iface}/icmp-allowlist/{cidr}", h.handleDeleteICMPAllowlist)
+	policyWrite("POST /interfaces/{iface}/icmp-allowlist", h.handleAddICMPAllowlist)
+	policyWrite("DELETE /interfaces/{iface}/icmp-allowlist/{cidr}", h.handleDeleteICMPAllowlist)
 	mux.HandleFunc("GET /interfaces/{iface}/icmp-allowlist", h.handleListICMPAllowlist)
-	mux.HandleFunc("POST /interfaces/{iface}/icmp-blocklist", h.handleAddICMPBlocklist)
-	mux.HandleFunc("DELETE /interfaces/{iface}/icmp-blocklist/{cidr}", h.handleDeleteICMPBlocklist)
+	policyWrite("POST /interfaces/{iface}/icmp-blocklist", h.handleAddICMPBlocklist)
+	policyWrite("DELETE /interfaces/{iface}/icmp-blocklist/{cidr}", h.handleDeleteICMPBlocklist)
 	mux.HandleFunc("GET /interfaces/{iface}/icmp-blocklist", h.handleListICMPBlocklist)
-	mux.HandleFunc("POST /interfaces/{iface}/public-ports", h.handleAddPublicPort)
-	mux.HandleFunc("DELETE /interfaces/{iface}/public-ports/{port}", h.handleDeletePublicPort)
+	policyWrite("POST /interfaces/{iface}/public-ports", h.handleAddPublicPort)
+	policyWrite("DELETE /interfaces/{iface}/public-ports/{port}", h.handleDeletePublicPort)
 	mux.HandleFunc("GET /interfaces/{iface}/public-ports", h.handleListPublicPorts)
-	mux.HandleFunc("POST /interfaces/{iface}/denied-ports", h.handleAddDeniedPort)
-	mux.HandleFunc("DELETE /interfaces/{iface}/denied-ports/{port}", h.handleDeleteDeniedPort)
+	policyWrite("POST /interfaces/{iface}/denied-ports", h.handleAddDeniedPort)
+	policyWrite("DELETE /interfaces/{iface}/denied-ports/{port}", h.handleDeleteDeniedPort)
 	mux.HandleFunc("GET /interfaces/{iface}/denied-ports", h.handleListDeniedPorts)
-	mux.HandleFunc("POST /interfaces/{iface}/ports", h.handleAddPort)
-	mux.HandleFunc("DELETE /interfaces/{iface}/ports/{port}", h.handleDeletePort)
+	policyWrite("POST /interfaces/{iface}/ports", h.handleAddPort)
+	policyWrite("DELETE /interfaces/{iface}/ports/{port}", h.handleDeletePort)
 	mux.HandleFunc("GET /interfaces/{iface}/ports", h.handleListPorts)
 	mux.HandleFunc("GET /interfaces/{iface}/stats", h.handleStats)
 	mux.HandleFunc("POST /interfaces/{iface}/publish", h.handlePublish)
@@ -325,6 +335,9 @@ func (h *AgentHandler) handleMaintenanceCleanup(w http.ResponseWriter, r *http.R
 }
 
 func (h *AgentHandler) cleanupDataplane(ctx context.Context) error {
+	h.policyMu.Lock()
+	defer h.policyMu.Unlock()
+
 	var detachErrs []error
 	for _, iface := range h.runtimeKeys() {
 		if err := h.xdp.Detach(iface); err != nil {
@@ -476,7 +489,11 @@ func (h *AgentHandler) handleAttach(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
 	previous := h.ensureRuntime(iface)
+	restoring := h.interfaceRestoreError(iface) != nil
 	if err := h.xdp.Attach(iface, xdp.ParseAttachMode(req.Mode)); err != nil {
+		if restoring {
+			h.setInterfaceRestoreError(iface, err)
+		}
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -502,7 +519,7 @@ func (h *AgentHandler) handleAttach(w http.ResponseWriter, r *http.Request) {
 	}
 	runtime.LastUpdatedAt = time.Now().UTC()
 	failAttach := func(cause error) {
-		if !previous.Attached {
+		if !previous.Attached || restoring {
 			if err := h.xdp.Detach(iface); err != nil {
 				cause = errors.Join(cause, fmt.Errorf("restore unattached interface: %w", err))
 			}
@@ -510,23 +527,31 @@ func (h *AgentHandler) handleAttach(w http.ResponseWriter, r *http.Request) {
 		h.setRuntime(iface, previous)
 		writeError(w, http.StatusInternalServerError, cause)
 	}
-	if err := h.xdp.ReplaceRateLimitRules(iface, runtime.RateLimits); err != nil {
-		failAttach(err)
-		return
-	}
-	if err := h.syncPolicyConfig(iface, runtime); err != nil {
-		failAttach(err)
-		return
+	if restoring {
+		if err := h.applyRestoredInterfacePolicy(iface, runtime); err != nil {
+			failAttach(err)
+			return
+		}
+	} else {
+		if err := h.xdp.ReplaceRateLimitRules(iface, runtime.RateLimits); err != nil {
+			failAttach(err)
+			return
+		}
+		if err := h.syncPolicyConfig(iface, runtime); err != nil {
+			failAttach(err)
+			return
+		}
 	}
 	h.setRuntime(iface, runtime)
 	if err := h.persist(r.Context()); err != nil {
 		failAttach(fmt.Errorf("persist interface attach: %w", err))
 		return
 	}
+	h.setInterfaceRestoreError(iface, nil)
 	writeJSON(w, http.StatusOK, struct {
 		models.InterfaceRuntime
 		PreviouslyAttached bool `json:"previously_attached"`
-	}{runtime, previous.Attached})
+	}{runtime, previous.Attached && !restoring})
 }
 
 func (h *AgentHandler) validateAttachableInterface(iface string) error {
@@ -560,7 +585,11 @@ func (h *AgentHandler) handleDetach(w http.ResponseWriter, r *http.Request) {
 	runtime.Egress.AttachMode = ""
 	runtime.LastUpdatedAt = time.Now().UTC()
 	h.setRuntime(iface, runtime)
-	_ = h.persist(r.Context())
+	h.setInterfaceRestoreError(iface, nil)
+	if err := h.persist(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("persist interface detach: %w", err))
+		return
+	}
 	writeJSON(w, http.StatusOK, runtime)
 }
 
@@ -1148,25 +1177,27 @@ func (h *AgentHandler) handleHealth(w http.ResponseWriter, r *http.Request) {
 		if !runtime.Attached {
 			continue
 		}
-		found := false
-		for _, item := range status.Interfaces {
-			if item.Interface == iface {
-				found = true
-				break
-			}
-		}
-		if found {
+		index := slices.IndexFunc(status.Interfaces, func(item models.InterfaceHealth) bool {
+			return item.Interface == iface
+		})
+		restoreErr := h.interfaceRestoreError(iface)
+		if index >= 0 && restoreErr == nil {
 			continue
 		}
 		status.Status = "degraded"
-		status.Interfaces = append(status.Interfaces, models.InterfaceHealth{
+		entry := models.InterfaceHealth{
 			Interface:   iface,
-			XDPAttached: false,
-			MapOK:       false,
-			StatsOK:     false,
 			LastCheckAt: time.Now().UTC(),
 			LastError:   "persisted interface state is attached but dataplane is not loaded",
-		})
+		}
+		if restoreErr != nil {
+			entry.LastError = restoreErr.Error()
+		}
+		if index < 0 {
+			status.Interfaces = append(status.Interfaces, entry)
+		} else {
+			status.Interfaces[index] = entry
+		}
 	}
 	writeJSON(w, http.StatusOK, status)
 }
@@ -1180,6 +1211,12 @@ func (h *AgentHandler) handleInterfaces(w http.ResponseWriter, r *http.Request) 
 	for i := range inventory.Interfaces {
 		_ = h.pruneExpiredDispositions(r.Context(), inventory.Interfaces[i].Name)
 		runtime := h.ensureRuntime(inventory.Interfaces[i].Name)
+		if h.interfaceRestoreError(inventory.Interfaces[i].Name) != nil {
+			// Preserve the desired attachment for the next boot, but report
+			// only policy that this Agent actually restored.
+			runtime.Attached, runtime.AttachMode = false, ""
+			runtime.Egress.Attached, runtime.Egress.AttachMode = false, ""
+		}
 		var lastPassed, lastDropped uint64
 		if runtime.LastStats != nil {
 			lastPassed = runtime.LastStats.Passed
@@ -1411,6 +1448,10 @@ func (h *AgentHandler) handlePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	runtime := h.ensureRuntime(iface)
+	if err := h.interfaceRestoreError(iface); err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
 	if _, pending := runtime.Recovery[direction]; pending {
 		writeError(w, http.StatusConflict, errors.New("a policy update is already being verified"))
 		return
@@ -2001,6 +2042,25 @@ func (h *AgentHandler) setRuntime(iface string, runtime models.InterfaceRuntime)
 	h.runtimeMu.Unlock()
 }
 
+func (h *AgentHandler) interfaceRestoreError(iface string) error {
+	h.runtimeMu.RLock()
+	defer h.runtimeMu.RUnlock()
+	return h.interfaceRestoreErrors[iface]
+}
+
+func (h *AgentHandler) setInterfaceRestoreError(iface string, err error) {
+	h.runtimeMu.Lock()
+	defer h.runtimeMu.Unlock()
+	if err == nil {
+		delete(h.interfaceRestoreErrors, iface)
+		return
+	}
+	if h.interfaceRestoreErrors == nil {
+		h.interfaceRestoreErrors = make(map[string]error)
+	}
+	h.interfaceRestoreErrors[iface] = err
+}
+
 func (h *AgentHandler) runtimeSnapshotAll() map[string]models.InterfaceRuntime {
 	h.runtimeMu.RLock()
 	defer h.runtimeMu.RUnlock()
@@ -2027,6 +2087,7 @@ func (h *AgentHandler) runtimeKeys() []string {
 func (h *AgentHandler) clearRuntimes() {
 	h.runtimeMu.Lock()
 	h.runtimes = make(map[string]models.InterfaceRuntime)
+	h.interfaceRestoreErrors = nil
 	h.runtimeMu.Unlock()
 }
 
@@ -2034,6 +2095,10 @@ func (h *AgentHandler) persist(ctx context.Context) error {
 	if h.state == nil {
 		return nil
 	}
+	// A slow stats save must not rename an older snapshot over the restored
+	// policy or a concurrent detach.
+	h.stateSaveMu.Lock()
+	defer h.stateSaveMu.Unlock()
 	return h.state.Save(ctx, h.runtimeSnapshotAll())
 }
 
@@ -2076,71 +2141,142 @@ func (h *AgentHandler) syncPolicyConfig(iface string, runtime models.InterfaceRu
 }
 
 func (h *AgentHandler) reconcileState(ctx context.Context) error {
-	for iface, runtime := range h.runtimeSnapshotAll() {
-		if err := h.pruneExpiredDispositions(ctx, iface); err != nil {
-			return err
+	var restoreErrors []error
+	for _, iface := range h.runtimeKeys() {
+		err := h.reconcileInterfaceState(ctx, iface)
+		if err != nil {
+			err = fmt.Errorf("restore firewall on %s: %w", iface, err)
+			restoreErrors = append(restoreErrors, err)
 		}
-		runtime = h.ensureRuntime(iface)
-		if !runtime.Attached {
+		h.setInterfaceRestoreError(iface, err)
+	}
+	if len(restoreErrors) > 0 {
+		return errors.Join(restoreErrors...)
+	}
+	return h.persist(ctx)
+}
+
+// RunInterfaceRecovery restores policies for interfaces created or renamed
+// after the agent starts. Retry only when link lookup confirmed absence
+// before attachment. A failed attach retains its original error.
+func (h *AgentHandler) RunInterfaceRecovery(ctx context.Context) {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	for h.retryBootInterfaces(ctx) {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (h *AgentHandler) retryBootInterfaces(ctx context.Context) bool {
+	h.policyMu.Lock()
+	defer h.policyMu.Unlock()
+
+	pending, restored := false, false
+	for _, iface := range h.runtimeKeys() {
+		if ctx.Err() != nil {
+			break
+		}
+		if !errors.Is(h.interfaceRestoreError(iface), xdp.ErrInterfaceNotPresent) {
 			continue
 		}
+		err := h.reconcileInterfaceState(ctx, iface)
+		switch {
+		case errors.Is(err, xdp.ErrInterfaceNotPresent):
+			pending = true
+		case err != nil:
+			log.Printf("warning: restore firewall on %s: %v", iface, err)
+		default:
+			restored = true
+			log.Printf("restored firewall on %s after interface initialization", iface)
+		}
+		h.setInterfaceRestoreError(iface, err)
+	}
+	if restored {
+		if err := h.persist(ctx); err != nil {
+			log.Printf("warning: persist restored firewall state: %v", err)
+		}
+	}
+	return pending
+}
 
-		mode := xdp.ParseAttachMode(runtime.AttachMode)
-		if err := h.xdp.Attach(iface, mode); err != nil {
-			return err
-		}
-		if dataplaneRuntime, err := h.xdp.Runtime(iface); err == nil && dataplaneRuntime.Mode != "" {
-			runtime.AttachMode = string(dataplaneRuntime.Mode)
-			h.setRuntime(iface, runtime)
-		}
-		if err := h.xdp.ReplaceAllowlist(iface, runtime.Allowlist); err != nil {
-			return err
-		}
-		if err := h.xdp.ReplaceBypassCIDRs(iface, runtime.BypassCIDRs); err != nil {
-			return err
-		}
-		if err := h.xdp.ReplaceBlockedCIDRs(iface, runtime.BlockedCIDRs); err != nil {
-			return err
-		}
-		if err := h.xdp.ReplaceICMPAllowCIDRs(iface, runtime.ICMPAllowCIDRs); err != nil {
-			return err
-		}
-		if err := h.xdp.ReplaceICMPBlockedCIDRs(iface, runtime.ICMPBlockedCIDRs); err != nil {
-			return err
-		}
-		if err := h.xdp.ReplacePublicPortRules(iface, models.NormalizePortRules(runtime.PublicPortRules, runtime.PublicPorts)); err != nil {
-			return err
-		}
-		if err := h.xdp.ReplaceDeniedPortRules(iface, models.NormalizePortRules(runtime.DeniedPortRules, runtime.DeniedPorts)); err != nil {
-			return err
-		}
-		if err := h.xdp.ReplacePortRules(iface, models.NormalizePortRules(runtime.AllowedPortRules, runtime.AllowedPorts)); err != nil {
-			return err
-		}
-		if err := h.xdp.ReplaceRateLimitRules(iface, runtime.RateLimits); err != nil {
-			return err
-		}
-		if runtime.Egress.Attached {
-			if directional, ok := h.xdp.(xdp.DirectionalDataplane); ok {
-				if err := directional.ApplyDirectionPolicy(iface, models.DirectionEgress, directionPolicyFromRuntime(runtime.Egress)); err != nil {
-					return err
-				}
+func (h *AgentHandler) reconcileInterfaceState(ctx context.Context, iface string) (restoreErr error) {
+	if err := h.pruneInterfaceDispositions(ctx, iface, false); err != nil {
+		return err
+	}
+	runtime := h.ensureRuntime(iface)
+	if !runtime.Attached {
+		return nil
+	}
+
+	mode := xdp.ParseAttachMode(runtime.AttachMode)
+	if err := h.xdp.Attach(iface, mode); err != nil {
+		return err
+	}
+	defer func() {
+		if restoreErr != nil {
+			if err := h.xdp.Detach(iface); err != nil {
+				restoreErr = errors.Join(restoreErr, fmt.Errorf("detach incomplete firewall: %w", err))
 			}
 		}
-		// ApplyDirectionPolicy keeps the egress gate disabled while it fills the
-		// separate TC maps. Sync the shared config only after those maps are
-		// complete so a restart cannot briefly enforce an empty default-deny map.
-		if err := h.syncPolicyConfig(iface, runtime); err != nil {
-			return err
-		}
-		for _, item := range runtime.TemporaryBlocks {
-			if err := h.applyTemporaryBlock(iface, item); err != nil {
+	}()
+	if dataplaneRuntime, err := h.xdp.Runtime(iface); err == nil && dataplaneRuntime.Mode != "" {
+		runtime.AttachMode = string(dataplaneRuntime.Mode)
+		h.setRuntime(iface, runtime)
+	}
+	return h.applyRestoredInterfacePolicy(iface, runtime)
+}
+
+func (h *AgentHandler) applyRestoredInterfacePolicy(iface string, runtime models.InterfaceRuntime) error {
+	if err := h.xdp.ReplaceAllowlist(iface, runtime.Allowlist); err != nil {
+		return err
+	}
+	if err := h.xdp.ReplaceBypassCIDRs(iface, runtime.BypassCIDRs); err != nil {
+		return err
+	}
+	if err := h.xdp.ReplaceBlockedCIDRs(iface, runtime.BlockedCIDRs); err != nil {
+		return err
+	}
+	if err := h.xdp.ReplaceICMPAllowCIDRs(iface, runtime.ICMPAllowCIDRs); err != nil {
+		return err
+	}
+	if err := h.xdp.ReplaceICMPBlockedCIDRs(iface, runtime.ICMPBlockedCIDRs); err != nil {
+		return err
+	}
+	if err := h.xdp.ReplacePublicPortRules(iface, models.NormalizePortRules(runtime.PublicPortRules, runtime.PublicPorts)); err != nil {
+		return err
+	}
+	if err := h.xdp.ReplaceDeniedPortRules(iface, models.NormalizePortRules(runtime.DeniedPortRules, runtime.DeniedPorts)); err != nil {
+		return err
+	}
+	if err := h.xdp.ReplacePortRules(iface, models.NormalizePortRules(runtime.AllowedPortRules, runtime.AllowedPorts)); err != nil {
+		return err
+	}
+	if err := h.xdp.ReplaceRateLimitRules(iface, runtime.RateLimits); err != nil {
+		return err
+	}
+	if runtime.Egress.Attached {
+		if directional, ok := h.xdp.(xdp.DirectionalDataplane); ok {
+			if err := directional.ApplyDirectionPolicy(iface, models.DirectionEgress, directionPolicyFromRuntime(runtime.Egress)); err != nil {
 				return err
 			}
 		}
 	}
-
-	return h.persist(ctx)
+	// ApplyDirectionPolicy keeps the egress gate disabled while it fills the
+	// separate TC maps. Sync the shared config only after those maps are
+	// complete so a restart cannot briefly enforce an empty default-deny map.
+	if err := h.syncPolicyConfig(iface, runtime); err != nil {
+		return err
+	}
+	for _, item := range runtime.TemporaryBlocks {
+		if err := h.applyTemporaryBlock(iface, item); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func directionStateFor(runtime models.InterfaceRuntime, direction models.PolicyDirection) models.DirectionRuntime {
